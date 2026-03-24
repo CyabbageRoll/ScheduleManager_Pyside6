@@ -109,12 +109,9 @@ class DailyScheduleWidget(QWidget):
         row3 = QHBoxLayout(); row3.setSpacing(2)
         row3.addWidget(QLabel("常時:"))
         row3.addWidget(self.f_notes_ever, stretch=1)
-        save_btn = QPushButton("💾")
-        save_btn.setFixedSize(22, 20)
-        save_btn.setStyleSheet(STYLE_BUTTON + " QPushButton { padding:0; font-size:9pt; }")
-        save_btn.clicked.connect(self._on_save_log)
-        row3.addWidget(save_btn)
         in_layout.addLayout(row3)
+        # 常時メモは編集完了時（フォーカス移動・Enterキー）に自動保存
+        self.f_notes_ever.editingFinished.connect(self._on_save_permanent)
 
         layout.addWidget(input_frame)
 
@@ -267,12 +264,17 @@ class DailyScheduleWidget(QWidget):
             "Last_Update":   today,
         }
         self.state.df_daily_log.loc[idx] = row
-        # 常時メモを即時 DB に保存（daily_log とは別テーブル）
+        self.info.set_info("保存しました")
+
+    def _on_save_permanent(self) -> None:
+        """常時メモを自動保存する（editingFinished シグナルで呼ばれる）"""
         ever_text = self.f_notes_ever.text()
+        if ever_text == getattr(self.state, "permanent_notice", ""):
+            return  # 変化なしは保存しない
         self.state.permanent_notice = ever_text
+        self.state.all_permanent_notices[self.state.user] = ever_text
         if self.state.db:
             self.state.db.save_permanent_notice(self.state.user, ever_text)
-        self.info.set_info("保存しました")
 
     def _adjust_row_heights(self) -> None:
         """begin_time〜end_timeがビューポートに収まるよう行高を調整し begin_time へスクロール"""
@@ -460,7 +462,7 @@ class MainWindow(QMainWindow):
 
         # ユーザー選択
         tb.addWidget(QLabel(" 表示メンバー: "))
-        self.user_combo = UserCombo(self.state.members)
+        self.user_combo = UserCombo(self.state.members, self.state.config.display_names)
         self.user_combo.set_user(self.state.current_member)
         self.user_combo.user_changed.connect(self._on_member_changed)
         tb.addWidget(self.user_combo)
@@ -1177,7 +1179,7 @@ class TablePane(QWidget):
                     row.get("actual_hours", ""),
                     row.get("start_available", ""),
                     row.get("deadline", ""),
-                    row.get("assigned_to", ""),
+                    self.state.display_name(str(row.get("assigned_to", ""))),
                     row.get("memo", ""),
                 ]
                 hex_c = COLOR_OPTIONS.get(row.get("color", "Cyan"), "#00BCD4")
@@ -1481,7 +1483,7 @@ class DetailPane(QWidget):
             ("タイトル",   row.get("title", "")),
             ("ステータス", row.get("status", "")),
             ("順序",       row.get("priority", "")),
-            ("担当者",     row.get("assigned_to", "")),
+            ("担当者",     self.state.display_name(str(row.get("assigned_to", "")))),
             ("見積工数(h)", row.get("estimated_hours", "")),
             ("実績工数(h)", row.get("actual_hours", "")),
             ("開始可能日", row.get("start_available", "")),

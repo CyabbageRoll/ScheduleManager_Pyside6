@@ -49,8 +49,8 @@ def make_state(tmpdir: str):
     from db import Database
 
     cfg = load_config()
-    cfg.members = ["Yamada", "Tanaka", "Suzuki"]
-    cfg.username = "Yamada"
+    cfg.members = ["yamada@email.com", "tanaka@email.com", "suzuki@email.com"]
+    cfg.username = "yamada@email.com"
     state = AppState(config=cfg)
     state.db = Database(tmpdir)
     state.reload_nodes()
@@ -64,21 +64,21 @@ def make_test_data(state):
     from db import create_initial_node
     today = datetime.date.today().isoformat()
 
-    pj = create_initial_node("Yamada", "project1", "テストPJ", "0", 1)
+    pj = create_initial_node("yamada@email.com", "project1", "テストPJ", "0", 1)
     state.db.upsert_node(pj)
-    task_ds = create_initial_node("Yamada", "task", "テストTask", pj.name, 1)
+    task_ds = create_initial_node("yamada@email.com", "task", "テストTask", pj.name, 1)
     state.db.upsert_node(task_ds)
-    state.db.create_auto_children(task_ds, "Yamada")
+    state.db.create_auto_children(task_ds, "yamada@email.com")
 
-    ticket1 = create_initial_node("Yamada", "ticket", "チケットA", task_ds.name, 2)
+    ticket1 = create_initial_node("yamada@email.com", "ticket", "チケットA", task_ds.name, 2)
     ticket1["estimated_hours"] = 2.0
     ticket1["deadline"] = (datetime.date.today() + datetime.timedelta(days=5)).isoformat()
     state.db.upsert_node(ticket1)
 
-    ticket2 = create_initial_node("Tanaka", "ticket", "チケットB", task_ds.name, 3)
+    ticket2 = create_initial_node("tanaka@email.com", "ticket", "チケットB", task_ds.name, 3)
     ticket2["estimated_hours"] = 1.0
     ticket2["deadline"] = (datetime.date.today() + datetime.timedelta(days=10)).isoformat()
-    ticket2["assigned_to"] = "Tanaka"
+    ticket2["assigned_to"] = "tanaka@email.com"
     state.db.upsert_node(ticket2)
 
     state.reload_nodes()
@@ -92,21 +92,21 @@ def test_state_properties(state):
     """AppState の user / refresh / save / load プロパティ確認"""
     print("\n[1] AppState プロパティテスト")
     try:
-        assert state.user == "Yamada", f"user={state.user}"
-        ok("state.user == 'Yamada'")
+        assert state.user == "yamada@email.com", f"user={state.user}"
+        ok("state.user == 'yamada@email.com'")
     except Exception as e:
         ng("state.user", e)
 
     try:
-        assert state.current_member == "Yamada"
-        ok("state.current_member == 'Yamada'")
+        assert state.current_member == "yamada@email.com"
+        ok("state.current_member == 'yamada@email.com'")
     except Exception as e:
         ng("state.current_member", e)
 
     try:
-        state.current_member = "Tanaka"
-        assert state.user == "Tanaka"
-        state.current_member = "Yamada"
+        state.current_member = "tanaka@email.com"
+        assert state.user == "tanaka@email.com"
+        state.current_member = "yamada@email.com"
         ok("current_member setter → user が連動する")
     except Exception as e:
         ng("current_member setter", e)

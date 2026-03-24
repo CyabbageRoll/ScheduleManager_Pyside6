@@ -86,22 +86,38 @@ class _CalendarDialog(QDialog):
 
 
 class UserCombo(QComboBox):
-    """ユーザー一覧コンボボックス"""
-    user_changed = Signal(str)
+    """ユーザー一覧コンボボックス。表示は表示名、内部値はメールアドレス。"""
+    user_changed = Signal(str)  # メールアドレスを送出
 
-    def __init__(self, members: List[str], parent=None):
+    def __init__(self, members: List[str], display_names: dict = None, parent=None):
         super().__init__(parent)
-        self.addItems(members)
-        self.currentTextChanged.connect(self.user_changed)
+        self._display_names = display_names or {}
+        for email in members:
+            display = self._display_names.get(email, email)
+            self.addItem(display)
+            self.setItemData(self.count() - 1, email, Qt.ItemDataRole.UserRole)
+        self.currentIndexChanged.connect(self._on_index_changed)
         self.setStyleSheet(STYLE_COMBO)
 
-    def current_user(self) -> str:
-        return self.currentText()
+    def _on_index_changed(self, index: int) -> None:
+        if index >= 0:
+            email = self.itemData(index, Qt.ItemDataRole.UserRole)
+            if email:
+                self.user_changed.emit(str(email))
 
-    def set_user(self, username: str) -> None:
-        idx = self.findText(username)
+    def current_user(self) -> str:
+        """現在選択中のメールアドレスを返す"""
+        idx = self.currentIndex()
         if idx >= 0:
-            self.setCurrentIndex(idx)
+            data = self.itemData(idx, Qt.ItemDataRole.UserRole)
+            return str(data) if data else ""
+        return ""
+
+    def set_user(self, email: str) -> None:
+        for i in range(self.count()):
+            if self.itemData(i, Qt.ItemDataRole.UserRole) == email:
+                self.setCurrentIndex(i)
+                return
 
 
 class ColorCombo(QComboBox):

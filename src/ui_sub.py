@@ -459,7 +459,7 @@ class GanttView(QWidget):
 
             for c, val in enumerate(["── Task ──", title,
                                       str(task_row.get("status", "")),
-                                      str(task_row.get("assigned_to", "")),
+                                      self.state.display_name(str(task_row.get("assigned_to", ""))),
                                       f"{float(task_row.get('estimated_hours', 0) or 0):.1f}"]):
                 item = QTableWidgetItem(val)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -523,7 +523,7 @@ class GanttView(QWidget):
                     memo_str = ""
 
                 tip_lines = [
-                    f"担当      : {tr.get('assigned_to', '')}",
+                    f"担当      : {self.state.display_name(str(tr.get('assigned_to', '')))}",
                     f"開始可能日: {sa_str}" if sa_str else "開始可能日: —",
                     f"納期      : {orig_dl}" if orig_dl else "納期      : —",
                     f"見積工数  : {est_h:.1f}h  / 実績: {act_h:.1f}h",
@@ -537,7 +537,7 @@ class GanttView(QWidget):
                     f"  {status_icon} Ticket",
                     f"  {tr.get('title', '')}",
                     t_status,
-                    str(tr.get("assigned_to", "")),
+                    self.state.display_name(str(tr.get("assigned_to", ""))),
                     f"{est_h:.1f}",
                 ]):
                     item = QTableWidgetItem(val)
@@ -1214,7 +1214,7 @@ class RoadmapView(QWidget):
 
             for c, val in enumerate([
                 f"{indent}{row.get('title', '')}",
-                str(row.get("assigned_to", "")),
+                self.state.display_name(str(row.get("assigned_to", ""))),
                 status,
                 period_str,
             ]):
@@ -1364,7 +1364,7 @@ class AnalysisView(QWidget):
             member_data[m]["actual"] += float(row.get("actual_hours", 0) or 0)
             member_data[m]["est"]    += float(row.get("estimated_hours", 0) or 0)
             member_data[m]["cnt"]    += 1
-        m_rows = [[m, f"{v['actual']:.2f}", f"{v['est']:.2f}", v['cnt']]
+        m_rows = [[self.state.display_name(m), f"{v['actual']:.2f}", f"{v['est']:.2f}", v['cnt']]
                   for m, v in member_data.items()]
         self.member_table.set_rows(sorted(m_rows, key=lambda x: -float(x[1])))
 
@@ -1389,7 +1389,7 @@ class AnalysisView(QWidget):
             )
         ]
         al_rows = [[
-            r.get("title", ""), r.get("assigned_to", ""),
+            r.get("title", ""), self.state.display_name(str(r.get("assigned_to", ""))),
             f"{float(r.get('estimated_hours', 0)):.2f}",
             f"{float(r.get('actual_hours', 0)):.2f}",
             r.get("deadline", ""),
@@ -1424,7 +1424,7 @@ class SearchView(QWidget):
         self.f_member = QComboBox()
         self.f_member.addItem("（全員）", userData="")
         for m in state.members:
-            self.f_member.addItem(m, userData=m)
+            self.f_member.addItem(state.display_name(m), userData=m)
         fl.addRow("担当者:", self.f_member)
 
         status_row = QHBoxLayout()
@@ -1492,7 +1492,7 @@ class SearchView(QWidget):
         self._last_result = result
         rows = [[
             r.get("node_type", ""), r.get("title", ""),
-            r.get("assigned_to", ""), r.get("status", ""),
+            self.state.display_name(str(r.get("assigned_to", ""))), r.get("status", ""),
             r.get("estimated_hours", ""), r.get("actual_hours", ""),
             r.get("updated_at", ""),
         ] for _, r in result.iterrows()]
@@ -1551,8 +1551,8 @@ class TeamLogView(QWidget):
         layout.addWidget(self.work_table, stretch=1)
 
         layout.addWidget(QLabel("連絡事項 / 備考"))
-        INFO_COLS = ["メンバー", "安全確認", "情報"]
-        self.info_table = ScrollableTable(INFO_COLS, [120, 80, 350])
+        INFO_COLS = ["メンバー", "安全確認", "今日", "常時"]
+        self.info_table = ScrollableTable(INFO_COLS, [120, 80, 200, 200])
         layout.addWidget(self.info_table, stretch=1)
 
         self.info_lbl = InfoLabel()
@@ -1562,6 +1562,7 @@ class TeamLogView(QWidget):
         date = self.state.current_date
         df_log = self.state.df_daily_log
         df_daily = self.state.df_daily
+        all_permanent = getattr(self.state, "all_permanent_notices", {})
 
         work_rows = []
         info_rows = []
@@ -1582,8 +1583,12 @@ class TeamLogView(QWidget):
                 health  = str(row.get("health_status", "") or "")
                 safety  = str(row.get("safety", "") or "")
                 notes   = str(row.get("notes", "") or "")
-            work_rows.append([member, wh_str, place, overwork, health])
-            info_rows.append([member, safety, notes])
+            # 常時メモ（キャッシュになければDBから取得）
+            ever = all_permanent.get(member, "")
+            if not ever and self.state.db:
+                ever = self.state.db.read_permanent_notice(member)
+            work_rows.append([self.state.display_name(member), wh_str, place, overwork, health])
+            info_rows.append([self.state.display_name(member), safety, notes, ever])
 
         self.work_table.set_rows(work_rows)
         self.info_table.set_rows(info_rows)
@@ -1608,7 +1613,7 @@ class AssignmentView(QWidget):
         self.req_ticket.setMinimumWidth(250)
         self.req_to = QComboBox()
         for m in state.members:
-            self.req_to.addItem(m)
+            self.req_to.addItem(state.display_name(m), userData=m)
         self.req_msg = QLineEdit()
         self.req_msg.setPlaceholderText("メッセージ")
         req_form.addRow("チケット:", self.req_ticket)
@@ -1675,7 +1680,7 @@ class AssignmentView(QWidget):
         if not t_idx:
             QMessageBox.information(self, "情報", "チケットを選択してください")
             return
-        to_user = self.req_to.currentText()
+        to_user = self.req_to.currentData() or self.req_to.currentText()
         if to_user == self.state.user:
             QMessageBox.warning(self, "エラー", "自分には依頼できません")
             return
@@ -1685,7 +1690,7 @@ class AssignmentView(QWidget):
         self.state.df_assignments = self.state.db.read_assignments()
         self.req_msg.clear()
         self.refresh()
-        QMessageBox.information(self, "完了", f"{to_user} へ依頼しました")
+        QMessageBox.information(self, "完了", f"{self.state.display_name(to_user)} へ依頼しました")
 
     def _on_accept(self) -> None:
         asgn_idx = self.recv_table.selected_id()
@@ -1822,6 +1827,7 @@ class ConfigView(QWidget):
 
         self._build_section_database()
         self._build_section_user()
+        self._build_section_display_names()
         self._build_section_gui()
         self._build_section_schedule()
         self._build_section_daily_info()
@@ -1903,6 +1909,13 @@ class ConfigView(QWidget):
         self._text("user_username", cfg.username, fl, "username:")
         self._text("user_members", ", ".join(cfg.members), fl,
                    "members (カンマ区切り):")
+
+    def _build_section_display_names(self) -> None:
+        cfg = self.state.config
+        fl = self._group("[DisplayNames]")
+        for email, display in cfg.display_names.items():
+            key = f"dn_{email}"
+            self._text(key, display, fl, f"{email} =")
 
     def _build_section_gui(self) -> None:
         cfg = self.state.config
@@ -1994,6 +2007,11 @@ class ConfigView(QWidget):
         _ensure("User")
         parser.set("User", "username", self._get("user_username"))
         parser.set("User", "members",  self._get("user_members"))
+
+        _ensure("DisplayNames")
+        for email in self.state.config.display_names:
+            new_display = self._get(f"dn_{email}", email)
+            parser.set("DisplayNames", email, new_display)
 
         _ensure("GUI")
         parser.set("GUI", "window_width",  self._get("gui_window_width"))

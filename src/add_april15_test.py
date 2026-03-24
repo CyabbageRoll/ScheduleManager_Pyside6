@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from db import Database, create_initial_node
 
 DB_DIR = Path(__file__).parent / "db"
-OWNER = "Yamada"
+OWNER = "yamada@email.com"
 DEADLINE_4_15 = "2026-04-15"
 
 TODAY = datetime.date.today()

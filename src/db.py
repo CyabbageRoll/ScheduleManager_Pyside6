@@ -466,6 +466,15 @@ class Database:
         finally:
             conn.close()
 
+    def read_all_permanent_notices(self) -> dict:
+        """全ユーザーの常時表示メモを {username: text} の辞書で返す"""
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT username, text FROM permanent_notices").fetchall()
+            return {r[0]: r[1] for r in rows}
+        finally:
+            conn.close()
+
     def save_permanent_notice(self, username: str, text: str) -> None:
         """常時表示メモを保存する"""
         today = datetime.date.today().isoformat()

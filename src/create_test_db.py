@@ -20,8 +20,8 @@ from db import Database, create_initial_node, daily_sch_idx, DAILY_TIME_COLS
 # 設定
 # -------------------------------------------------------
 DB_DIR   = Path(__file__).parent / "db"
-MEMBERS  = ["Yamada", "Tanaka", "Suzuki"]
-OWNER    = "Yamada"   # メインオーナー
+MEMBERS  = ["yamada@email.com", "tanaka@email.com", "suzuki@email.com"]
+OWNER    = "yamada@email.com"   # メインオーナー
 
 # 今日基準の日付ヘルパー
 TODAY = datetime.date.today()
@@ -178,11 +178,11 @@ def main():
     make_ticket(db, OWNER, "キッチン仕様決定",   tk_equip, 2, 3.0,
                 start_available=d(-30), deadline=d(-25), status="done",
                 memo="クリナップ ステディア。食洗機・IH標準装備。",
-                assigned_to="Tanaka")
+                assigned_to="tanaka@email.com")
     make_ticket(db, OWNER, "浴室仕様決定",       tk_equip, 3, 2.0,
                 start_available=d(-28), deadline=d(-22), status="done",
                 memo="TOTO サザナ 1616。自動洗浄機能付き。",
-                assigned_to="Tanaka")
+                assigned_to="tanaka@email.com")
     make_ticket(db, OWNER, "電気設備・照明計画", tk_equip, 4, 4.0,
                 start_available=d(-25), deadline=d(-20), status="done",
                 memo="全LED。スイッチ・コンセント位置図を確定。")
@@ -245,7 +245,7 @@ def main():
     make_ticket(db, OWNER, "地盤改良施工",   tk_ground, 4, 16.0,
                 start_available=d(19), deadline=d(25),
                 memo="施工会社：山田基礎工業。工期3日。",
-                assigned_to="Suzuki")
+                assigned_to="suzuki@email.com")
 
     pj4_found_work = make(db, OWNER, "project4", "基礎施工", pj3_found,
                           priority=2, color="Lime",
@@ -255,19 +255,19 @@ def main():
                               start_available=d(26), deadline=d(45))
     make_ticket(db, OWNER, "根切り・砕石地業",       tk_found_work, 2, 8.0,
                 start_available=d(26), deadline=d(29),
-                assigned_to="Suzuki")
+                assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "捨てコンクリート打設",   tk_found_work, 3, 4.0,
                 start_available=d(29), deadline=d(31),
-                assigned_to="Suzuki")
+                assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "配筋工事",               tk_found_work, 4, 16.0,
                 start_available=d(31), deadline=d(36),
-                assigned_to="Suzuki")
+                assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "型枠設置・コンクリート打設", tk_found_work, 5, 8.0,
                 start_available=d(36), deadline=d(40),
-                assigned_to="Suzuki")
+                assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "養生・脱型・仕上げ",     tk_found_work, 6, 8.0,
                 start_available=d(40), deadline=d(45),
-                assigned_to="Suzuki")
+                assigned_to="suzuki@email.com")
 
     # --- Project3: 躯体工事 ---
     pj3_frame = make(db, OWNER, "project3", "躯体工事", pj2_work,
@@ -284,17 +284,17 @@ def main():
                 start_available=d(46), deadline=d(48))
     make_ticket(db, OWNER, "資材搬入・荷降ろし",     tk_timber, 3, 8.0,
                 start_available=d(55), deadline=d(57),
-                assigned_to="Suzuki")
+                assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "建方（柱・梁・小屋）",   tk_timber, 4, 24.0,
                 start_available=d(57), deadline=d(62),
-                assigned_to="Suzuki",
+                assigned_to="suzuki@email.com",
                 memo="クレーン使用。2日間で上棟予定。")
     make_ticket(db, OWNER, "上棟式準備・実施",       tk_timber, 5, 4.0,
                 start_available=d(62), deadline=d(63),
                 memo="近隣への挨拶・お礼品手配。")
     make_ticket(db, OWNER, "屋根工事（ルーフィング）", tk_timber, 6, 16.0,
                 start_available=d(63), deadline=d(70),
-                assigned_to="Suzuki")
+                assigned_to="suzuki@email.com")
 
     pj4_wall = make(db, OWNER, "project4", "外壁・防水工事", pj3_frame,
                     priority=2, color="Lime",
@@ -303,12 +303,12 @@ def main():
                         priority=1, color="Yellow",
                         start_available=d(71), deadline=d(90))
     make_ticket(db, OWNER, "透湿防水シート施工", tk_wall, 2, 8.0,
-                start_available=d(71), deadline=d(74), assigned_to="Suzuki")
+                start_available=d(71), deadline=d(74), assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "外壁サイディング施工", tk_wall, 3, 24.0,
-                start_available=d(74), deadline=d(84), assigned_to="Suzuki",
+                start_available=d(74), deadline=d(84), assigned_to="suzuki@email.com",
                 memo="ニチハ モエンエクセラード16。色：プレミアムストーン調。")
     make_ticket(db, OWNER, "バルコニー防水処理",  tk_wall, 4, 8.0,
-                start_available=d(84), deadline=d(90), assigned_to="Suzuki")
+                start_available=d(84), deadline=d(90), assigned_to="suzuki@email.com")
 
     # --- Project3: 内装工事 ---
     pj3_interior = make(db, OWNER, "project3", "内装・設備工事", pj2_work,
@@ -322,15 +322,15 @@ def main():
                             priority=1, color="Yellow",
                             start_available=d(91), deadline=d(120))
     make_ticket(db, OWNER, "断熱材施工",    tk_interior, 2, 16.0,
-                start_available=d(91), deadline=d(96), assigned_to="Suzuki")
+                start_available=d(91), deadline=d(96), assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "石膏ボード貼り", tk_interior, 3, 24.0,
-                start_available=d(96), deadline=d(105), assigned_to="Suzuki")
+                start_available=d(96), deadline=d(105), assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "クロス（壁紙）貼り", tk_interior, 4, 16.0,
-                start_available=d(105), deadline=d(112), assigned_to="Suzuki")
+                start_available=d(105), deadline=d(112), assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "床材（フローリング）施工", tk_interior, 5, 16.0,
-                start_available=d(105), deadline=d(113), assigned_to="Suzuki")
+                start_available=d(105), deadline=d(113), assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "建具（ドア・引き戸）取付", tk_interior, 6, 8.0,
-                start_available=d(113), deadline=d(118), assigned_to="Suzuki")
+                start_available=d(113), deadline=d(118), assigned_to="suzuki@email.com")
     make_ticket(db, OWNER, "造作家具・棚板施工", tk_interior, 7, 8.0,
                 start_available=d(113), deadline=d(120),
                 memo="書斎カウンター、リビング収納棚。")
@@ -342,21 +342,21 @@ def main():
                              priority=1, color="Yellow",
                              start_available=d(95), deadline=d(135))
     make_ticket(db, OWNER, "給排水配管工事",   tk_equipment, 2, 24.0,
-                start_available=d(95), deadline=d(108), assigned_to="Tanaka")
+                start_available=d(95), deadline=d(108), assigned_to="tanaka@email.com")
     make_ticket(db, OWNER, "電気配線工事",     tk_equipment, 3, 24.0,
-                start_available=d(95), deadline=d(108), assigned_to="Tanaka")
+                start_available=d(95), deadline=d(108), assigned_to="tanaka@email.com")
     make_ticket(db, OWNER, "キッチン設置",     tk_equipment, 4, 8.0,
-                start_available=d(108), deadline=d(114), assigned_to="Tanaka")
+                start_available=d(108), deadline=d(114), assigned_to="tanaka@email.com")
     make_ticket(db, OWNER, "ユニットバス設置", tk_equipment, 5, 4.0,
-                start_available=d(108), deadline=d(114), assigned_to="Tanaka")
+                start_available=d(108), deadline=d(114), assigned_to="tanaka@email.com")
     make_ticket(db, OWNER, "洗面台・トイレ設置", tk_equipment, 6, 4.0,
-                start_available=d(110), deadline=d(116), assigned_to="Tanaka")
+                start_available=d(110), deadline=d(116), assigned_to="tanaka@email.com")
     make_ticket(db, OWNER, "エアコン・換気設備設置", tk_equipment, 7, 8.0,
-                start_available=d(120), deadline=d(128), assigned_to="Tanaka")
+                start_available=d(120), deadline=d(128), assigned_to="tanaka@email.com")
     make_ticket(db, OWNER, "太陽光パネル設置", tk_equipment, 8, 8.0,
                 start_available=d(125), deadline=d(135),
                 memo="4.5kW システム。売電契約は引渡後。",
-                assigned_to="Tanaka")
+                assigned_to="tanaka@email.com")
 
     # ================================================================
     # Project2-D: 完工・引渡しフェーズ
@@ -427,7 +427,7 @@ def main():
     # ================================================================
     # メモ
     # ================================================================
-    db.save_memo("Yamada",
+    db.save_memo("yamada@email.com",
                  "【工事会社連絡先】\n"
                  "・施工管理：鈴木 090-xxxx-xxxx\n"
                  "・設計担当：田中 080-xxxx-xxxx\n\n"
@@ -462,11 +462,11 @@ def _add_sample_schedules(db: Database) -> None:
     # 対象日付と担当者
     schedule_data = [
         # (日付オフセット, メンバー, 作業スロット開始インデックス, 終了インデックス)
-        (d(-2), "Yamada", "C0900", "C1700"),
-        (d(-2), "Tanaka", "C0830", "C1730"),
-        (d(-1), "Yamada", "C0900", "C1800"),
-        (d(-1), "Suzuki", "C0800", "C1700"),
-        (d(0),  "Yamada", "C0900", "C1700"),
+        (d(-2), "yamada@email.com", "C0900", "C1700"),
+        (d(-2), "tanaka@email.com", "C0830", "C1730"),
+        (d(-1), "yamada@email.com", "C0900", "C1800"),
+        (d(-1), "suzuki@email.com", "C0800", "C1700"),
+        (d(0),  "yamada@email.com", "C0900", "C1700"),
     ]
 
     # チケットIDX（日次スケジュールに割り当てる）
@@ -538,14 +538,14 @@ def _add_sample_schedules(db: Database) -> None:
 
     # 日次ログ
     log_data = [
-        (d(-2), "Yamada", "Good",  "Office", "OK", "No",  "基礎工事の現場確認を実施しました。"),
-        (d(-2), "Tanaka", "Good",  "Home",   "OK", "No",  "給排水図面の最終確認中。"),
-        (d(-2), "Suzuki", "Good",  "Office", "OK", "Yes", "地盤改良工事の立会い。残業で報告書作成。"),
-        (d(-1), "Yamada", "Good",  "Office", "OK", "No",  "確認申請の書類を提出しました。"),
-        (d(-1), "Tanaka", "Bad",   "Home",   "OK", "No",  "体調不良のため在宅勤務。"),
-        (d(-1), "Suzuki", "Good",  "Office", "OK", "No",  "捨てコン打設完了。"),
-        (d(0),  "Yamada", "Good",  "Office", "OK", "No",  "確認済証待ち。申請番号: R8-00123。"),
-        (d(0),  "Tanaka", "Good",  "Office", "OK", "No",  ""),
+        (d(-2), "yamada@email.com", "Good",  "Office", "OK", "No",  "基礎工事の現場確認を実施しました。"),
+        (d(-2), "tanaka@email.com", "Good",  "Home",   "OK", "No",  "給排水図面の最終確認中。"),
+        (d(-2), "suzuki@email.com", "Good",  "Office", "OK", "Yes", "地盤改良工事の立会い。残業で報告書作成。"),
+        (d(-1), "yamada@email.com", "Good",  "Office", "OK", "No",  "確認申請の書類を提出しました。"),
+        (d(-1), "tanaka@email.com", "Bad",   "Home",   "OK", "No",  "体調不良のため在宅勤務。"),
+        (d(-1), "suzuki@email.com", "Good",  "Office", "OK", "No",  "捨てコン打設完了。"),
+        (d(0),  "yamada@email.com", "Good",  "Office", "OK", "No",  "確認済証待ち。申請番号: R8-00123。"),
+        (d(0),  "tanaka@email.com", "Good",  "Office", "OK", "No",  ""),
     ]
 
     import pandas as pd

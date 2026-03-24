@@ -50,8 +50,15 @@ class AppConfig:
     safety_options: List[str] = field(default_factory=lambda: ["OK", "NG"])
     overwork_options: List[str] = field(default_factory=lambda: ["No", "Yes"])
 
+    # [DisplayNames] - メールアドレス → 表示名 のマッピング
+    display_names: Dict[str, str] = field(default_factory=dict)
+
     # [Commands]
     commands: List[Dict[str, str]] = field(default_factory=list)
+
+    def get_display_name(self, email: str) -> str:
+        """メールアドレスから表示名を返す。マッピングがなければメールアドレスをそのまま返す。"""
+        return self.display_names.get(email, email)
 
     @property
     def daily_combo(self) -> Dict[str, List[str]]:
@@ -112,6 +119,11 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
         cfg.safety_options     = _split("safety",        cfg.safety_options)
         cfg.overwork_options   = _split("overwork",      cfg.overwork_options)
 
+    # [DisplayNames]
+    if parser.has_section("DisplayNames"):
+        for email, name in parser.items("DisplayNames"):
+            cfg.display_names[email] = name
+
     # [Commands]
     if parser.has_section("Commands"):
         i = 1
@@ -149,7 +161,8 @@ class AppState:
     df_daily_log: pd.DataFrame   = field(default_factory=pd.DataFrame)   # 日次ログ（全件）
     df_assignments: pd.DataFrame = field(default_factory=pd.DataFrame)   # 依頼テーブル
     memo_text: str = ""
-    permanent_notice: str = ""  # 常時表示メモ
+    permanent_notice: str = ""  # 自分の常時表示メモ
+    all_permanent_notices: Dict[str, str] = field(default_factory=dict)  # 全員の常時メモ
 
     def __post_init__(self):
         if not self.current_user:
@@ -168,6 +181,10 @@ class AppState:
             self.df_daily     = self.db.read_daily_schedule()
             self.df_daily_log = self.db.read_daily_log()
             self.df_assignments = self.db.read_assignments()
+
+    def display_name(self, email: str) -> str:
+        """メールアドレスから表示名を返す"""
+        return self.config.get_display_name(email)
 
     @property
     def members(self) -> List[str]:
@@ -213,8 +230,9 @@ class AppState:
     def reload_memo(self) -> None:
         """DB からメモ・常時表示メモを再読込"""
         if self.db:
-            self.memo_text         = self.db.read_memo(self.current_user)
-            self.permanent_notice  = self.db.read_permanent_notice(self.current_user)
+            self.memo_text              = self.db.read_memo(self.current_user)
+            self.permanent_notice       = self.db.read_permanent_notice(self.current_user)
+            self.all_permanent_notices  = self.db.read_all_permanent_notices()
 
 
 # -------------------------------------------------------
@@ -317,7 +335,7 @@ def main() -> None:
 
     window = MainWindow(state, APP_VERSION)
     window.resize(config.window_width, config.window_height)
-    window.setWindowTitle(f"{APP_NAME}  [{config.username}]")
+    window.setWindowTitle(f"{APP_NAME}  [{config.get_display_name(config.username)}]")
     window.show()
 
     logger.info("メインウィンドウ表示完了")
