@@ -15,10 +15,10 @@ from PySide6.QtWidgets import (
     QMessageBox, QFormLayout, QSplitter, QFileDialog, QGroupBox,
     QSizePolicy, QRadioButton, QButtonGroup, QCalendarWidget, QMenu,
     QDialog, QDialogButtonBox, QSpinBox, QDoubleSpinBox,
-    QTreeWidget, QTreeWidgetItem,
+    QTreeWidget, QTreeWidgetItem, QStyledItemDelegate,
 )
 from PySide6.QtCore import Qt, Signal, QDate
-from PySide6.QtGui import QColor, QFont, QAction, QCursor
+from PySide6.QtGui import QColor, QFont, QAction, QCursor, QPen
 from PySide6.QtWidgets import QToolTip
 
 import db as DB
@@ -29,6 +29,23 @@ from ui_widgets import (
 )
 
 
+# ---------- 項目4: ガントチャートセル用デリゲート ----------
+
+class _GanttCellDelegate(QStyledItemDelegate):
+    """開始可能日セルの左側に縦線を描画するデリゲート"""
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if index.data(Qt.ItemDataRole.UserRole + 10) == "start_avail":
+            painter.save()
+            pen = QPen(QColor("#2E7D32"))
+            pen.setWidth(3)
+            painter.setPen(pen)
+            r = option.rect
+            painter.drawLine(r.topLeft(), r.bottomLeft())
+            painter.restore()
+
+
 # ---------- ガントチャート ----------
 
 class GanttView(QWidget):
@@ -36,8 +53,9 @@ class GanttView(QWidget):
     ガントチャート：Task グループ別・横日付バー表示。
     左端の DailyScheduleWidget と連動して、シングルクリックで割り当て可能。
     """
-    ticket_clicked = Signal(str)   # チケット行クリック時に IDX を送出
-    edit_requested = Signal(str)    # Edit メニュー選択時に IDX を送出
+    ticket_clicked    = Signal(str)  # チケット行クリック時に IDX を送出
+    edit_requested    = Signal(str)  # Edit メニュー選択時に IDX を送出
+    request_requested = Signal(str)  # 項目3: Request メニュー選択時に IDX を送出
 
     _FIXED_COLS = 5   # 種別/タイトル/ステータス/担当者/見積h
     _COL_WIDTH_DATE = 28  # 日付列の幅(px)
@@ -109,6 +127,8 @@ class GanttView(QWidget):
         self.table.setMouseTracking(True)
         self.table.viewport().setMouseTracking(True)
         self.table.cellEntered.connect(self._on_cell_entered)
+        # 項目4: 開始可能日セルの左側縦線を描画するデリゲートを設定
+        self.table.setItemDelegate(_GanttCellDelegate(self.table))
         layout.addWidget(self.table, stretch=1)
 
         self.info = InfoLabel()
@@ -568,7 +588,8 @@ class GanttView(QWidget):
                             item.setText("🚩")
                             item.setBackground(QColor("#FFCDD2"))
                         elif start_avail and d == start_avail:
-                            item.setText("▶")
+                            # 項目4: 開始可能日: アイコンなし、左側線マーカーのみ
+                            item.setData(Qt.ItemDataRole.UserRole + 10, "start_avail")
                             item.setBackground(QColor("#C8E6C9"))
                         elif d in work_days:
                             item.setText("🔨")
@@ -619,7 +640,7 @@ class GanttView(QWidget):
                 self.ticket_clicked.emit(idx)
 
     def _on_context_menu(self, pos) -> None:
-        """チケット行の右クリックメニュー（自分のチケットのみ操作可能）"""
+        """チケット行の右クリックメニュー"""
         item = self.table.itemAt(pos)
         if not item:
             return
@@ -628,8 +649,18 @@ class GanttView(QWidget):
             return
         if self.state.df_nodes.loc[idx, "node_type"] != "ticket":
             return
-        # 自分のチケットのみ操作可能
-        if self.state.df_nodes.loc[idx, "assigned_to"] != self.state.user:
+
+        # 項目3: 担当者チェック前にIDXを取得し、チケットであれば全てメニューを表示
+        assigned_to = str(self.state.df_nodes.loc[idx, "assigned_to"])
+        is_own = (assigned_to == self.state.user)
+
+        # 自分以外のチケットの場合はRequestのみ表示
+        if not is_own:
+            menu = QMenu(self)
+            menu.addSeparator()
+            menu.addAction(QAction("📨 Request", self,
+                                    triggered=lambda: self.request_requested.emit(idx)))
+            menu.exec(self.table.viewport().mapToGlobal(pos))
             return
 
         def _change_date(field: str) -> None:
@@ -677,6 +708,7 @@ class GanttView(QWidget):
             if ans == QMessageBox.StandardButton.Yes:
                 _set_status("deleted")
 
+        # 自分のチケット: 全メニューを表示
         menu = QMenu(self)
         menu.addAction(QAction("✏ Edit", self, triggered=lambda: self.edit_requested.emit(idx)))
         menu.addSeparator()
@@ -692,6 +724,10 @@ class GanttView(QWidget):
             menu.addAction(act)
         menu.addSeparator()
         menu.addAction(QAction("🗑 Delete", self, triggered=_delete_ticket))
+        # 項目3: Requestメニューを追加
+        menu.addSeparator()
+        menu.addAction(QAction("📨 Request", self,
+                                triggered=lambda: self.request_requested.emit(idx)))
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
 
@@ -702,6 +738,7 @@ class RoadmapView(QWidget):
 
     edit_requested       = Signal(str)  # Edit タブにジャンプしてノードを表示
     edit_popup_requested = Signal(str)  # ポップアップダイアログで編集
+    request_requested    = Signal(str)  # 項目3: Request メニュー選択時に IDX を送出
 
     _LEVEL_TYPES = [
         ("Project2", "project2"),
@@ -954,9 +991,13 @@ class RoadmapView(QWidget):
             return
         menu = QMenu(self)
         act_edit = menu.addAction("Edit（Editタブで開く）")
+        # 項目3: Requestメニューを追加
+        act_req = menu.addAction("📨 Request")
         chosen = menu.exec(QCursor.pos())
         if chosen == act_edit:
             self.edit_requested.emit(idx)
+        elif chosen == act_req:
+            self.request_requested.emit(idx)
 
     # ── 実績データ ──
 
@@ -1172,6 +1213,17 @@ class RoadmapView(QWidget):
         # 表示済み親チェーンの管理（前の行との差分でヘッダー行を挿入）
         prev_chain: list = []
         count = 0
+
+        # 項目1: 親チェーン順でソートして親が同じものが連続するようにする
+        def _sort_key(idx):
+            chain = self._get_parent_chain(df, idx)
+            # 祖先の priority リスト + 自身の priority
+            prios = [int(df.loc[pid, "priority"] or 9999) for _, pid, _ in chain]
+            prios.append(int(df.loc[idx, "priority"] or 9999) if idx in df.index else 9999)
+            return prios
+
+        sorted_idxs = sorted(items.index, key=_sort_key)
+        items = items.loc[sorted_idxs]
 
         for idx, row in items.iterrows():
             if filter_idx is not None:
@@ -1611,13 +1663,26 @@ class AssignmentView(QWidget):
         req_form = QFormLayout(req_box)
         self.req_ticket = QComboBox()
         self.req_ticket.setMinimumWidth(250)
-        self.req_to = QComboBox()
+
+        # 項目2: 送り先をチェックボックスで複数選択
+        self._req_to_checks: dict[str, QCheckBox] = {}
+        checks_widget = QWidget()
+        checks_layout = QHBoxLayout(checks_widget)
+        checks_layout.setContentsMargins(0, 0, 0, 0)
+        checks_layout.setSpacing(6)
         for m in state.members:
-            self.req_to.addItem(state.display_name(m), userData=m)
+            cb = QCheckBox(state.display_name(m))
+            if m == state.user:
+                # 自分自身はチェック不可
+                cb.setEnabled(False)
+            checks_layout.addWidget(cb)
+            self._req_to_checks[m] = cb
+        checks_layout.addStretch()
+
         self.req_msg = QLineEdit()
         self.req_msg.setPlaceholderText("メッセージ")
         req_form.addRow("チケット:", self.req_ticket)
-        req_form.addRow("送り先:",   self.req_to)
+        req_form.addRow("送り先:", checks_widget)
         req_form.addRow("メッセージ:", self.req_msg)
         send_btn = QPushButton("依頼送信")
         send_btn.setStyleSheet(STYLE_BUTTON)
@@ -1676,21 +1741,41 @@ class AssignmentView(QWidget):
         self.recv_table.set_rows(rows, ids)
 
     def _on_send(self) -> None:
+        """依頼を送信する"""
         t_idx = self.req_ticket.currentData()
         if not t_idx:
             QMessageBox.information(self, "情報", "チケットを選択してください")
             return
-        to_user = self.req_to.currentData() or self.req_to.currentText()
-        if to_user == self.state.user:
-            QMessageBox.warning(self, "エラー", "自分には依頼できません")
+
+        # チェックされたメンバーを収集（自分自身を除外）
+        selected_members = [
+            m for m, cb in self._req_to_checks.items()
+            if cb.isChecked() and m != self.state.user
+        ]
+        if not selected_members:
+            QMessageBox.warning(self, "エラー", "送り先を1人以上選択してください")
             return
-        self.state.db.create_assignment(
-            t_idx, self.state.user, to_user, self.req_msg.text()
-        )
+
+        # 選択された全メンバーに送信
+        for to_user in selected_members:
+            self.state.db.create_assignment(
+                t_idx, self.state.user, to_user, self.req_msg.text()
+            )
         self.state.df_assignments = self.state.db.read_assignments()
         self.req_msg.clear()
+        # チェックボックスをリセット
+        for cb in self._req_to_checks.values():
+            cb.setChecked(False)
         self.refresh()
-        QMessageBox.information(self, "完了", f"{self.state.display_name(to_user)} へ依頼しました")
+        names = ", ".join(self.state.display_name(m) for m in selected_members)
+        QMessageBox.information(self, "完了", f"{names} へ依頼しました")
+
+    def select_ticket(self, ticket_idx: str) -> None:
+        """外部から呼ばれた時にチケットを選択状態にする"""
+        for i in range(self.req_ticket.count()):
+            if self.req_ticket.itemData(i) == ticket_idx:
+                self.req_ticket.setCurrentIndex(i)
+                break
 
     def _on_accept(self) -> None:
         asgn_idx = self.recv_table.selected_id()
@@ -1772,6 +1857,25 @@ class VersionView(QWidget):
         info_text.setWordWrap(True)
         layout.addWidget(info_text)
 
+        # 項目9: UPDATE_APP.txt の内容を表示
+        layout.addWidget(Separator())
+        layout.addWidget(QLabel("📋 アップデート内容 (UPDATE_APP.txt)"))
+
+        self.update_text = QTextEdit()
+        self.update_text.setReadOnly(True)  # 編集不可
+        self.update_text.setFont(QFont("Courier New", 9))
+        self.update_text.setPlaceholderText("UPDATE_APP.txt が見つかりません")
+
+        # UPDATE_APP.txt を読み込んで表示
+        _update_txt_path = Path(__file__).parent / "UPDATE_APP.txt"
+        if _update_txt_path.exists():
+            try:
+                self.update_text.setPlainText(_update_txt_path.read_text(encoding="utf-8"))
+            except Exception:
+                self.update_text.setPlainText("(読み込みエラー)")
+
+        layout.addWidget(self.update_text, stretch=1)
+
         layout.addWidget(Separator())
         layout.addWidget(QLabel("バグ・改善レポート"))
         self.report_edit = QTextEdit()
@@ -1789,9 +1893,56 @@ class VersionView(QWidget):
         pass
 
     def _on_save(self) -> None:
+        """バグ・改善レポートを保存する"""
+        import json
         report = self.report_edit.toPlainText()
-        self.state.db.save_memo(f"_report_{self.state.user}", report)
-        QMessageBox.information(self, "完了", "レポートを保存しました")
+        if not report.strip():
+            QMessageBox.information(self, "情報", "内容が空です")
+            return
+
+        # 項目10: __server_log_dir.json から保存先ディレクトリを取得
+        log_dir = None
+        json_path = Path(__file__).parent / "__server_log_dir.json"
+        if json_path.exists():
+            try:
+                data = json.loads(json_path.read_text(encoding="utf-8"))
+                raw_path = data.get("PortablePy_Log", "")
+                if raw_path:
+                    # 相対パスは __server_log_dir.json の場所を基準に解決
+                    log_dir = (Path(__file__).parent / raw_path).resolve()
+            except Exception:
+                pass
+
+        if log_dir:
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = log_dir / f"report_{self.state.user}_{timestamp}.txt"
+                filename.write_text(report, encoding="utf-8")
+                self.report_edit.clear()
+                QMessageBox.information(self, "完了", f"レポートを保存しました\n{filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "保存エラー", str(e))
+        else:
+            # フォールバック: DB に保存
+            self.state.db.save_memo(f"_report_{self.state.user}", report)
+            QMessageBox.information(self, "完了", "レポートを保存しました（DB）")
+
+
+# ---------- 項目8: スクロールホイール禁止スピンボックス ----------
+
+class _NoWheelSpinBox(QSpinBox):
+    """マウスホイールでの値変更を禁止したスピンボックス"""
+
+    def wheelEvent(self, e):
+        e.ignore()
+
+
+class _NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """マウスホイールでの値変更を禁止したダブルスピンボックス"""
+
+    def wheelEvent(self, e):
+        e.ignore()
 
 
 # ---------- Config 設定画面 ----------
@@ -1878,7 +2029,8 @@ class ConfigView(QWidget):
 
     def _spin(self, key: str, value: int, form: QFormLayout, label: str,
               mn: int = 0, mx: int = 9999) -> QSpinBox:
-        w = QSpinBox()
+        # 項目8: ホイール禁止スピンボックスを使用
+        w = _NoWheelSpinBox()
         w.setRange(mn, mx)
         w.setValue(int(value))
         form.addRow(label, w)
@@ -1887,7 +2039,8 @@ class ConfigView(QWidget):
 
     def _dspin(self, key: str, value: float, form: QFormLayout, label: str,
                mn: float = 0.0, mx: float = 24.0) -> QDoubleSpinBox:
-        w = QDoubleSpinBox()
+        # 項目8: ホイール禁止ダブルスピンボックスを使用
+        w = _NoWheelDoubleSpinBox()
         w.setRange(mn, mx)
         w.setDecimals(1)
         w.setSingleStep(0.5)

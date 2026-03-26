@@ -40,10 +40,11 @@ IDX_CONFIG  = 9
 # ---------- 日次スケジュール用カスタムデリゲート ----------
 
 class _HourLineDelegate(QStyledItemDelegate):
-    """毎時00分の行の上に区切り線を描画するデリゲート"""
+    """毎時00分の行の上に区切り線を描画し、同一チケットを囲むデリゲート"""
 
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
+        # 毎時区切り線
         if index.data(Qt.ItemDataRole.UserRole) == "hour":
             painter.save()
             pen = QPen(QColor("#5C6BC0"))
@@ -52,6 +53,32 @@ class _HourLineDelegate(QStyledItemDelegate):
             r = option.rect
             painter.drawLine(r.topLeft(), r.topRight())
             painter.restore()
+        # 項目6: 同一チケットの囲み線（task列のみ: col==1）
+        if index.column() == 1:
+            pos = index.data(Qt.ItemDataRole.UserRole + 1)
+            if pos in ("first", "single", "last"):
+                painter.save()
+                pen = QPen(QColor("#5C6BC0"))
+                pen.setWidth(1)
+                painter.setPen(pen)
+                r = option.rect
+                # 左右の縦線（常時）
+                painter.drawLine(r.topLeft(), r.bottomLeft())
+                painter.drawLine(r.topRight(), r.bottomRight())
+                if pos in ("first", "single"):
+                    painter.drawLine(r.topLeft(), r.topRight())
+                if pos in ("last", "single"):
+                    painter.drawLine(r.bottomLeft(), r.bottomRight())
+                painter.restore()
+            elif pos == "middle":
+                painter.save()
+                pen = QPen(QColor("#5C6BC0"))
+                pen.setWidth(1)
+                painter.setPen(pen)
+                r = option.rect
+                painter.drawLine(r.topLeft(), r.bottomLeft())
+                painter.drawLine(r.topRight(), r.bottomRight())
+                painter.restore()
 
 
 # ---------- 日次スケジュールウィジェット ----------
@@ -330,13 +357,14 @@ class DailyScheduleWidget(QWidget):
                 _ticket_title = df_nodes.loc[t_idx, "title"] if t_idx in df_nodes.index else t_idx
 
             if same_count == 0:
-                # 1行目: 親タスクのタイトルを表示
-                task_title = ""
+                # 項目5: 1行目: P1~Taskのフルパスを / 区切りで表示
+                path_parts = []
                 if t_idx in df_nodes.index:
-                    parent_id = str(df_nodes.loc[t_idx, "parent_id"])
-                    if parent_id and parent_id != "0" and parent_id in df_nodes.index:
-                        task_title = str(df_nodes.loc[parent_id, "title"])
-                display[i] = f"[{task_title}]" if task_title else f"[{_ticket_title}]"
+                    pid = str(df_nodes.loc[t_idx, "parent_id"])
+                    while pid and pid != "0" and pid in df_nodes.index:
+                        path_parts.insert(0, str(df_nodes.loc[pid, "title"]))
+                        pid = str(df_nodes.loc[pid, "parent_id"])
+                display[i] = " / ".join(path_parts) if path_parts else f"[{_ticket_title}]"
             elif same_count == 1:
                 # 2行目: チケットのタイトルを表示
                 display[i] = _ticket_title
@@ -345,6 +373,25 @@ class DailyScheduleWidget(QWidget):
                 display[i] = "↑"
             same_count += 1
 
+        # 項目6: 各スロットのチケットグループ内位置を計算
+        position_marks = [""] * 96
+        for i, col in enumerate(DB.DAILY_TIME_COLS):
+            t_idx_i = ds[col] if col in ds.index else ""
+            if not t_idx_i:
+                continue
+            prev_idx = ds[DB.DAILY_TIME_COLS[i - 1]] if i > 0 and DB.DAILY_TIME_COLS[i - 1] in ds.index else ""
+            next_idx = ds[DB.DAILY_TIME_COLS[i + 1]] if i < 95 and DB.DAILY_TIME_COLS[i + 1] in ds.index else ""
+            is_first = (t_idx_i != prev_idx)
+            is_last  = (t_idx_i != next_idx)
+            if is_first and is_last:
+                position_marks[i] = "single"
+            elif is_first:
+                position_marks[i] = "first"
+            elif is_last:
+                position_marks[i] = "last"
+            else:
+                position_marks[i] = "middle"
+
         for i in range(96):
             col = DB.DAILY_TIME_COLS[i]
             t_idx = ds[col] if col in ds.index else ""
@@ -352,6 +399,8 @@ class DailyScheduleWidget(QWidget):
             if item:
                 item.setText(display[i])
                 item.setData(Qt.ItemDataRole.UserRole, t_idx)
+                # 項目6: グループ内位置をアイテムに保存
+                item.setData(Qt.ItemDataRole.UserRole + 1, position_marks[i])
                 if t_idx and t_idx in df_nodes.index:
                     hex_c = COLOR_OPTIONS.get(
                         df_nodes.loc[t_idx, "color"], "#00BCD4"
@@ -460,15 +509,6 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        # ユーザー選択
-        tb.addWidget(QLabel(" 表示メンバー: "))
-        self.user_combo = UserCombo(self.state.members, self.state.config.display_names)
-        self.user_combo.set_user(self.state.current_member)
-        self.user_combo.user_changed.connect(self._on_member_changed)
-        tb.addWidget(self.user_combo)
-
-        tb.addSeparator()
-
         # Save / Load
         for label, slot in [("💾 保存 (Ctrl+S)", self._on_save),
                              ("🔄 読込 (Ctrl+R)", self._on_load)]:
@@ -521,6 +561,39 @@ class MainWindow(QMainWindow):
             tb.addWidget(btn)
             self._tab_btns[view_idx] = btn
 
+        # 項目7: 2行目のツールバーにメンバーボタンを追加
+        self.addToolBarBreak()
+        tb2 = QToolBar("メンバー選択ツールバー")
+        tb2.setMovable(False)
+        tb2.setStyleSheet(
+            "QToolBar { background: #F5F5F5; border-bottom: 1px solid #CFD8DC; padding: 2px; }"
+        )
+        self.addToolBar(tb2)
+        tb2.addWidget(QLabel(" メンバー: "))
+
+        # メンバーボタン（ボタン形式で素早く切替）
+        _MEMBER_STYLE = (
+            "QPushButton {"
+            " background: #ECEFF1; color: #37474F;"
+            " border: 1px solid #B0BEC5; border-radius: 4px;"
+            " padding: 3px 10px; font-size: 8pt; }"
+            "QPushButton:checked {"
+            " background: #1565C0; color: white;"
+            " border: 1px solid #0D47A1; }"
+            "QPushButton:hover:!checked {"
+            " background: #E3F2FD; border-color: #64B5F6; color: #1565C0; }"
+        )
+        self._member_btns: dict = {}
+        for m in self.state.members:
+            display = self.state.display_name(m)
+            btn = QPushButton(display)
+            btn.setCheckable(True)
+            btn.setChecked(m == self.state.current_member)
+            btn.setStyleSheet(_MEMBER_STYLE)
+            btn.clicked.connect(lambda checked=False, member=m: self._on_member_changed(member))
+            tb2.addWidget(btn)
+            self._member_btns[m] = btn
+
     # ---------- 中央ウィジェット ----------
 
     def _build_central(self) -> None:
@@ -564,6 +637,9 @@ class MainWindow(QMainWindow):
         self.gantt_view.edit_requested.connect(self._on_gantt_edit_requested)
         self.road_view.edit_requested.connect(self._on_gantt_edit_requested)
         self.road_view.edit_popup_requested.connect(self._on_roadmap_edit_popup)
+        # 項目3: Request シグナル接続
+        self.gantt_view.request_requested.connect(self._on_request_requested)
+        self.road_view.request_requested.connect(self._on_request_requested)
 
     # ---------- ショートカット ----------
 
@@ -619,7 +695,11 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def _on_member_changed(self, member: str) -> None:
+        """項目7: メンバー選択時にボタンのチェック状態を更新"""
         self.state.current_member = member
+        # ボタンのチェック状態を更新
+        for m, btn in getattr(self, "_member_btns", {}).items():
+            btn.setChecked(m == member)
         self.refresh()
 
     def _on_save(self) -> None:
@@ -652,6 +732,11 @@ class MainWindow(QMainWindow):
                 if it and it.data(Qt.ItemDataRole.UserRole) == idx:
                     table.selectRow(r)
                     break
+
+    def _on_request_requested(self, idx: str) -> None:
+        """項目3: 依頼タブに切替してチケットを選択状態にする"""
+        self._switch_view(IDX_ASSIGN)
+        self.assign_view.select_ticket(idx)
 
     def _on_roadmap_edit_popup(self, idx: str) -> None:
         """ロードマップのダブルクリック → ポップアップダイアログで編集"""
