@@ -35,12 +35,14 @@ def parse_ticket_text(text: str, parent_id: str, owner: str,
     """
     results: List[pd.Series] = []
     errors: List[str] = []
+    # 既存チケット名の重複チェック用セット（同一親 ID 配下のタイトルを収集）
     existing_titles = set(
         df_nodes[df_nodes["parent_id"] == parent_id]["title"].tolist()
     ) if not df_nodes.empty else set()
 
     for line_no, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
+        # コメント行・空行はスキップ
         if not line or line.startswith("#"):
             continue
 
@@ -127,8 +129,14 @@ def _parse_date(s: str) -> Optional[str]:
 def edf_schedule(df_nodes: pd.DataFrame, task_idx: str,
                  daily_hours: float = 5.0) -> List[str]:
     """
-    同一 Task 配下の Ticket を EDF + 優先度順に並べ替え、
+    同一 Task 配下の Ticket を EDF（Earliest Deadline First）+ 優先度順に並べ替え、
     各チケットへの推奨開始日を計算して df_nodes を更新する。
+
+    アルゴリズム概要:
+      1. 対象 Task 配下の有効チケット（cancel/deleted 除く）を収集
+      2. fill_deadlines_backward() で納期未設定チケットに仮納期を逆算設定
+      3. 仮納期昇順 → 同一納期内は優先度昇順でソート（EDF）
+      4. 順序付き IDX リストを返す（UI 側でこの順に表示）
 
     Returns:
         順序付き ticket IDX リスト
@@ -155,7 +163,7 @@ def edf_schedule(df_nodes: pd.DataFrame, task_idx: str,
     # 納期が未設定のチケットに逆算で設定（daily_hours を渡す）
     tickets = fill_deadlines_backward(tickets, daily_h=daily_hours, parent_deadline=parent_dl)
 
-    # EDF: 納期昇順、同一納期内は優先度昇順
+    # EDF: 納期昇順、同一納期内は優先度昇順（納期なしは最後に配置）
     tickets["_deadline_sort"] = pd.to_datetime(
         tickets["deadline"], errors="coerce"
     )
@@ -173,6 +181,9 @@ def fill_deadlines_backward(tickets: pd.DataFrame, daily_h: float = 5.0,
     納期未設定チケットに対して、後ろ（優先度大=後で実行）のチケットの納期から
     逆算して仮の納期を設定する。
 
+    概要: 優先度降順（後から前）にチケットを走査し、
+    直後チケットの作業開始日を起点に「前日」を仮納期として割り当てる。
+
     アルゴリズム（優先度降順＝後ろから順に処理）:
       直後チケットの実行開始日 = 直後納期 - (ceil(直後残工数/daily_h) - 1) 日
       現チケットの仮納期       = 直後チケットの実行開始日 - 1日
@@ -185,6 +196,7 @@ def fill_deadlines_backward(tickets: pd.DataFrame, daily_h: float = 5.0,
       Ticket2残工数=15h → 3日必要 → 3/3〜3/5に作業 → 開始日=3/3
       Ticket1仮納期=3/3-1=3/2 ✓
     """
+    # 優先度降順（後ろのチケットから逆算するため）にソート
     df = tickets.copy().sort_values("priority", ascending=False)
     prev_start: Optional[datetime.date] = None  # 直後チケットの実行開始日
     first_row = True  # 最初に処理される行 = 優先度最大 = 最後に実行されるチケット
@@ -193,14 +205,16 @@ def fill_deadlines_backward(tickets: pd.DataFrame, daily_h: float = 5.0,
         dl_raw = df.loc[idx, "deadline"]
         est_h = float(df.loc[idx, "estimated_hours"] or 0)
         act_h = float(df.loc[idx, "actual_hours"] or 0)
+        # 残工数（既に実績がある分を除く）
         remaining_h = max(0.0, est_h - act_h)
 
-        # 必要日数（切り上げ）
+        # 必要日数（切り上げ整数演算: Python の -(-a//b) を利用）
         if remaining_h > 0.001:
             days_needed = max(1, -(-int(remaining_h * 100) // int(daily_h * 100)))
         else:
             days_needed = 0
 
+        # NaN・空文字列・"None" 文字列を「納期なし」と扱う
         has_deadline = (dl_raw and str(dl_raw) not in ("", "nan", "None")
                         and dl_raw == dl_raw)
 
@@ -212,9 +226,10 @@ def fill_deadlines_backward(tickets: pd.DataFrame, daily_h: float = 5.0,
         first_row = False
 
         if has_deadline:
-            # 納期設定済み: 実行開始日を計算して prev_start に保持
+            # 納期設定済み: 作業期間から実行開始日を逆算して prev_start に保持
             dl = datetime.date.fromisoformat(str(dl_raw))
             if days_needed > 0:
+                # 例: 3 日必要で納期 3/5 → 3/3 から開始
                 prev_start = dl - datetime.timedelta(days=days_needed - 1)
             else:
                 prev_start = dl + datetime.timedelta(days=1)
@@ -235,7 +250,8 @@ def fill_deadlines_backward(tickets: pd.DataFrame, daily_h: float = 5.0,
 
 def check_auto_done(df_nodes: pd.DataFrame, changed_idx: str) -> List[str]:
     """
-    「完了」チケットが done になったとき、親を自動 done にする。
+    「完了」チケットが done になったとき、親ノードを自動 done にする（仕様 2.2）。
+    全兄弟ノードが done/cancel/deleted なら親も done にする。
     返り値: done にすべき親 IDX のリスト
     """
     to_done: List[str] = []
@@ -250,11 +266,12 @@ def check_auto_done(df_nodes: pd.DataFrame, changed_idx: str) -> List[str]:
     if parent_id == "0" or parent_id not in df_nodes.index:
         return to_done
 
-    # 親の子ノードに cancel/deleted 以外の未完了があるか
+    # 親の子ノードに cancel/deleted/done 以外の未完了ノードがあるか確認
     siblings = df_nodes[
         (df_nodes["parent_id"] == parent_id)
         & (~df_nodes["status"].isin(["cancel", "deleted", "done"]))
     ]
+    # 全て完了・取消・削除の場合のみ親を done にする
     if siblings.empty:
         to_done.append(parent_id)
 
@@ -271,7 +288,8 @@ def filter_nodes(df: pd.DataFrame,
                  date_to: str = "",
                  node_types: Optional[List[str]] = None) -> pd.DataFrame:
     """
-    条件に合うノードを返す。
+    複合条件でノードをフィルタリングして返す。
+    deleted ステータスは常に除外する。各条件は AND で結合される。
     """
     if df.empty:
         return df
@@ -279,6 +297,7 @@ def filter_nodes(df: pd.DataFrame,
     result = df.copy()
 
     if keyword:
+        # タイトルまたはメモにキーワードが含まれる行を抽出（大文字小文字を区別しない）
         kw = keyword.lower()
         mask = (
             result.get("title", pd.Series(dtype=str)).fillna("").str.lower().str.contains(kw)
@@ -326,6 +345,7 @@ def export_excel(df: pd.DataFrame, filepath: str) -> None:
 def calc_working_hours(df_daily: pd.DataFrame, idx: str) -> dict:
     """
     daily_schedule の1行から勤務時間情報を計算して返す。
+    連続するスロット間の空きを休憩として計算する。
     戻り値: {"total": float, "from": str, "to": str, "break": float}
     """
     empty = {"total": 0.0, "from": "", "to": "", "break": 0.0}

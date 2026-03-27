@@ -10,8 +10,11 @@ from pathlib import Path
 import pandas as pd
 
 # --- 定数 ---
+# ノード種別の一覧（Project1〜4の階層構造 + タスク + チケット）
 NODE_TYPES = ["project1", "project2", "project3", "project4", "task", "ticket"]
+# ステータスの選択肢（deleted は論理削除用）
 STATUS_LIST = ["todo", "done", "cancel", "regularly", "deleted"]
+# 各ノード種別の直下子種別マッピング（Ticketはキー無し → 子作成不可）
 CHILD_TYPE = {
     "project1": "project2",
     "project2": "project3",
@@ -25,7 +28,7 @@ NODE_COLUMNS = [
     "deadline", "start_available", "actual_start", "actual_end",
     "memo", "color", "created_at", "updated_at",
 ]
-# daily_schedule の時間スロット列名
+# daily_schedule の時間スロット列名（C0000〜C2345 の 96 列、15分刻み）
 DAILY_TIME_COLS = [f"C{i // 4:02d}{(i % 4) * 15:02d}" for i in range(24 * 4)]
 DAILY_SCH_COLS = (["IDX", "Owner"] + DAILY_TIME_COLS
                   + ["CTOTAL", "CFROM", "CTO", "CBREAK", "Last_Update"])
@@ -59,7 +62,7 @@ DEFAULT_COLORS_BY_TYPE = {
 
 # --- IDX ユーティリティ ---
 def generate_idx(owner: str) -> str:
-    """YYMMDD_HH + MD5[:6] 形式の TEXT IDX を生成する"""
+    """YYMMDD_HH + MD5[:6] 形式の TEXT IDX を生成する。重複しにくいランダム文字列を付与。"""
     n = datetime.datetime.now().strftime("%y%m%d%H")
     rn = str(random.randint(0, 99999))
     suffix = hashlib.md5((rn + owner).encode()).hexdigest()[:6]
@@ -167,6 +170,7 @@ CREATE TABLE IF NOT EXISTS permanent_notices (
 
 
 def _daily_schedule_create_sql() -> str:
+    """15分スロット96列 + 集計列を持つ daily_schedule テーブルの CREATE 文を返す"""
     cols = ["IDX TEXT PRIMARY KEY", "Owner TEXT NOT NULL DEFAULT ''"]
     cols += [f"{c} TEXT DEFAULT ''" for c in DAILY_TIME_COLS]
     cols += [
@@ -195,6 +199,7 @@ class Database:
             self.logger.debug(msg)
 
     def _connect(self) -> sqlite3.Connection:
+        """WAL モードで SQLite 接続を開く（並列書き込みに強い設定）"""
         conn = sqlite3.connect(str(self.db_path))
         conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
@@ -220,6 +225,7 @@ class Database:
 
     def _read_df(self, sql: str, index_col: str = None,
                  params: list = None) -> pd.DataFrame:
+        """SQL を実行して DataFrame を返す汎用ヘルパー。エラー時は空 DataFrame。"""
         conn = self._connect()
         try:
             df = pd.read_sql_query(sql, conn, params=params or [])
@@ -262,11 +268,12 @@ class Database:
         return df
 
     def upsert_node(self, ds: pd.Series) -> None:
-        """1 件のノードを upsert する"""
+        """1 件のノードを upsert する（DELETE + INSERT で最新データに上書き）"""
         ds = ds.copy()
         ds["updated_at"] = datetime.date.today().isoformat()
         conn = self._connect()
         try:
+            # 既存行を一度削除してから再挿入（SQLite の UPSERT の代替）
             conn.execute("DELETE FROM nodes WHERE IDX=?", [ds.name])
             row = {c: ds.get(c, None) for c in NODE_COLUMNS[1:]}
             row_full = {"IDX": ds.name, **row}
@@ -284,9 +291,10 @@ class Database:
             conn.close()
 
     def save_nodes(self, df: pd.DataFrame, user: str) -> None:
-        """ユーザー自身の最近更新ノードを DB に保存する"""
+        """ユーザー自身の最近更新ノードを DB に保存する（直近 2 日以内を対象）"""
         if df.empty:
             return
+        # 直近 2 日以内に更新された、自分が担当するノードのみ保存対象とする
         threshold = (datetime.date.today() - datetime.timedelta(days=2)).isoformat()
         mask = (df.get("assigned_to", pd.Series(dtype=str)) == user) & \
                (df.get("updated_at", pd.Series(dtype=str)) >= threshold)
@@ -316,17 +324,20 @@ class Database:
     # ---------- daily_schedule ----------
 
     def read_daily_schedule(self) -> pd.DataFrame:
+        """全ユーザー・全日付の daily_schedule を DataFrame で返す。IDX がインデックス。"""
         df = self._read_df("SELECT * FROM daily_schedule", index_col="IDX")
         if df.empty:
             return self._empty_daily_df()
         return df
 
     def save_daily_schedule(self, df: pd.DataFrame, user: str) -> None:
+        """指定ユーザーの直近 2 日以内のスケジュール行を DB に保存する"""
         if df.empty:
             return
         threshold = (datetime.date.today() - datetime.timedelta(days=2)).isoformat()
         if "Owner" not in df.columns:
             return
+        # 自分のデータかつ直近 2 日以内のレコードのみ保存
         target = df[df["Owner"] == user].copy()
         if "Last_Update" in target.columns:
             target = target[target["Last_Update"] >= threshold]
@@ -403,6 +414,7 @@ class Database:
 
     def create_assignment(self, ticket_id: str, from_user: str,
                           to_user: str, message: str) -> None:
+        """チケット依頼レコードを新規作成する（初期ステータス: pending）"""
         idx = generate_idx(from_user)
         today = datetime.date.today().isoformat()
         conn = self._connect()
@@ -418,9 +430,11 @@ class Database:
             conn.close()
 
     def respond_assignment(self, assignment_idx: str, response: str) -> None:
+        """依頼に対する応答（accept/reject 等）を記録し responded_at を更新する"""
         today = datetime.date.today().isoformat()
         conn = self._connect()
         try:
+            # ステータスと応答日時を一括更新
             conn.execute(
                 "UPDATE task_assignments SET status=?, responded_at=? WHERE IDX=?",
                 [response, today, assignment_idx],
@@ -442,6 +456,7 @@ class Database:
             conn.close()
 
     def save_memo(self, username: str, content: str) -> None:
+        """ユーザーのメモを保存する（INSERT OR REPLACE で既存行を上書き）"""
         today = datetime.date.today().isoformat()
         conn = self._connect()
         try:
@@ -501,11 +516,11 @@ class Database:
             return df_nodes
         df = df_nodes.copy()
 
-        # Ticket をリセット
+        # Ticket の実績工数をいったんゼロリセット（全スロットから再集計するため）
         ticket_mask = df["node_type"] == "ticket"
         df.loc[ticket_mask, "actual_hours"] = 0.0
 
-        # 各スロットからカウント
+        # 各スロット（15分=0.25h）からチケットの actual_hours を積算
         if not df_daily.empty:
             for row_idx in df_daily.index:
                 for col in DAILY_TIME_COLS:
@@ -518,7 +533,7 @@ class Database:
                                 df.loc[t_idx, "actual_hours"] + 0.25
                             )
 
-        # Task 以上に集計（下位から上位へ）
+        # Task 以上に集計（下位から上位へバブルアップ）
         for nt in ["task", "project4", "project3", "project2", "project1"]:
             for idx in df[df["node_type"] == nt].index:
                 children = df[

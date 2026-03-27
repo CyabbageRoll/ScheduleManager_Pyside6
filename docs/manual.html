@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Schedule Manager v3 - 操作マニュアル</title>
+<style>
+  :root {
+    --primary: #1565C0;
+    --primary-light: #E3F2FD;
+    --accent: #2E7D32;
+    --accent-light: #E8F5E9;
+    --warn: #F57F17;
+    --warn-light: #FFF9C4;
+    --text: #212121;
+    --text-sub: #546E7A;
+    --border: #CFD8DC;
+    --bg: #FAFAFA;
+    --code-bg: #ECEFF1;
+    --sidebar-w: 260px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Hiragino Sans", "Meiryo", "Yu Gothic", sans-serif;
+    font-size: 14px; line-height: 1.7;
+    color: var(--text); background: var(--bg);
+    display: flex;
+  }
+
+  /* ── サイドバー ── */
+  nav#sidebar {
+    position: fixed; top: 0; left: 0;
+    width: var(--sidebar-w); height: 100vh;
+    overflow-y: auto;
+    background: #263238; color: #CFD8DC;
+    padding: 16px 0;
+    z-index: 100;
+  }
+  nav#sidebar .logo {
+    font-size: 13px; font-weight: bold;
+    color: white; padding: 8px 20px 16px;
+    border-bottom: 1px solid #37474F;
+    margin-bottom: 8px;
+  }
+  nav#sidebar a {
+    display: block; padding: 6px 20px;
+    color: #B0BEC5; text-decoration: none;
+    font-size: 12.5px;
+    transition: background .15s;
+  }
+  nav#sidebar a:hover { background: #37474F; color: white; }
+  nav#sidebar .section-head {
+    padding: 10px 20px 4px;
+    font-size: 11px; color: #78909C;
+    text-transform: uppercase; letter-spacing: .5px;
+    margin-top: 8px;
+  }
+  nav#sidebar a.indent { padding-left: 32px; }
+
+  /* ── メインコンテンツ ── */
+  main {
+    margin-left: var(--sidebar-w);
+    padding: 32px 48px;
+    max-width: 960px; width: 100%;
+  }
+
+  /* ── ヘッダー ── */
+  .page-header {
+    background: linear-gradient(135deg, #1565C0 0%, #0D47A1 100%);
+    color: white; padding: 40px 48px;
+    margin: -32px -48px 40px;
+  }
+  .page-header h1 { font-size: 28px; font-weight: bold; margin-bottom: 8px; }
+  .page-header p { opacity: .85; font-size: 14px; }
+
+  /* ── セクション ── */
+  h2 {
+    font-size: 20px; color: var(--primary);
+    border-left: 4px solid var(--primary);
+    padding-left: 12px; margin: 40px 0 16px;
+  }
+  h3 {
+    font-size: 16px; color: #37474F;
+    margin: 24px 0 10px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  h4 { font-size: 14px; color: #546E7A; margin: 16px 0 8px; }
+  p { margin-bottom: 10px; }
+  ul, ol { margin: 8px 0 12px 24px; }
+  li { margin-bottom: 4px; }
+
+  /* ── カード ── */
+  .card {
+    background: white; border: 1px solid var(--border);
+    border-radius: 8px; padding: 20px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06);
+  }
+  .card.info  { border-left: 4px solid var(--primary); background: var(--primary-light); }
+  .card.tip   { border-left: 4px solid var(--accent);  background: var(--accent-light); }
+  .card.warn  { border-left: 4px solid var(--warn);    background: var(--warn-light); }
+
+  /* ── テーブル ── */
+  table {
+    width: 100%; border-collapse: collapse;
+    margin-bottom: 16px; font-size: 13px;
+  }
+  th {
+    background: #37474F; color: white;
+    padding: 8px 12px; text-align: left;
+  }
+  td { padding: 7px 12px; border-bottom: 1px solid var(--border); }
+  tr:hover td { background: #F5F5F5; }
+  tr:nth-child(even) td { background: #FAFAFA; }
+
+  /* ── コード/ショートカット ── */
+  kbd {
+    background: #ECEFF1; border: 1px solid #B0BEC5;
+    border-radius: 4px; padding: 2px 7px;
+    font-family: monospace; font-size: 12px;
+    box-shadow: 0 1px 0 #90A4AE;
+  }
+  code {
+    background: var(--code-bg); padding: 1px 6px;
+    border-radius: 3px; font-size: 12.5px;
+    font-family: "Courier New", monospace;
+  }
+
+  /* ── バッジ ── */
+  .badge {
+    display: inline-block;
+    padding: 2px 8px; border-radius: 12px;
+    font-size: 11px; font-weight: bold;
+    vertical-align: middle; margin: 0 2px;
+  }
+  .badge.blue  { background: #E3F2FD; color: #1565C0; border: 1px solid #90CAF9; }
+  .badge.green { background: #E8F5E9; color: #2E7D32; border: 1px solid #A5D6A7; }
+  .badge.yellow{ background: #FFF9C4; color: #F57F17; border: 1px solid #FFE082; }
+  .badge.purple{ background: #F3E5F5; color: #6A1B9A; border: 1px solid #CE93D8; }
+  .badge.gray  { background: #ECEFF1; color: #37474F; border: 1px solid #B0BEC5; }
+  .badge.red   { background: #FFEBEE; color: #C62828; border: 1px solid #EF9A9A; }
+
+  /* ── ステップ ── */
+  .steps { counter-reset: step; list-style: none; margin-left: 0; }
+  .steps li {
+    counter-increment: step;
+    padding: 10px 12px 10px 48px;
+    margin-bottom: 8px;
+    background: white; border: 1px solid var(--border);
+    border-radius: 6px; position: relative;
+  }
+  .steps li::before {
+    content: counter(step);
+    position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+    width: 24px; height: 24px; border-radius: 50%;
+    background: var(--primary); color: white;
+    font-size: 12px; font-weight: bold;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  /* ── ツールバータブ画像代用 ── */
+  .tab-btn {
+    display: inline-block;
+    background: linear-gradient(180deg, #FFF 0%, #E8ECEF 100%);
+    border: 1px solid #B0BEC5; border-radius: 5px;
+    padding: 4px 10px; font-size: 12px; font-weight: bold;
+    color: #37474F; margin: 2px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.1);
+  }
+  .tab-btn.active {
+    background: linear-gradient(180deg, #1E88E5 0%, #1565C0 100%);
+    color: white; border-color: #0D47A1;
+  }
+
+  /* ── hr ── */
+  hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+
+  /* ── アンカーオフセット調整 ── */
+  [id] { scroll-margin-top: 16px; }
+</style>
+</head>
+<body>
+
+<!-- ===================== サイドバー ===================== -->
+<nav id="sidebar">
+  <div class="logo">📊 Schedule Manager v3<br><span style="font-weight:normal;font-size:11px;color:#78909C;">操作マニュアル</span></div>
+
+  <div class="section-head">はじめに</div>
+  <a href="#overview">アプリの概要</a>
+  <a href="#startup">起動と初期設定</a>
+  <a href="#screen">画面の見かた</a>
+
+  <div class="section-head">機能説明</div>
+  <a href="#main-tab">📊 Main（ガントチャート）</a>
+  <a class="indent" href="#daily-schedule">日次スケジュール</a>
+  <a class="indent" href="#gantt-view">ガント表示</a>
+  <a href="#plan-tab">🗺 Plan（ロードマップ）</a>
+  <a href="#edit-tab">✏ Edit（データ編集）</a>
+  <a class="indent" href="#edit-tree">階層ツリー</a>
+  <a class="indent" href="#edit-table">チケット一覧テーブル</a>
+  <a href="#team-tab">👥 Team（チームログ）</a>
+  <a href="#search-tab">🔍 Search（検索）</a>
+  <a href="#request-tab">📨 Request（タスク依頼）</a>
+  <a href="#memo-tab">📝 Memo（メモ）</a>
+  <a href="#analyze-tab">📈 Analyze（分析）</a>
+  <a href="#version-tab">ℹ Version</a>
+  <a href="#config-tab">⚙ Config（設定）</a>
+
+  <div class="section-head">リファレンス</div>
+  <a href="#shortcuts">キーボードショートカット</a>
+  <a href="#node-types">階層構造（ノード種別）</a>
+  <a href="#status-list">ステータス一覧</a>
+  <a href="#tips">Tips &amp; よくある質問</a>
+</nav>
+
+<!-- ===================== メインコンテンツ ===================== -->
+<main>
+
+<!-- ヘッダー -->
+<div class="page-header">
+  <h1>📊 Schedule Manager v3<br>操作マニュアル</h1>
+  <p>チームのプロジェクト・タスク・チケットを一元管理するスケジュール管理ツール</p>
+</div>
+
+<!-- ===================== 概要 ===================== -->
+<h2 id="overview">アプリの概要</h2>
+
+<p>Schedule Manager v3 は、チームのタスク管理と日次スケジュール管理を一体化した社内向けツールです。</p>
+
+<div class="card">
+  <h4>主な機能</h4>
+  <ul>
+    <li><strong>階層管理</strong>: Project1〜Project4 → Task → Ticket の5階層でタスクを体系化</li>
+    <li><strong>ガントチャート（Main）</strong>: 誰がいつ何をするかを日単位で可視化</li>
+    <li><strong>ロードマップ（Plan）</strong>: 日/週/月単位の長期スケジュール表示</li>
+    <li><strong>日次スケジュール</strong>: 15分刻みでその日の作業を記録</li>
+    <li><strong>チームログ（Team）</strong>: メンバー全員の勤務状況・連絡事項を一覧表示</li>
+    <li><strong>タスク依頼（Request）</strong>: 他メンバーへのチケット依頼</li>
+    <li><strong>工数分析（Analyze）</strong>: 見積vs実績の比較・超過アラート</li>
+  </ul>
+</div>
+
+<div class="card info">
+  <strong>💡 データの保存場所</strong><br>
+  全データは SQLite データベース（<code>config.ini</code> の <code>server_dir</code> で指定したフォルダ）に保存されます。
+  共有フォルダに設置することでチーム全員が同じデータを参照できます。
+</div>
+
+<!-- ===================== 起動 ===================== -->
+<h2 id="startup">起動と初期設定</h2>
+
+<h3>起動方法</h3>
+<ol class="steps">
+  <li><code>src/schedule_app.py</code> を Python で実行します<br>
+      <code>python schedule_app.py</code></li>
+  <li>同フォルダの <code>config.ini</code> が自動的に読み込まれます</li>
+  <li>メインウィンドウが表示されます（最初は <strong>Main</strong> タブが開きます）</li>
+</ol>
+
+<h3>初期設定（config.ini）</h3>
+<p>初めて使う際は <a href="#config-tab">⚙ Config タブ</a> で以下を設定してください。</p>
+
+<table>
+  <tr><th>設定項目</th><th>説明</th><th>例</th></tr>
+  <tr><td><code>username</code></td><td>自分のメールアドレス</td><td><code>yamada@example.com</code></td></tr>
+  <tr><td><code>members</code></td><td>チームメンバーのメールアドレス（カンマ区切り）</td><td><code>yamada@example.com, tanaka@example.com</code></td></tr>
+  <tr><td><code>server_dir</code></td><td>DBファイルの保存先フォルダ</td><td><code>./db</code>（共有フォルダなら <code>//server/share/db</code>）</td></tr>
+  <tr><td><code>daily_task_hour</code></td><td>1日の標準作業時間（時間）</td><td><code>5.0</code></td></tr>
+  <tr><td><code>[DisplayNames]</code></td><td>メール→表示名のマッピング</td><td><code>yamada@example.com = 山田</code></td></tr>
+</table>
+
+<div class="card warn">
+  <strong>⚠ 注意</strong>: Config タブで保存後、<strong>アプリを再起動</strong>することで設定が完全に反映されます。
+</div>
+
+<!-- ===================== 画面の見かた ===================== -->
+<h2 id="screen">画面の見かた</h2>
+
+<h3>ツールバー（1行目）</h3>
+<p>画面上部のツールバーには以下のコントロールが並んでいます。</p>
+
+<table>
+  <tr><th>コントロール</th><th>説明</th></tr>
+  <tr><td><kbd>◀</kbd> <kbd>▶</kbd></td><td>前日・翌日に移動</td></tr>
+  <tr><td>日付ボタン</td><td>クリックでカレンダーを開き日付を選択</td></tr>
+  <tr><td><kbd>⏎</kbd></td><td>今日に戻る</td></tr>
+  <tr><td><kbd>💾 保存 (Ctrl+S)</kbd></td><td>現在の編集内容をDBに保存</td></tr>
+  <tr><td><kbd>🔄 読込 (Ctrl+R)</kbd></td><td>DBから最新データを読み込む</td></tr>
+  <tr><td>タブボタン群</td><td>各機能タブへの切替（下記参照）</td></tr>
+</table>
+
+<h3>タブボタン（1行目 右側）</h3>
+<p>
+  <span class="tab-btn active">📊 Main</span>
+  <span class="tab-btn">🗺 Plan</span>
+  <span class="tab-btn">✏ Edit</span>
+  <span class="tab-btn">👥 Team</span>
+  <span class="tab-btn">🔍 Search</span>
+  <span class="tab-btn">📨 Request</span>
+  <span class="tab-btn">📝 Memo</span>
+  <span class="tab-btn">📈 Analyze</span>
+  <span class="tab-btn">ℹ Version</span>
+  <span class="tab-btn">⚙ Config</span>
+</p>
+
+<h3>メンバー切替ボタン（2行目）</h3>
+<p>ツールバー2行目に各メンバーのボタンが並びます。クリックすると表示対象メンバーが切り替わります。</p>
+
+<div class="card info">
+  <strong>💡 「自分」と「表示メンバー」</strong><br>
+  <code>config.ini</code> の <code>username</code> が「自分」です。ガントや日次スケジュールの <em>操作</em>（割り当て・編集）は自分のデータのみ可能ですが、<em>表示</em> は2行目のボタンで他のメンバーに切り替えられます。
+</div>
+
+<hr>
+
+<!-- ===================== Main タブ ===================== -->
+<h2 id="main-tab">📊 Main タブ（ガントチャート）</h2>
+<p>Main タブは画面を左右に分割した2ペイン構成です。</p>
+<ul>
+  <li><strong>左パネル</strong>: 日次スケジュール（その日の作業記録）</li>
+  <li><strong>右パネル</strong>: ガントチャート（担当チケットの進捗・作業予定）</li>
+</ul>
+
+<!-- ── 日次スケジュール ── -->
+<h3 id="daily-schedule">左パネル：日次スケジュール</h3>
+
+<h4>本日の入力フォーム</h4>
+<p>日次スケジュール上部の入力欄に、その日の勤務状況を記録します。</p>
+
+<table>
+  <tr><th>フィールド</th><th>説明</th></tr>
+  <tr><td><strong>健</strong>（健康状態）</td><td>Good / Bad などから選択</td></tr>
+  <tr><td><strong>場</strong>（勤務場所）</td><td>Office / Home などから選択</td></tr>
+  <tr><td><strong>安</strong>（安全確認）</td><td>OK / NG から選択</td></tr>
+  <tr><td><strong>残</strong>（残業）</td><td>No / Yes から選択</td></tr>
+  <tr><td><strong>今日</strong></td><td>その日だけ表示する連絡事項（自由記述）</td></tr>
+  <tr><td><strong>常時</strong></td><td>常にチームに表示し続けるメモ（フォーカスを外すと自動保存）</td></tr>
+</table>
+
+<div class="card tip">
+  <strong>✅ 自動保存</strong>: 「常時」欄はフォーカスを外すか Enter を押すと自動保存されます。他の項目は <kbd>Ctrl+S</kbd> で保存します。
+</div>
+
+<h4>スケジュールテーブルの操作</h4>
+<p>15分刻みの時間スロット（00:00〜23:45）が縦に並んでいます。</p>
+
+<ol class="steps">
+  <li>予定を記録したい時間帯の行を<strong>クリック</strong>（複数選択は <kbd>Shift+クリック</kbd> または <kbd>Ctrl+クリック</kbd>）</li>
+  <li>ガントチャートで担当の<strong>チケットをクリック</strong></li>
+  <li>選択スロットにチケットが割り当てられ、実績工数が自動更新されます</li>
+</ol>
+
+<div class="card warn">
+  <strong>⚠ 注意</strong>: 割り当てられるのは<strong>自分が担当するチケットのみ</strong>です。他のメンバーのチケットは割り当てられません。
+</div>
+
+<p><strong>Free ボタン</strong>: 選択したスロットに入力済みのチケットを消去します。</p>
+
+<!-- ── ガント表示 ── -->
+<h3 id="gantt-view">右パネル：ガントチャート</h3>
+
+<h4>フィルター</h4>
+<table>
+  <tr><th>フィルター</th><th>説明</th></tr>
+  <tr><td>ステータス（ラジオ）</td><td>Todo / All / Done / Cancel / Regularly から選択（デフォルト: Todo）</td></tr>
+  <tr><td>Project ドロップダウン</td><td>表示する Project1 を絞り込み</td></tr>
+  <tr><td>担当ドロップダウン</td><td>表示する担当者を絞り込み</td></tr>
+  <tr><td>期間（DateButton）</td><td>表示する日付範囲を選択</td></tr>
+</table>
+
+<h4>ガント表示の見かた</h4>
+<table>
+  <tr><th>マーカー</th><th>意味</th></tr>
+  <tr><td>🔨</td><td>作業予定日（システムが自動計算）</td></tr>
+  <tr><td>🏁</td><td>納期</td></tr>
+  <tr><td>左側の緑縦線</td><td>開始可能日（この日より前には作業しない）</td></tr>
+  <tr><td><span style="background:#EF5350;color:white;padding:2px 6px;border-radius:3px;">🔨赤</span></td><td>作業日が納期を超過（要対応）</td></tr>
+</table>
+
+<h4>チケットの割り当て</h4>
+<p>日次スケジュールで時間帯を選択した状態で、ガントのチケット行をクリックすると割り当てが完了します。</p>
+
+<h4>右クリックメニュー</h4>
+<p>ガントのチケット行を右クリックするとメニューが表示されます。</p>
+<ul>
+  <li><strong>✏ Edit</strong> — Edit タブでそのチケットを表示・編集</li>
+  <li><strong>📅 開始可能日変更</strong> — カレンダーで開始可能日を設定</li>
+  <li><strong>🏁 納期変更</strong> — カレンダーで納期を設定</li>
+  <li><strong>☐ ToDo / ✓ Done / ✗ Cancel / ↻ Regularly</strong> — ステータス変更</li>
+  <li><strong>🗑 Delete</strong> — チケットを削除（確認ダイアログあり）</li>
+  <li><strong>📨 Request</strong> — 他メンバーへ依頼（Request タブへ移動）</li>
+</ul>
+
+<div class="card info">
+  <strong>💡 自分のチケットと他人のチケット</strong><br>
+  自分が担当するチケットはすべてのメニューが表示されます。他人のチケットでは <strong>📨 Request のみ</strong>表示されます。
+</div>
+
+<div class="card tip">
+  <strong>✅ 作業予定日の計算について</strong><br>
+  🔨 の作業予定日はシステムが自動で計算します（EDF: Earliest Deadline First アルゴリズム）。
+  見積工数・実績工数・開始可能日・納期をもとに、1日の標準作業時間内で無理のない順序に並べます。
+  納期が設定されていないチケットには、親 Task の納期から逆算した仮納期が使われます。
+</div>
+
+<hr>
+
+<!-- ===================== Plan タブ ===================== -->
+<h2 id="plan-tab">🗺 Plan タブ（ロードマップ）</h2>
+<p>開始日〜納期の期間をバーで表示した長期スケジュール表です。計画と実績を色で確認できます。</p>
+
+<h3>上部コントロール</h3>
+<table>
+  <tr><th>コントロール</th><th>説明</th></tr>
+  <tr><td>表示レベルボタン</td><td><span class="badge green">Project2</span> <span class="badge yellow">Project3</span> <span class="badge purple">Project4</span> <span class="badge gray">Task</span> — 何の単位でバーを表示するか選択</td></tr>
+  <tr><td>単位ボタン</td><td><span class="badge blue">日</span> <span class="badge blue">週</span> <span class="badge blue">月</span> — セル1列あたりの時間単位</td></tr>
+  <tr><td>期間（DateButton）</td><td>表示する期間の開始・終了を選択（デフォルト: 会計年度）</td></tr>
+</table>
+
+<h3>左ツリー：親の絞り込み</h3>
+<p>左側のツリーから親ノードをクリックすると、その配下のアイテムのみを表示できます。（全て）を選択すると全件表示。</p>
+
+<h3>スケジュールバーの色</h3>
+<table>
+  <tr><th>色</th><th>意味</th></tr>
+  <tr><td><span style="display:inline-block;width:20px;height:14px;background:#90CAF9;border-radius:2px;vertical-align:middle;"></span> 青</td><td>計画期間（開始日〜納期）</td></tr>
+  <tr><td><span style="display:inline-block;width:20px;height:14px;background:#A5D6A7;border-radius:2px;vertical-align:middle;"></span> 緑</td><td>実績あり（その日に実際に作業した）</td></tr>
+  <tr><td><span style="display:inline-block;width:20px;height:14px;background:#80DEEA;border-radius:2px;vertical-align:middle;"></span> シアン</td><td>計画かつ実績あり</td></tr>
+  <tr><td>🏁</td><td>納期日</td></tr>
+  <tr><td>▶</td><td>開始可能日</td></tr>
+</table>
+
+<h3>ダブルクリック・右クリック</h3>
+<ul>
+  <li><strong>ダブルクリック</strong>: ポップアップダイアログで編集（自分のデータのみ）</li>
+  <li><strong>右クリック → Edit</strong>: Edit タブでそのノードを表示</li>
+  <li><strong>右クリック → Request</strong>: Request タブへ移動</li>
+</ul>
+
+<hr>
+
+<!-- ===================== Edit タブ ===================== -->
+<h2 id="edit-tab">✏ Edit タブ（データ編集）</h2>
+<p>プロジェクト・タスク・チケットの作成・編集・削除を行うメインの編集画面です。</p>
+
+<h3 id="edit-tree">左ペイン：階層ツリー</h3>
+<p>Project1（最上位）〜 Ticket（最下位）の5階層が木構造で表示されます。</p>
+<ul>
+  <li>ノードをクリックすると、右ペインにその子ノード一覧が表示されます</li>
+  <li>右クリックで新規追加・削除が可能です</li>
+  <li>ノードの種別は色とラベルで区別できます</li>
+</ul>
+
+<table>
+  <tr><th>種別</th><th>ラベル</th><th>説明</th></tr>
+  <tr><td><span class="badge" style="background:#E3F2FD;color:#1565C0;border-color:#90CAF9;">[P1]</span></td><td>Project1</td><td>最上位の大プロジェクト</td></tr>
+  <tr><td><span class="badge" style="background:#E8F5E9;color:#2E7D32;border-color:#A5D6A7;">[P2]</span></td><td>Project2</td><td>サブプロジェクト</td></tr>
+  <tr><td><span class="badge" style="background:#FFF9C4;color:#F57F17;border-color:#FFE082;">[P3]</span></td><td>Project3</td><td>フェーズ・カテゴリ</td></tr>
+  <tr><td><span class="badge" style="background:#F3E5F5;color:#6A1B9A;border-color:#CE93D8;">[P4]</span></td><td>Project4</td><td>より細かい区分</td></tr>
+  <tr><td><span class="badge gray">[Task]</span></td><td>Task</td><td>作業のまとまり</td></tr>
+  <tr><td><span class="badge" style="background:#FFFFFF;color:#546E7A;border-color:#CFD8DC;">[Tkt]</span></td><td>Ticket</td><td>個別の作業チケット（最小単位）</td></tr>
+</table>
+
+<h3 id="edit-table">右ペイン：チケット一覧テーブル</h3>
+<p>選択されたノードの子アイテムを一覧表示します。Excel のように直接編集できます。</p>
+
+<h4>テーブルの列</h4>
+<table>
+  <tr><th>列</th><th>説明</th><th>編集方法</th></tr>
+  <tr><td>順番</td><td>表示・処理の優先順位（数値が小さいほど優先）</td><td>▲▼ボタン or 直接入力</td></tr>
+  <tr><td>タイトル</td><td>チケット名</td><td>キー入力で即編集</td></tr>
+  <tr><td>ステータス</td><td>現在の状態</td><td>クリック→一覧 / <kbd>Alt+↑↓</kbd></td></tr>
+  <tr><td>担当者</td><td>チケット担当者</td><td>クリック→一覧</td></tr>
+  <tr><td>見積(h)</td><td>見積作業時間</td><td>数字キー入力</td></tr>
+  <tr><td>実績(h)</td><td>実際の作業時間（自動集計）</td><td>読み取り専用</td></tr>
+  <tr><td>開始可能日</td><td>この日以降から作業可能</td><td>クリック→カレンダー</td></tr>
+  <tr><td>納期</td><td>完了期限</td><td>クリック→カレンダー</td></tr>
+  <tr><td>メモ</td><td>補足メモ</td><td>キー入力</td></tr>
+</table>
+
+<h4>行の操作</h4>
+<table>
+  <tr><th>操作</th><th>方法</th></tr>
+  <tr><td>行を選択</td><td>クリック（複数選択は <kbd>Shift</kbd> / <kbd>Ctrl</kbd> + クリック）</td></tr>
+  <tr><td>セルを編集</td><td>セルに移動してそのままキー入力、またはダブルクリック</td></tr>
+  <tr><td>次のセルへ移動</td><td><kbd>Tab</kbd> / <kbd>→</kbd> / <kbd>↓</kbd></td></tr>
+  <tr><td>行を追加</td><td>テーブル最終行で <kbd>Ctrl+Enter</kbd>（デフォルト: 見積1h、ToDo）</td></tr>
+  <tr><td>ステータス変更</td><td>ステータス列をクリック、または <kbd>Alt+↑</kbd>/<kbd>Alt+↓</kbd></td></tr>
+  <tr><td>日付を変更</td><td>開始可能日・納期列をクリック → カレンダー表示</td></tr>
+  <tr><td>優先順位を上げる</td><td>▲ ボタン（複数選択も可）</td></tr>
+  <tr><td>優先順位を下げる</td><td>▼ ボタン（複数選択も可）</td></tr>
+  <tr><td>行を削除</td><td>🗑 削除ボタン</td></tr>
+</table>
+
+<div class="card warn">
+  <strong>⚠ 注意</strong>: 他のメンバーのデータは<strong>読み取り専用</strong>になり、編集できません。
+  実績工数は日次スケジュールへの割り当てにより自動計算されるため、手動編集は不可です。
+</div>
+
+<div class="card tip">
+  <strong>✅ 子ノードの追加制限</strong>: Ticket は最下位ノードのため、Ticket を選択した状態では子ノードを追加できません。
+</div>
+
+<hr>
+
+<!-- ===================== Team タブ ===================== -->
+<h2 id="team-tab">👥 Team タブ（チームログ）</h2>
+<p>チームメンバー全員の本日の勤務状況と連絡事項を一覧表示します。</p>
+
+<h4>表示内容</h4>
+<table>
+  <tr><th>情報</th><th>説明</th></tr>
+  <tr><td>勤務時間</td><td>日次スケジュールの記録から自動集計した実勤務時間</td></tr>
+  <tr><td>勤務場所</td><td>Office / Home など（Main タブの「場」欄の値）</td></tr>
+  <tr><td>残業</td><td>No / Yes（Main タブの「残」欄の値）</td></tr>
+  <tr><td>健康状態</td><td>Good / Bad など（Main タブの「健」欄の値）</td></tr>
+  <tr><td>安全確認</td><td>OK / NG（Main タブの「安」欄の値）</td></tr>
+  <tr><td>今日の連絡事項</td><td>その日の一時的なメッセージ</td></tr>
+  <tr><td>常時表示メモ</td><td>常にチームへ伝えたいメッセージ</td></tr>
+</table>
+
+<div class="card info">
+  <strong>💡 チームログの活用</strong>: 朝のミーティング前にこのタブを開いてメンバーの状況を確認することを推奨します。
+</div>
+
+<hr>
+
+<!-- ===================== Search タブ ===================== -->
+<h2 id="search-tab">🔍 Search タブ（検索）</h2>
+<p>階層ツリー全体からチケットやタスクをキーワード・条件で検索します。</p>
+
+<h4>検索条件</h4>
+<table>
+  <tr><th>項目</th><th>説明</th></tr>
+  <tr><td>キーワード</td><td>タイトル・メモを全文検索</td></tr>
+  <tr><td>担当者</td><td>全員 または 特定メンバーで絞り込み</td></tr>
+  <tr><td>ステータス</td><td>複数チェックで OR 検索（例: Todo ✓ Done ✓）</td></tr>
+  <tr><td>更新日範囲</td><td>指定期間内に更新されたものを抽出</td></tr>
+</table>
+
+<h4>ボタン</h4>
+<ul>
+  <li><strong>🔍 検索</strong>: 条件を指定して検索実行</li>
+  <li><strong>📋 今週の仕事</strong>: 過去7日間に更新されたノードを自動検索</li>
+  <li><strong>📤 CSV 出力 / Excel 出力</strong>: 検索結果をファイルに保存</li>
+</ul>
+
+<hr>
+
+<!-- ===================== Request タブ ===================== -->
+<h2 id="request-tab">📨 Request タブ（タスク依頼）</h2>
+<p>自分の担当チケットを他のメンバーに依頼したり、受け取った依頼を承諾・拒否します。</p>
+
+<h3>依頼を送る</h3>
+<ol class="steps">
+  <li>「チケット」ドロップダウンから依頼したいチケットを選択</li>
+  <li>「送り先」の中から依頼先メンバーにチェックを入れる（複数選択可）</li>
+  <li>「メッセージ」に一言コメントを記入（任意）</li>
+  <li>「依頼送信」ボタンをクリック</li>
+</ol>
+
+<div class="card info">
+  <strong>💡 ガント・Plan からも依頼可能</strong>: ガントや Plan でチケットを右クリック → 📨 Request を選ぶと、そのチケットが自動選択された状態で Request タブが開きます。
+</div>
+
+<h3>受信した依頼を処理する</h3>
+<ol class="steps">
+  <li>下の「受信した依頼」テーブルから処理する依頼を選択</li>
+  <li><strong>✅ 承諾</strong>: そのチケットの担当者が自分に変更されます</li>
+  <li><strong>❌ 拒否</strong>: 依頼を却下します（チケットは変更されません）</li>
+</ol>
+
+<hr>
+
+<!-- ===================== Memo タブ ===================== -->
+<h2 id="memo-tab">📝 Memo タブ（メモ）</h2>
+<p>個人用の自由メモ帳です。他のメンバーには見えません。</p>
+<ul>
+  <li>自由にテキストを記入し、「保存」ボタンでDBに保存</li>
+  <li>次回起動時も内容は保持されます</li>
+</ul>
+
+<hr>
+
+<!-- ===================== Analyze タブ ===================== -->
+<h2 id="analyze-tab">📈 Analyze タブ（工数分析）</h2>
+<p>指定期間の工数状況を集計・分析します。</p>
+
+<h4>分析内容</h4>
+<table>
+  <tr><th>集計</th><th>説明</th></tr>
+  <tr><td>担当者別 実績工数</td><td>誰がどれくらい作業したかを比較</td></tr>
+  <tr><td>Project 別 実績工数</td><td>プロジェクトごとの工数配分</td></tr>
+  <tr><td>見積 vs 実績（超過チケット）</td><td>実績が見積を超えているチケットを一覧表示（要注意チケット）</td></tr>
+</table>
+
+<p>期間は画面上部の日付入力で指定します（デフォルト: 当月1日〜今日）。</p>
+
+<hr>
+
+<!-- ===================== Version タブ ===================== -->
+<h2 id="version-tab">ℹ Version タブ</h2>
+<p>アプリのバージョン情報と、アップデート内容・改善要望レポートの送信ができます。</p>
+
+<h4>表示内容</h4>
+<ul>
+  <li><strong>バージョン情報</strong>: アプリのバージョン番号</li>
+  <li><strong>アップデート内容</strong>: <code>UPDATE_APP.txt</code> の内容を表示（読み取り専用）</li>
+  <li><strong>バグ・改善レポート</strong>: テキストを入力して「保存」するとサーバーログに保存されます</li>
+</ul>
+
+<hr>
+
+<!-- ===================== Config タブ ===================== -->
+<h2 id="config-tab">⚙ Config タブ（設定）</h2>
+<p><code>config.ini</code> の内容を GUI から閲覧・変更できます。</p>
+
+<h4>設定セクション一覧</h4>
+<table>
+  <tr><th>セクション</th><th>主な設定</th></tr>
+  <tr><td>[Database]</td><td>DB 保存フォルダのパス</td></tr>
+  <tr><td>[User]</td><td>自分のメールアドレス、チームメンバー一覧</td></tr>
+  <tr><td>[DisplayNames]</td><td>メールアドレス → 画面表示名のマッピング</td></tr>
+  <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ</td></tr>
+  <tr><td>[Schedule]</td><td>営業時間（始業・終業）、1日の標準作業時間、休日</td></tr>
+  <tr><td>[DailyInfoCombo]</td><td>健・場・安・残 の選択肢リスト</td></tr>
+  <tr><td>[Commands]</td><td>カスタムコマンドの登録</td></tr>
+</table>
+
+<div class="card warn">
+  <strong>⚠ スクロールホイール誤操作防止</strong>: 数値フィールドではマウスホイールによる値変更は無効化されています。
+  意図しないフォントサイズ変更などの事故を防ぐためです。
+</div>
+
+<p>変更後は <strong>「💾 config.ini に保存」</strong> ボタンをクリックし、<strong>アプリを再起動</strong>してください。</p>
+
+<hr>
+
+<!-- ===================== ショートカット ===================== -->
+<h2 id="shortcuts">キーボードショートカット一覧</h2>
+
+<h3>グローバル（どのタブでも使用可）</h3>
+<table>
+  <tr><th>ショートカット</th><th>動作</th></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>保存</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>R</kbd></td><td>最新データを読み込み</td></tr>
+</table>
+
+<h3>Edit タブ（テーブル操作）</h3>
+<table>
+  <tr><th>ショートカット</th><th>動作</th></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>Enter</kbd></td><td>最終行の下に新規行を追加</td></tr>
+  <tr><td><kbd>Alt</kbd>+<kbd>↑</kbd></td><td>ステータス・日付を前の選択肢に変更</td></tr>
+  <tr><td><kbd>Alt</kbd>+<kbd>↓</kbd></td><td>ステータス・日付を次の選択肢に変更</td></tr>
+  <tr><td><kbd>Tab</kbd> / <kbd>→</kbd></td><td>右のセルへ移動</td></tr>
+  <tr><td><kbd>Shift</kbd>+<kbd>Tab</kbd> / <kbd>←</kbd></td><td>左のセルへ移動</td></tr>
+  <tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>上下の行へ移動</td></tr>
+  <tr><td>任意のキー</td><td>現在のセルを即座に編集開始</td></tr>
+</table>
+
+<h3>日次スケジュール（Main タブ左パネル）</h3>
+<table>
+  <tr><th>操作</th><th>動作</th></tr>
+  <tr><td>クリック</td><td>スロットを1行選択</td></tr>
+  <tr><td><kbd>Shift</kbd>+クリック</td><td>範囲選択（複数スロット）</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+クリック</td><td>個別に複数選択</td></tr>
+</table>
+
+<hr>
+
+<!-- ===================== ノード種別 ===================== -->
+<h2 id="node-types">階層構造（ノード種別）</h2>
+
+<p>アプリでは以下の5階層でデータを管理します。</p>
+
+<div class="card">
+<pre style="font-family: monospace; font-size: 13px; line-height: 1.8; color: #37474F;">
+<span style="color:#1565C0;">[P1] 大プロジェクト</span>
+  └── <span style="color:#2E7D32;">[P2] サブプロジェクト</span>
+        └── <span style="color:#F57F17;">[P3] フェーズ・カテゴリ</span>
+              └── <span style="color:#6A1B9A;">[P4] 詳細区分</span>
+                    └── <span style="color:#37474F;">[Task] 作業のまとまり</span>
+                          └── <span style="color:#546E7A;">[Ticket] 個別チケット ← 実際の作業単位</span>
+</pre>
+</div>
+
+<ul>
+  <li><strong>Ticket が最小単位</strong>: 日次スケジュールへの割り当て・見積工数・実績工数は Ticket に紐付きます</li>
+  <li><strong>Task より上の階層</strong>: 主に分類・グルーピングのために使用。Ticket の工数は上位に積み上げられます</li>
+  <li>使わない階層は省略できます（例: P1 直下に Task を置くことも可能）</li>
+</ul>
+
+<hr>
+
+<!-- ===================== ステータス ===================== -->
+<h2 id="status-list">ステータス一覧</h2>
+
+<table>
+  <tr><th>ステータス</th><th>記号</th><th>説明</th></tr>
+  <tr><td><span class="badge blue">Todo</span></td><td>☐</td><td>未着手・進行中の作業</td></tr>
+  <tr><td><span class="badge green">Done</span></td><td>✓</td><td>完了</td></tr>
+  <tr><td><span class="badge red">Cancel</span></td><td>✗</td><td>キャンセル（不要になった作業）</td></tr>
+  <tr><td><span class="badge yellow">Regularly</span></td><td>↻</td><td>定期作業（スケジュールバーは非表示、項目名のみ表示）</td></tr>
+</table>
+
+<div class="card info">
+  <strong>💡 Done/Cancel のチケット</strong>: ガントには表示されません（「All」フィルターで表示可）。
+  実績工数は保持されるため、分析に使用できます。
+</div>
+
+<hr>
+
+<!-- ===================== Tips ===================== -->
+<h2 id="tips">Tips &amp; よくある質問</h2>
+
+<h3>Q. データの保存はいつ行われますか？</h3>
+<p>
+  常時メモ以外の変更は自動保存されません。<kbd>Ctrl+S</kbd> または「💾 保存」ボタンで明示的に保存してください。
+  保存せずにアプリを閉じると変更が失われます。
+</p>
+
+<h3>Q. チームで共有するには？</h3>
+<p>
+  <code>config.ini</code> の <code>server_dir</code> を共有フォルダのパス（例: <code>//NAS/share/scheduledb</code>）に設定し、
+  全メンバーが同じパスを指定することでデータを共有できます。
+</p>
+<div class="card warn">
+  <strong>⚠ 同時書き込みに注意</strong>: 複数ユーザーが同時に「保存」を実行した場合、最後に保存した内容が優先されます。
+  <kbd>Ctrl+R</kbd> で定期的に最新データを読み込むことを推奨します。
+</div>
+
+<h3>Q. ガントに自分のチケットが表示されません</h3>
+<ol>
+  <li>ステータスフィルターを確認（「Todo」以外のステータスは非表示になります。「All」を選択してみてください）</li>
+  <li>期間フィルターの範囲にチケットの作業予定日が含まれているか確認</li>
+  <li>担当者フィルターが正しく設定されているか確認</li>
+  <li>チケットの <code>assigned_to</code>（担当者）が自分のメールアドレスになっているか Edit タブで確認</li>
+</ol>
+
+<h3>Q. 作業予定日（🔨）が表示されません</h3>
+<p>作業予定日の表示には以下の条件が必要です。</p>
+<ul>
+  <li>チケットのステータスが Todo（Done/Cancel/Regularly は非表示）</li>
+  <li>見積工数が 0 より大きい</li>
+  <li>担当者が設定されている</li>
+</ul>
+
+<h3>Q. 納期を超過した場合はどうなりますか？</h3>
+<p>
+  作業予定日（🔨）が納期を超えた場合、そのセルが<span style="background:#EF5350;color:white;padding:1px 6px;border-radius:3px;font-size:12px;">赤</span>で強調表示されます。
+  該当チケットの見積工数を確認し、優先順位を上げるか納期を調整してください。
+</p>
+
+<h3>Q. Regularly（定期）ステータスはいつ使いますか？</h3>
+<p>
+  毎日の朝礼、週次ミーティングなど、定期的に繰り返す作業に使用します。
+  ガントのスケジュールバーは表示されませんが、項目名は一覧に残ります。
+</p>
+
+<h3>Q. 依頼（Request）を承諾したらどうなりますか？</h3>
+<p>
+  そのチケットの担当者（assigned_to）が<strong>あなたのメールアドレスに変更</strong>されます。
+  以降は自分のチケットとしてガントに表示され、日次スケジュールへの割り当てが可能になります。
+</p>
+
+<hr>
+
+<p style="text-align:center; color:#78909C; font-size:12px; margin-top:32px; padding-bottom:40px;">
+  Schedule Manager v3 操作マニュアル &nbsp;|&nbsp; 最終更新: 2026年3月
+</p>
+
+</main>
+</body>
+</html>

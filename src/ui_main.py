@@ -84,7 +84,11 @@ class _HourLineDelegate(QStyledItemDelegate):
 # ---------- 日次スケジュールウィジェット ----------
 
 class DailyScheduleWidget(QWidget):
-    """左端に常時表示される日次スケジュールパネル"""
+    """
+    左端に常時表示される日次スケジュールパネル。
+    00:00〜23:45 を 15 分刻みで表示し、各スロットにチケットを割り当てられる。
+    健康状態・就業場所・常時メモなどの日次ログ入力フォームも内包する。
+    """
 
     def __init__(self, state):
         super().__init__()
@@ -175,7 +179,7 @@ class DailyScheduleWidget(QWidget):
             " font-size: 7pt; background: #FAFAFA; }"
             "QTableWidget::item:selected { background: #7986CB; color: white; }"
         )
-        # デリゲートを設定（毎時に区切り線を描画）
+        # デリゲートを設定（毎時00分に区切り線、同一チケットに囲み線を描画）
         self.schedule_table.setItemDelegate(_HourLineDelegate(self.schedule_table))
 
         # 時刻ラベルを設定（全行フル表示、毎時にスタイルを付与）
@@ -320,14 +324,26 @@ class DailyScheduleWidget(QWidget):
             )
 
     def _rebuild_schedule(self) -> None:
-        """current_date の daily_schedule を表示する"""
+        """
+        current_date の daily_schedule をテーブルに描画する。
+
+        処理フロー:
+          1. 全スロットをクリア（白背景・空テキスト）
+          2. df_daily から current_date・current_member の行を取得
+          3. 連続チケットスロットの表示テキストを決定:
+             - 1行目: P1〜Task のフルパスを「/」区切りで
+             - 2行目: チケットタイトル
+             - 3行目以降: 「↑」で継続を示す
+          4. スロットグループ内の位置（first/middle/last/single）を計算
+          5. 各スロットに背景色・テキスト・グループ位置を設定（デリゲートが囲み線を描画）
+        """
         date = self.state.current_date
         member = self.state.current_member
         sch_idx = DB.daily_sch_idx(date, member)
         df = self.state.df_daily
         df_nodes = self.state.df_nodes
 
-        # 全スロットをクリア
+        # 全スロットをクリア（前回の表示を消す）
         for i in range(96):
             item = self.schedule_table.item(i, 1)
             if item:
@@ -347,11 +363,13 @@ class DailyScheduleWidget(QWidget):
         for i, col in enumerate(DB.DAILY_TIME_COLS):
             t_idx = ds[col] if col in ds.index else ""
             if not t_idx:
+                # 空スロットで連続カウントをリセット
                 current_ticket = ""
                 same_count = 0
                 _ticket_title = ""
                 continue
             if t_idx != current_ticket:
+                # 新しいチケットに切り替わった
                 current_ticket = t_idx
                 same_count = 0
                 _ticket_title = df_nodes.loc[t_idx, "title"] if t_idx in df_nodes.index else t_idx
@@ -369,11 +387,11 @@ class DailyScheduleWidget(QWidget):
                 # 2行目: チケットのタイトルを表示
                 display[i] = _ticket_title
             else:
-                # 3行目以降
+                # 3行目以降: 継続マークを表示
                 display[i] = "↑"
             same_count += 1
 
-        # 項目6: 各スロットのチケットグループ内位置を計算
+        # 項目6: 各スロットのチケットグループ内位置を計算（デリゲートでの囲み線描画に使用）
         position_marks = [""] * 96
         for i, col in enumerate(DB.DAILY_TIME_COLS):
             t_idx_i = ds[col] if col in ds.index else ""
@@ -597,12 +615,13 @@ class MainWindow(QMainWindow):
     # ---------- 中央ウィジェット ----------
 
     def _build_central(self) -> None:
+        """中央ウィジェットを構築する（左: 日次スケジュール / 右: スタックビュー）"""
         import ui_sub
 
-        # 左端の日次スケジュールパネル
+        # 左端の日次スケジュールパネル（ガントビュー表示時のみ表示）
         self.schedule_panel = DailyScheduleWidget(self.state)
 
-        # スタックウィジェット（各種ビュー）
+        # スタックウィジェット（各種ビューを切替）
         self.stack = QStackedWidget()
 
         # 外側スプリッター
@@ -644,6 +663,7 @@ class MainWindow(QMainWindow):
     # ---------- ショートカット ----------
 
     def _setup_shortcuts(self) -> None:
+        """キーボードショートカットを登録する（Ctrl+S: 保存、Ctrl+R: 読込、Ctrl+1〜9: ビュー切替）"""
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._on_save)
         QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._on_load)
         for i, vi in enumerate(range(1, 10)):
@@ -654,11 +674,12 @@ class MainWindow(QMainWindow):
     # ---------- ビュー切替 ----------
 
     def _switch_view(self, view_idx: int) -> None:
+        """指定インデックスのビューに切替え、タブボタンのチェック状態を更新する"""
         self.stack.setCurrentIndex(view_idx)
-        # タブボタンのチェック状態を更新
+        # タブボタンのチェック状態を更新（選択中のビューを強調）
         for vi, btn in getattr(self, "_tab_btns", {}).items():
             btn.setChecked(vi == view_idx)
-        # 日次スケジュールはガントのみ表示
+        # 日次スケジュールパネルはガントビューのみ表示
         show = view_idx == IDX_GANTT
         self.schedule_panel.setVisible(show)
         if show:
@@ -759,9 +780,10 @@ class MainWindow(QMainWindow):
     # ---------- リフレッシュ ----------
 
     def refresh(self) -> None:
-        """全サブビューを更新する"""
+        """全サブビューを更新する（Edit ペイン・スケジュールパネル・現在表示中のビュー）"""
         self.main_pane.refresh()
         self.schedule_panel.refresh()
+        # 現在表示中のビューのみ追加でリフレッシュ（二重更新を防ぐ）
         cur = self.stack.currentWidget()
         if hasattr(cur, "refresh") and cur is not self.main_pane:
             cur.refresh()
@@ -770,7 +792,10 @@ class MainWindow(QMainWindow):
 # ---------- 3 ペインレイアウト ----------
 
 class _Main3Pane(QWidget):
-    """左ツリー + 右テーブル の 2 分割ビュー（Edit 画面）"""
+    """
+    Edit 画面の 2 分割ビュー（左: 階層ツリー / 右: 子ノード一覧テーブル）。
+    TreePane でノードを選択すると TablePane が対応する子ノードを表示する。
+    """
 
     def __init__(self, state):
         super().__init__()
@@ -804,6 +829,11 @@ class _Main3Pane(QWidget):
 # ---------- 左ペイン：階層ツリー ----------
 
 class TreePane(QWidget):
+    """
+    階層ツリーペイン（Edit 画面の左側）。
+    ノードの新規作成・削除・検索・自分のみフィルタ機能を持つ。
+    ノード選択時に node_selected シグナルで IDX を TablePane へ通知する。
+    """
     node_selected = Signal(str)  # 選択された IDX
 
     def __init__(self, state):
@@ -1079,7 +1109,7 @@ class TreePane(QWidget):
 # ---------- テーブル用デリゲート ----------
 
 class _StatusDelegate(QStyledItemDelegate):
-    """ステータス列用デリゲート：コンボボックス選択、自由入力不可"""
+    """ステータス列用デリゲート：セルクリック時にコンボボックスを表示し、自由入力を禁止する"""
 
     def createEditor(self, parent, option, index):
         combo = QComboBox(parent)
@@ -1100,7 +1130,7 @@ class _StatusDelegate(QStyledItemDelegate):
 
 
 class _DateDelegate(QStyledItemDelegate):
-    """日付列用デリゲート：カレンダーポップアップ、自由入力不可"""
+    """日付列用デリゲート：セルクリック時にカレンダーポップアップを表示し、自由入力を禁止する"""
 
     def createEditor(self, parent, option, index):
         edit = QDateEdit(parent)
@@ -1134,6 +1164,11 @@ class _DateDelegate(QStyledItemDelegate):
 # ---------- 中央ペイン：子一覧テーブル ----------
 
 class TablePane(QWidget):
+    """
+    子ノード一覧テーブルペイン（Edit 画面の右側）。
+    TreePane で選択した親ノードの直下子を一覧表示し、直接編集できる。
+    node_selected シグナルでクリックした IDX を DailyScheduleWidget へ通知する。
+    """
     node_selected = Signal(str)
 
     def __init__(self, state):
@@ -1242,6 +1277,7 @@ class TablePane(QWidget):
         self._rebuild_table()
 
     def _rebuild_table(self) -> None:
+        """選択中の親ノードの子ノードをテーブルに再描画する。シグナルをブロックして再帰更新を防ぐ。"""
         self._rebuilding = True
         self.table.blockSignals(True)
         try:

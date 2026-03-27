@@ -45,7 +45,7 @@ def ng(label: str, exc: Exception = None) -> None:
 # テスト用 AppState・DB の準備
 # -------------------------------------------------------
 def make_state(tmpdir: str):
-    from main import load_config, AppState, APP_VERSION
+    from schedule_app import load_config, AppState, APP_VERSION
     from db import Database
 
     cfg = load_config()

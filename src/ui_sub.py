@@ -52,6 +52,8 @@ class GanttView(QWidget):
     """
     ガントチャート：Task グループ別・横日付バー表示。
     左端の DailyScheduleWidget と連動して、シングルクリックで割り当て可能。
+    EDF スケジューリングで算出した作業日を 🔨 マーカーで表示し、
+    開始可能日は左縦線、納期は 🏁 で示す。
     """
     ticket_clicked    = Signal(str)  # チケット行クリック時に IDX を送出
     edit_requested    = Signal(str)  # Edit メニュー選択時に IDX を送出
@@ -355,11 +357,21 @@ class GanttView(QWidget):
         return " > ".join(parts) if parts else ""
 
     def _rebuild_table(self) -> None:
+        """
+        ガントチャートテーブルを再構築する。
+
+        処理フロー:
+          1. 表示期間の日付列を生成（固定 5 列 + 日付列）
+          2. 担当者の全チケットを EDF スケジューリング（_compute_all_schedules）
+          3. Task ヘッダー行を挿入（背景色・ツールチップ付き）
+          4. 各チケット行の日付セルに 🚩/🔨/開始可能日マーカーを設定
+          5. 納期超過チケットは赤色でアラート表示
+        """
         df = self.state.df_nodes
         self._date_range = self._date_range_list()
         date_list = self._date_range
 
-        # カラム設定
+        # カラム設定（固定情報列 + 日付列）
         total_cols = self._FIXED_COLS + len(date_list)
         self.table.setColumnCount(total_cols)
         headers = ["種別", "タイトル", "ステータス", "担当者", "見積h"]
@@ -386,6 +398,7 @@ class GanttView(QWidget):
         filter_status = self._get_status_filter()
 
         # 担当者の全チケットを横断してグローバルにスケジューリング（一括計算）
+        # 戻り値: {ticket_idx: (work_days: set, start_avail, deadline)}
         global_schedule = self._compute_all_schedules(df, filter_member)
 
         tasks = df[
@@ -393,7 +406,7 @@ class GanttView(QWidget):
             & (~df["status"].isin(["deleted"]))
         ].sort_values("priority")
 
-        # 各Taskの子チケット最早作業日を計算してTaskをソート
+        # 各 Task の配下チケットの最早作業日を求め、作業開始が早い Task 順に表示
         def _earliest_work_day(task_idx):
             child_idxs = df[
                 (df["parent_id"] == task_idx)
@@ -444,7 +457,7 @@ class GanttView(QWidget):
             if not visible_tickets:
                 continue
 
-            # ── Task ヘッダー行 ──
+            # ── Task ヘッダー行を挿入（Project 階層パスをタイトルに付記）──
             parent_path = self._get_parent_path(df, task_idx)
             title = str(task_row.get("title", ""))
             if parent_path:
@@ -570,7 +583,7 @@ class GanttView(QWidget):
                         item.setBackground(t_bg)
                     self.table.setItem(r2, c, item)
 
-                # ▶（開始可能日）/ 🚩（納期）/ 🔨（作業日）マーカー
+                # ▶（開始可能日）/ 🏁（納期）/ 🔨（作業日）マーカー
                 for ci, d in enumerate(date_list):
                     item = QTableWidgetItem("")
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -583,14 +596,15 @@ class GanttView(QWidget):
                         else:
                             item.setBackground(t_bg)
                     elif t_status not in ("done", "cancel"):
-                        # 納期 > 開始可能日 > 作業日 の優先順で表示
+                        # セルのマーカー優先順: 納期🏁 > 開始可能日（左縦線）> 作業日🔨
+                        # 背景色は通常のチケット色と統一し、色の多用を避ける
                         if deadline and d == deadline:
-                            item.setText("🚩")
-                            item.setBackground(QColor("#FFCDD2"))
+                            item.setText("🏁")
+                            item.setBackground(t_bg)
                         elif start_avail and d == start_avail:
-                            # 項目4: 開始可能日: アイコンなし、左側線マーカーのみ
+                            # 開始可能日: テキストなし、左縦線デリゲートで表示
                             item.setData(Qt.ItemDataRole.UserRole + 10, "start_avail")
-                            item.setBackground(QColor("#C8E6C9"))
+                            item.setBackground(t_bg)
                         elif d in work_days:
                             item.setText("🔨")
                             if deadline and d > deadline:
@@ -714,7 +728,7 @@ class GanttView(QWidget):
         menu.addSeparator()
         menu.addAction(QAction("📅 開始可能日変更", self,
                                 triggered=lambda: _change_date("start_available")))
-        menu.addAction(QAction("🚩 納期変更", self,
+        menu.addAction(QAction("🏁 納期変更", self,
                                 triggered=lambda: _change_date("deadline")))
         menu.addSeparator()
         for s_key, s_label in [("todo", "☐ ToDo"), ("done", "✓ Done"),
@@ -734,7 +748,11 @@ class GanttView(QWidget):
 # ---------- ロードマップ（スケジュール表） ----------
 
 class RoadmapView(QWidget):
-    """ロードマップ：開始日〜納期を日/週/月単位のスケジュールバーで表示"""
+    """
+    ロードマップ：開始日〜納期を日/週/月単位のスケジュールバーで表示。
+    左ツリーで親を絞り込み、右テーブルで各ノードの計画期間・実績日を確認できる。
+    ダブルクリックでポップアップ編集ダイアログが開く。
+    """
 
     edit_requested       = Signal(str)  # Edit タブにジャンプしてノードを表示
     edit_popup_requested = Signal(str)  # ポップアップダイアログで編集
@@ -1002,7 +1020,7 @@ class RoadmapView(QWidget):
     # ── 実績データ ──
 
     def _build_actual_dates(self) -> dict:
-        """df_daily → {ticket_idx: set[date]} のマッピングを構築"""
+        """df_daily の全スロットを走査して {ticket_idx: set[date]} のマッピングを構築する"""
         result: dict = {}
         df_daily = getattr(self.state, "df_daily", None)
         if df_daily is None or df_daily.empty:
@@ -1039,7 +1057,10 @@ class RoadmapView(QWidget):
     # ── 列（ピリオド）生成 ──
 
     def _make_periods(self, d_from: datetime.date, d_to: datetime.date) -> list:
-        """cell_unit に応じた (start, end, label) のリストを返す（最大 365 列）"""
+        """
+        cell_unit（日/週/月）に応じた (start, end, label) タプルのリストを返す。
+        日: 最大 180 列、週: 最大 52 列、月: 最大 24 列。
+        """
         periods = []
         if self._cell_unit == "日":
             d = d_from
@@ -1080,7 +1101,7 @@ class RoadmapView(QWidget):
         return False
 
     def _get_parent_chain(self, df, idx: str) -> list:
-        """idx の祖先チェーンを [(ntype, pid, title), ...] で返す（P1 が先頭）"""
+        """idx の祖先チェーンを [(ntype, pid, title), ...] で返す（P1 が先頭）。テーブルのグループヘッダー生成に使用。"""
         chain = []
         pid = df.loc[idx, "parent_id"] if idx in df.index else None
         while pid and pid != "0" and pid in df.index:
@@ -1093,6 +1114,16 @@ class RoadmapView(QWidget):
         return chain
 
     def _rebuild_table(self) -> None:
+        """
+        ロードマップテーブルを再構築する。
+
+        処理フロー:
+          1. 期間ボタンから表示期間を取得し、cell_unit に応じた列（ピリオド）を生成
+          2. 表示レベル（Project2/3/4/Task）でノードを絞り込み
+          3. 祖先チェーンごとに親ヘッダー行を挿入してグループ化
+          4. 各ノード行に計画バー（青）・実績バー（緑）・両方（シアン）を描画
+          5. ツリー絞り込みで選択した親の配下ノードのみ表示
+        """
         df = self.state.df_nodes
         try:
             d_from = datetime.date.fromisoformat(self.from_btn.get_date())
@@ -1101,6 +1132,7 @@ class RoadmapView(QWidget):
             d_from = datetime.date.today()
             d_to   = d_from + datetime.timedelta(days=89)
 
+        # cell_unit（日/週/月）に応じたピリオドリストを生成
         periods    = self._make_periods(d_from, d_to)
         total_cols = self._FIXED_COLS + len(periods)
         col_w      = 50 if self._cell_unit != "日" else self._COL_W_DATE
@@ -1132,7 +1164,7 @@ class RoadmapView(QWidget):
         ].sort_values("priority")
         filter_idx = self._selected_parent_idx
 
-        # 実績データ（ticket_idx → set[date]）
+        # daily_schedule から ticket の実績作業日セットを収集（{ticket_idx: set[date]}）
         actual_dates = self._build_actual_dates()
 
         def _parse(val):
@@ -1214,13 +1246,26 @@ class RoadmapView(QWidget):
         prev_chain: list = []
         count = 0
 
+        # 親チェーン順でソートして同じ親のノードが連続するようにグループ化
         # 項目1: 親チェーン順でソートして親が同じものが連続するようにする
+        # ポイント: (priority, id) のタプルを各階層に使うことで、
+        # 同じpriorityを持つ異なる親が混在しても確実にグルーピングできる
         def _sort_key(idx):
             chain = self._get_parent_chain(df, idx)
-            # 祖先の priority リスト + 自身の priority
-            prios = [int(df.loc[pid, "priority"] or 9999) for _, pid, _ in chain]
-            prios.append(int(df.loc[idx, "priority"] or 9999) if idx in df.index else 9999)
-            return prios
+            key = []
+            for _, pid, _ in chain:
+                try:
+                    prio = float(df.loc[pid, "priority"] or 9999) if pid in df.index else 9999.0
+                except (ValueError, TypeError):
+                    prio = 9999.0
+                # (priority, id) のタプルで祖先を一意に特定してグループ化
+                key.append((prio, str(pid)))
+            try:
+                self_prio = float(df.loc[idx, "priority"] or 9999) if idx in df.index else 9999.0
+            except (ValueError, TypeError):
+                self_prio = 9999.0
+            key.append((self_prio, str(idx)))
+            return key
 
         sorted_idxs = sorted(items.index, key=_sort_key)
         items = items.loc[sorted_idxs]
@@ -1232,7 +1277,8 @@ class RoadmapView(QWidget):
 
             chain = self._get_parent_chain(df, idx)
 
-            # 共通プレフィックスを計算し、差分部分にヘッダー行を挿入
+            # 前の行と共通する祖先チェーンのプレフィックスを計算
+            # 差分部分（新しい親グループ）にのみヘッダー行を挿入する
             common = 0
             for i in range(min(len(chain), len(prev_chain))):
                 if chain[i][1] == prev_chain[i][1]:  # 同じ親 ID なら共通
@@ -1314,7 +1360,8 @@ class RoadmapView(QWidget):
                             if ps == start_avail:
                                 cell.setText("▶")
                             elif ps == deadline:
-                                cell.setText("🚩")
+                                # 納期セル: 背景は計画色と統一し🏁で示す
+                                cell.setText("🏁")
                     else:
                         cell.setBackground(bg)
                 else:

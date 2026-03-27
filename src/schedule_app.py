@@ -1,11 +1,20 @@
 """
-main.py - エントリポイント・設定・ロギング・起動
+schedule_app.py - エントリポイント・設定・ロギング・起動
+
+アプリケーションの起動フロー:
+  1. setup_logger() でログ設定
+  2. load_config() で config.ini を読み込み AppConfig 生成
+  3. Database 初期化
+  4. AppState 初期化・データロード
+  5. Qt アプリケーション・MainWindow を生成して表示
 """
 import configparser
 import datetime
+import json
 import logging
 import os
 import sys
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -271,9 +280,61 @@ def setup_logger(level: int = logging.INFO) -> logging.Logger:
 # -------------------------------------------------------
 # メイン関数
 # -------------------------------------------------------
+def _get_server_log_dir() -> Optional[Path]:
+    """
+    __server_log_dir.json の PortablePy_Log キーからサーバーログディレクトリを返す。
+    ファイルが存在しない・キーがない場合は None を返す。
+    """
+    json_path = Path(__file__).parent / "__server_log_dir.json"
+    if not json_path.exists():
+        return None
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        raw = data.get("PortablePy_Log", "")
+        if raw:
+            return (Path(__file__).parent / raw).resolve()
+    except Exception:
+        pass
+    return None
+
+
+def _setup_excepthook(logger: logging.Logger) -> None:
+    """
+    未捕捉例外をサーバーログに保存するグローバルハンドラーを設定する。
+    大きなエラー発生時に __server_log_dir.json で指定された場所へログを書き出す。
+    """
+    log_dir = _get_server_log_dir()
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        # まず通常のロガーに記録
+        logger.critical("未捕捉例外が発生しました", exc_info=(exc_type, exc_value, exc_tb))
+        # サーバーログディレクトリにも保存
+        if log_dir:
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                err_file = log_dir / f"error_{ts}.txt"
+                tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+                err_file.write_text(
+                    f"[{APP_NAME} {APP_VERSION}] 未捕捉例外\n"
+                    f"日時: {datetime.datetime.now()}\n\n"
+                    f"{tb_text}",
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass  # ログ保存自体のエラーは無視
+        # デフォルトの動作（標準エラーへの出力）も維持
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _excepthook
+
+
 def main() -> None:
     logger = setup_logger()
     logger.info(f"{APP_NAME} {APP_VERSION} 起動中...")
+
+    # グローバル例外ハンドラーを設定（未捕捉エラーをサーバーログに保存）
+    _setup_excepthook(logger)
 
     # PySide6 は import 前に QApplication が必要な場合があるため
     # ここでまとめて import する

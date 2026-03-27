@@ -33,6 +33,7 @@ class DateButton(QPushButton):
     """
     クリックするとカレンダーポップアップを表示する日付選択ボタン。
     date_changed シグナルで変更後の日付文字列（YYYY-MM-DD）を通知する。
+    カレンダーのダブルクリックでも即座に確定される。
     """
     date_changed = Signal(str)
 
@@ -54,6 +55,7 @@ class DateButton(QPushButton):
         self.setText(f"📅 {self._date}")
 
     def _open_calendar(self) -> None:
+        """カレンダーダイアログを開き、選択された日付でボタン表示を更新してシグナルを送出する"""
         dlg = _CalendarDialog(self._date, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._date = dlg.selected_date()
@@ -62,6 +64,7 @@ class DateButton(QPushButton):
 
 
 class _CalendarDialog(QDialog):
+    """DateButton が内部で使用するカレンダー選択ダイアログ（外部から直接使わない）"""
     def __init__(self, date_str: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("日付を選択")
@@ -86,12 +89,16 @@ class _CalendarDialog(QDialog):
 
 
 class UserCombo(QComboBox):
-    """ユーザー一覧コンボボックス。表示は表示名、内部値はメールアドレス。"""
+    """
+    ユーザー一覧コンボボックス。表示は表示名、内部値はメールアドレス。
+    members にメールアドレスのリストを渡し、display_names で表示名を指定する。
+    """
     user_changed = Signal(str)  # メールアドレスを送出
 
     def __init__(self, members: List[str], display_names: dict = None, parent=None):
         super().__init__(parent)
         self._display_names = display_names or {}
+        # 表示名を addItem し、UserRole にメールアドレスを保持（内部識別子）
         for email in members:
             display = self._display_names.get(email, email)
             self.addItem(display)
@@ -121,10 +128,14 @@ class UserCombo(QComboBox):
 
 
 class ColorCombo(QComboBox):
-    """カラー選択コンボボックス"""
+    """
+    カラー選択コンボボックス。
+    COLOR_OPTIONS の色名を一覧表示し、各アイテムの左にカラーアイコンを表示する。
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # DecorationRole に QColor を設定することでアイコン付き一覧を実現
         for name, hex_val in COLOR_OPTIONS.items():
             self.addItem(name)
             self.setItemData(
@@ -144,11 +155,14 @@ class ColorCombo(QComboBox):
 
 
 class ButtonRow(QWidget):
-    """横並びボタン群ウィジェット"""
+    """
+    横並びボタン群ウィジェット。
+    ボタン名からボタンオブジェクトを参照・有効/無効化できる。
+    """
 
     def __init__(self, buttons: List[tuple], parent=None):
         """
-        buttons: [("ラベル", callback), ...]
+        buttons: [("ラベル", callback), ...]  callback が None のときはボタンのみ配置
         """
         super().__init__(parent)
         layout = QHBoxLayout(self)
@@ -174,7 +188,10 @@ class ButtonRow(QWidget):
 
 
 class InfoLabel(QLabel):
-    """ステータス表示用ラベル"""
+    """
+    ステータス表示用ラベル。
+    通常メッセージは set_info()、エラーは set_error()（赤色）で表示する。
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -182,18 +199,24 @@ class InfoLabel(QLabel):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_info(self, msg: str) -> None:
+        """通常の情報メッセージを表示する"""
         self.setText(msg)
 
     def set_error(self, msg: str) -> None:
+        """エラーメッセージを赤色で表示する"""
         self.setText(f"⚠ {msg}")
         self.setStyleSheet("QLabel { color: #C62828; font-size: 10px; }")
 
 
 class AutoCombo(QComboBox):
-    """編集可能コンボボックス（候補リスト付き入力欄）"""
+    """
+    編集可能コンボボックス（候補リスト付き入力欄）。
+    ドロップダウンで候補を選ぶことも、直接テキスト入力することも可能。
+    """
 
     def __init__(self, items: List[str] = None, parent=None):
         super().__init__(parent)
+        # setEditable(True) で自由入力を許可
         self.setEditable(True)
         if items:
             self.addItems(items)
@@ -214,6 +237,7 @@ class ScrollableTable(QTableWidget):
     """
     汎用スクロール可能テーブル。
     列名リストと表示幅リストを受け取って初期化する。
+    行クリックで行全体が選択され、各行に IDX を UserRole として保持できる。
     """
 
     def __init__(self, columns: List[str], col_widths: List[int] = None,
@@ -275,7 +299,7 @@ class ScrollableTable(QTableWidget):
 
 
 class Separator(QFrame):
-    """水平区切り線"""
+    """水平区切り線（セクション間の視覚的な分割に使用）"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
