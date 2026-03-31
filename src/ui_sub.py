@@ -1830,9 +1830,12 @@ class AssignmentView(QWidget):
             return
         t_idx = self.state.df_assignments.loc[asgn_idx, "ticket_id"]
         if t_idx in self.state.df_nodes.index:
+            # インメモリを更新
             self.state.df_nodes.loc[t_idx, "assigned_to"] = self.state.user
             self.state.df_nodes.loc[t_idx, "updated_at"] = \
                 datetime.date.today().isoformat()
+            # 担当者変更をその場でDBに即時保存（次回起動まで待たずに反映）
+            self.state.db.upsert_node(self.state.df_nodes.loc[t_idx])
         self.state.db.respond_assignment(asgn_idx, "accepted")
         self.state.df_assignments = self.state.db.read_assignments()
         self.refresh()

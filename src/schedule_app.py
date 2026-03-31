@@ -4,10 +4,16 @@ schedule_app.py - エントリポイント・設定・ロギング・起動
 アプリケーションの起動フロー:
   1. setup_logger() でログ設定
   2. load_config() で config.ini を読み込み AppConfig 生成
-  3. Database 初期化
-  4. AppState 初期化・データロード
-  5. Qt アプリケーション・MainWindow を生成して表示
+  3. OSのログイン名を取得して username に設定
+  4. Database 初期化
+  5. AppState 初期化・データロード
+  6. Qt アプリケーション・MainWindow を生成して表示
+
+コマンドライン引数:
+  --debug  デバッグモード: OSログイン名を yamada の担当者IDとして扱い、
+           yamada 担当のアイテムを自分のアイテムとして表示する
 """
+import argparse
 import configparser
 import datetime
 import json
@@ -39,8 +45,9 @@ class AppConfig:
     server_dir: str = "./db"
 
     # [User]
-    username: str = "User"
-    members: List[str] = field(default_factory=lambda: ["User"])
+    # username は config.ini ではなく OS のログイン名から自動取得する
+    username: str = ""
+    members: List[str] = field(default_factory=lambda: [])
 
     # [GUI]
     window_width: int = 1500
@@ -94,12 +101,11 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
         cfg.server_dir = parser.get("Database", "server_dir", fallback=cfg.server_dir)
 
     # [User]
+    # username は OS ログイン名から取得するため config.ini には記載しない
+    # members には OS ログイン名形式の ID を設定する
     if parser.has_section("User"):
-        cfg.username = parser.get("User", "username", fallback=cfg.username)
-        raw_members = parser.get("User", "members", fallback=cfg.username)
+        raw_members = parser.get("User", "members", fallback="")
         cfg.members = [m.strip() for m in raw_members.split(",") if m.strip()]
-        if cfg.username not in cfg.members:
-            cfg.members.insert(0, cfg.username)
 
     # [GUI]
     if parser.has_section("GUI"):
@@ -329,9 +335,35 @@ def _setup_excepthook(logger: logging.Logger) -> None:
     sys.excepthook = _excepthook
 
 
+def _get_os_login() -> str:
+    """
+    OSのログイン名を取得して返す。
+    環境変数 USERNAME (Windows) または USER (macOS/Linux) を参照する。
+    どちらも取得できない場合は 'user' を返す。
+    """
+    return os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+
+
+# デバッグモードで「自分」として扱うテスト用 ID（id001 = 山田）
+DEBUG_YAMADA_ID = "id001"
+
+
 def main() -> None:
+    # コマンドライン引数のパース
+    parser_args = argparse.ArgumentParser(description=APP_NAME)
+    parser_args.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "デバッグモード: OSログイン名に関係なく id001（山田）として起動する"
+        ),
+    )
+    args = parser_args.parse_args()
+
     logger = setup_logger()
     logger.info(f"{APP_NAME} {APP_VERSION} 起動中...")
+    if args.debug:
+        logger.info(f"デバッグモード有効: ユーザーを {DEBUG_YAMADA_ID} として起動")
 
     # グローバル例外ハンドラーを設定（未捕捉エラーをサーバーログに保存）
     _setup_excepthook(logger)
@@ -348,6 +380,16 @@ def main() -> None:
 
     # 設定読込
     config = load_config()
+    # username を決定:
+    #   --debug 時は強制的に DEBUG_YAMADA_ID (id001) でログイン
+    #   通常時は OS のログイン名を使用
+    if args.debug:
+        config.username = DEBUG_YAMADA_ID
+    else:
+        config.username = _get_os_login()
+    # members に自分が含まれていない場合は先頭に追加
+    if config.username not in config.members:
+        config.members.insert(0, config.username)
     logger.info(f"設定読込完了: user={config.username}, db={config.server_dir}")
 
     # DB 初期化
