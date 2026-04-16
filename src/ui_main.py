@@ -692,6 +692,8 @@ class MainWindow(QMainWindow):
 
         # シグナル接続：チケット選択 → スケジュールパネルへ
         self.main_pane.table_pane.node_selected.connect(self.schedule_panel.assign_ticket)
+        # インライン編集後の軽量リフレッシュ（ツリー再構築なし）
+        self.main_pane.table_pane.schedule_refresh.connect(self.schedule_panel.refresh)
         self.gantt_view.ticket_clicked.connect(self.schedule_panel.assign_ticket)
         self.gantt_view.edit_requested.connect(self._on_gantt_edit_requested)
         self.road_view.edit_requested.connect(self._on_gantt_edit_requested)
@@ -1271,7 +1273,8 @@ class TablePane(QWidget):
     TreePane で選択した親ノードの直下子を一覧表示し、直接編集できる。
     node_selected シグナルでクリックした IDX を DailyScheduleWidget へ通知する。
     """
-    node_selected = Signal(str)
+    node_selected    = Signal(str)
+    schedule_refresh = Signal()  # スケジュールパネルのみ軽量リフレッシュ
 
     def __init__(self, state):
         super().__init__()
@@ -1490,10 +1493,11 @@ class TablePane(QWidget):
         if self.state.db:
             self.state.db.upsert_node(self.state.df_nodes.loc[idx])
             # スケジュールに影響するフィールドが変更された場合は全体を再計算
-            # スケジュールに影響するフィールドが変更された場合はUI再描画（インメモリ更新済み）
+            # スケジュールに影響するフィールドが変更された場合はUI再描画（ツリー再構築なし）
             if field in ("status", "estimated_hours", "actual_hours",
                          "start_available", "deadline"):
-                self.state.refresh()
+                self._rebuild_table()          # テーブル外観（done=グレー等）を更新
+                self.schedule_refresh.emit()   # スケジュールパネルのみリフレッシュ
         self.info.set_info(f"更新: {field} = {value}")
 
     def _current_idx(self) -> Optional[str]:
@@ -1620,8 +1624,11 @@ class TablePane(QWidget):
         self.state.df_nodes.loc[idx_adj, "updated_at"] = today
 
         if self.state.db:
-            self.state.db.upsert_node(self.state.df_nodes.loc[idx_cur])
-            self.state.db.upsert_node(self.state.df_nodes.loc[idx_adj])
+            # 1 トランザクションで一括保存（2回の個別 open/commit/close を削減）
+            self.state.db.upsert_nodes_bulk([
+                self.state.df_nodes.loc[idx_cur],
+                self.state.df_nodes.loc[idx_adj],
+            ])
 
         self._rebuild_table()
 
