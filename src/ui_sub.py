@@ -4,6 +4,7 @@ ui_sub.py - ガントチャート・ロードマップ・分析・検索・チ�
 import calendar
 import configparser
 import datetime
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -15,7 +16,8 @@ from PySide6.QtWidgets import (
     QMessageBox, QFormLayout, QSplitter, QFileDialog, QGroupBox,
     QSizePolicy, QRadioButton, QButtonGroup, QCalendarWidget, QMenu,
     QDialog, QDialogButtonBox, QSpinBox, QDoubleSpinBox,
-    QTreeWidget, QTreeWidgetItem, QStyledItemDelegate,
+    QTreeWidget, QTreeWidgetItem, QStyledItemDelegate, QPlainTextEdit,
+    QApplication,
 )
 from PySide6.QtCore import Qt, Signal, QDate
 from PySide6.QtGui import QColor, QFont, QAction, QCursor, QPen
@@ -792,9 +794,10 @@ class RoadmapView(QWidget):
     def __init__(self, state):
         super().__init__()
         self.state = state
-        self._selected_parent_idx: Optional[str] = None
+        self._selected_parent_idxs: set = set()
         self._current_level = "Task"
         self._cell_unit = "日"  # "日" / "週" / "月"
+        self._date_col_extra: int = 0  # 日付列幅の追加ピクセル数
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -855,6 +858,33 @@ class RoadmapView(QWidget):
         self.to_btn = DateButton(initial_date=fy_end.isoformat())
         self.to_btn.date_changed.connect(self._rebuild_table)
         ctrl.addWidget(self.to_btn)
+        ctrl.addSpacing(8)
+        # クイック期間ボタン群
+        _quick_style = (
+            "QPushButton { background:#EDE7F6; color:#4527A0; border:1px solid #7E57C2;"
+            " border-radius:8px; padding:2px 5px; font-size:7pt; font-weight:bold; }"
+            "QPushButton:hover { background:#D1C4E9; }"
+        )
+        for qname in ["今期", "1Q", "2Q", "3Q", "4Q", "Next30d", "Next06m", "Next01y"]:
+            qbtn = QPushButton(qname)
+            qbtn.setToolTip(f"{qname} の期間を設定")
+            qbtn.setStyleSheet(_quick_style)
+            qbtn.clicked.connect(lambda _, n=qname: self._on_quick_period(n))
+            ctrl.addWidget(qbtn)
+        ctrl.addSpacing(8)
+        # 日付列幅の縮小・拡大ボタン
+        ctrl.addWidget(QLabel("列幅:"))
+        for label, delta in [("-", -5), ("+", 5)]:
+            btn = QPushButton(label)
+            btn.setFixedWidth(26)
+            btn.setToolTip("日付列幅を縮小" if delta < 0 else "日付列幅を拡大")
+            btn.setStyleSheet(
+                "QPushButton { background:#F5F5F5; border:1px solid #BDBDBD;"
+                " border-radius:4px; font-size:10pt; font-weight:bold; }"
+                "QPushButton:hover { background:#E0E0E0; }"
+            )
+            btn.clicked.connect(lambda _, d=delta: self._on_date_col_resize(d))
+            ctrl.addWidget(btn)
         ctrl.addStretch()
         layout.addLayout(ctrl)
 
@@ -877,7 +907,9 @@ class RoadmapView(QWidget):
             QTreeWidget::branch:has-siblings:adjoins-item  { border-left: 1px solid #CCCCCC; }
             QTreeWidget::branch:!has-siblings:adjoins-item { border-left: 1px solid #CCCCCC; }
         """)
-        self.tree.itemClicked.connect(self._on_tree_click)
+        # Ctrl+クリックで複数の親を選択できるよう拡張選択モードに変更
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
         self._splitter.addWidget(self.tree)
 
         # 右: スケジュールテーブル
@@ -978,9 +1010,75 @@ class RoadmapView(QWidget):
                 child.setExpanded(True)
                 self._expand_to_p4(child)
 
-    def _on_tree_click(self, item: QTreeWidgetItem, col: int) -> None:
-        self._selected_parent_idx = item.data(0, Qt.ItemDataRole.UserRole)
+    def _on_tree_selection_changed(self) -> None:
+        """ツリー選択変更時（Ctrl+クリックで複数選択対応）"""
+        selected = self.tree.selectedItems()
+        # （全て）が含まれる場合はフィルタ解除
+        for item in selected:
+            if item.data(0, Qt.ItemDataRole.UserRole) is None:
+                self._selected_parent_idxs = set()
+                self._rebuild_table()
+                return
+        self._selected_parent_idxs = {
+            item.data(0, Qt.ItemDataRole.UserRole)
+            for item in selected
+            if item.data(0, Qt.ItemDataRole.UserRole) is not None
+        }
         self._rebuild_table()
+
+    def _on_quick_period(self, name: str) -> None:
+        """クイック期間ボタン押下時に from/to を設定してテーブルを再描画する"""
+        today = datetime.date.today()
+        # 会計年度の開始年を算出（4月始まり）
+        fy_year = today.year if today.month >= 4 else today.year - 1
+
+        if name == "今期":
+            d_from = datetime.date(fy_year, 4, 1)
+            d_to   = datetime.date(fy_year + 1, 3, 31)
+        elif name == "1Q":
+            d_from = datetime.date(fy_year, 4, 1)
+            d_to   = datetime.date(fy_year, 6, 30)
+        elif name == "2Q":
+            d_from = datetime.date(fy_year, 7, 1)
+            d_to   = datetime.date(fy_year, 9, 30)
+        elif name == "3Q":
+            d_from = datetime.date(fy_year, 10, 1)
+            d_to   = datetime.date(fy_year, 12, 31)
+        elif name == "4Q":
+            d_from = datetime.date(fy_year + 1, 1, 1)
+            d_to   = datetime.date(fy_year + 1, 3, 31)
+        elif name == "Next30d":
+            d_from = today
+            d_to   = today + datetime.timedelta(days=30)
+        elif name == "Next06m":
+            d_from = today
+            m6 = today.month + 6
+            y6 = today.year + (m6 - 1) // 12
+            m6 = (m6 - 1) % 12 + 1
+            d6_max = calendar.monthrange(y6, m6)[1]
+            d_to = datetime.date(y6, m6, min(today.day, d6_max))
+        elif name == "Next01y":
+            d_from = today
+            d_to   = datetime.date(today.year + 1, today.month, today.day)
+        else:
+            return
+
+        # シグナルを発さずに日付をセットし、_rebuild_table を1回だけ呼ぶ
+        self.from_btn.set_date(d_from.isoformat())
+        self.to_btn.set_date(d_to.isoformat())
+        self._rebuild_table()
+
+    def _on_date_col_resize(self, delta: int) -> None:
+        """日付列幅を delta px 分増減し、テーブルに即時反映する"""
+        self._date_col_extra += delta
+        # 最小幅 10px、最大幅 +100px の範囲に収める
+        base = 50 if self._cell_unit != "日" else self._COL_W_DATE
+        self._date_col_extra = max(10 - base, self._date_col_extra)  # 合計最小 10px
+        self._date_col_extra = min(100, self._date_col_extra)
+        col_w = max(10, base + self._date_col_extra)
+        total_cols = self.table.columnCount()
+        for c in range(self._FIXED_COLS, total_cols):
+            self.table.setColumnWidth(c, col_w)
 
     def _get_idx_at(self, row: int) -> Optional[str]:
         """テーブルの行から IDX を取得する（親ヘッダー行は None を返す）"""
@@ -1135,7 +1233,7 @@ class RoadmapView(QWidget):
         # cell_unit（日/週/月）に応じたピリオドリストを生成
         periods    = self._make_periods(d_from, d_to)
         total_cols = self._FIXED_COLS + len(periods)
-        col_w      = 50 if self._cell_unit != "日" else self._COL_W_DATE
+        col_w      = max(10, (50 if self._cell_unit != "日" else self._COL_W_DATE) + self._date_col_extra)
 
         self.table.setColumnCount(total_cols)
         headers = ["タイトル", "担当者", "ステータス", "期間"]
@@ -1162,7 +1260,7 @@ class RoadmapView(QWidget):
             (df["node_type"] == node_type)
             & (~df["status"].isin(["deleted"]))
         ].sort_values("priority")
-        filter_idx = self._selected_parent_idx
+        filter_idxs = self._selected_parent_idxs  # set[str]（空の場合は全件表示）
 
         # daily_schedule から ticket の実績作業日セットを収集（{ticket_idx: set[date]}）
         actual_dates = self._build_actual_dates()
@@ -1271,8 +1369,9 @@ class RoadmapView(QWidget):
         items = items.loc[sorted_idxs]
 
         for idx, row in items.iterrows():
-            if filter_idx is not None:
-                if idx != filter_idx and not self._is_under(df, idx, filter_idx):
+            # フィルタが設定されている場合、いずれかの選択親に属するノードのみ表示
+            if filter_idxs:
+                if not any(idx == fi or self._is_under(df, idx, fi) for fi in filter_idxs):
                     continue
 
             chain = self._get_parent_chain(df, idx)
@@ -1556,16 +1655,17 @@ class SearchView(QWidget):
         btn_row = ButtonRow([
             ("🔍 検索",        self._on_search),
             ("📋 今週の仕事",   self._on_preset_week),
+            ("📅 今日の仕事",   self._on_preset_today),
             ("📤 CSV 出力",    self._on_export),
         ])
         layout.addWidget(btn_row)
 
         layout.addWidget(Separator())
 
-        COLS = ["種類", "タイトル", "担当者", "ステータス",
-                "見積(h)", "実績(h)", "更新日"]
+        COLS = ["種類", "Project1", "Project2", "Project3", "Project4", "Task",
+                "タイトル", "担当者", "ステータス", "見積(h)", "実績(h)", "期間実績(h)", "更新日"]
         self.result_table = ScrollableTable(
-            COLS, [70, 220, 90, 80, 65, 65, 100]
+            COLS, [65, 110, 110, 110, 110, 110, 160, 90, 70, 55, 55, 65, 90]
         )
         layout.addWidget(self.result_table, stretch=1)
 
@@ -1577,24 +1677,91 @@ class SearchView(QWidget):
     def refresh(self) -> None:
         self._on_search()
 
+    def _calc_period_hours_batch(self, ticket_idxs: list,
+                                  date_from: str, date_to: str) -> dict:
+        """
+        指定期間における各チケットの実績工数を daily_schedule から一括集計する。
+        日付範囲未指定（date_from・date_to ともに空）の場合は空辞書を返す。
+        """
+        if not date_from and not date_to:
+            return {}
+        df_daily = self.state.df_daily
+        counts: dict = {idx: 0 for idx in ticket_idxs}
+        ticket_set = set(ticket_idxs)
+        if df_daily.empty or not ticket_set:
+            return {idx: 0.0 for idx in ticket_idxs}
+        for row_idx in df_daily.index:
+            # IDX 先頭10文字が日付 (YYYY-MM-DD)
+            date_part = str(row_idx)[:10]
+            if date_from and date_part < date_from:
+                continue
+            if date_to and date_part > date_to:
+                continue
+            for col in DB.DAILY_TIME_COLS:
+                if col not in df_daily.columns:
+                    continue
+                val = df_daily.loc[row_idx, col]
+                if val in ticket_set:
+                    counts[val] = counts.get(val, 0) + 1
+        return {idx: round(cnt * 0.25, 2) for idx, cnt in counts.items()}
+
+    def _get_ancestors(self, idx: str) -> dict:
+        """指定ノードの祖先タイトルを種別ごとに返す"""
+        df = self.state.df_nodes
+        result = {"project1": "", "project2": "", "project3": "", "project4": "", "task": ""}
+        if idx not in df.index:
+            return result
+        current = df.loc[idx]
+        while True:
+            parent_id = str(current.get("parent_id") or "")
+            if not parent_id or parent_id == "0" or parent_id not in df.index:
+                break
+            parent = df.loc[parent_id]
+            nt = str(parent.get("node_type", ""))
+            if nt in result:
+                result[nt] = str(parent.get("title", ""))
+            current = parent
+        return result
+
     def _on_search(self) -> None:
         statuses = [s for s, cb in self.status_checks.items() if cb.isChecked()]
         member = self.f_member.currentData() or ""
+        date_from = self.f_from.text().strip()
+        date_to   = self.f_to.text().strip()
         result = LG.filter_nodes(
             self.state.df_nodes,
             keyword=self.f_kw.text(),
             statuses=statuses,
             member=member,
-            date_from=self.f_from.text(),
-            date_to=self.f_to.text(),
+            date_from=date_from,
+            date_to=date_to,
+            node_types=["ticket"],
         )
         self._last_result = result
-        rows = [[
-            r.get("node_type", ""), r.get("title", ""),
-            self.state.display_name(str(r.get("assigned_to", ""))), r.get("status", ""),
-            r.get("estimated_hours", ""), r.get("actual_hours", ""),
-            r.get("updated_at", ""),
-        ] for _, r in result.iterrows()]
+        # 期間内実績工数を一括計算（日付範囲指定時のみ）
+        period_hours = self._calc_period_hours_batch(
+            list(result.index), date_from, date_to
+        )
+        rows = []
+        for idx, r in result.iterrows():
+            anc = self._get_ancestors(idx)
+            ph = period_hours.get(idx)
+            period_str = str(ph) if ph is not None else "-"
+            rows.append([
+                r.get("node_type", ""),
+                anc["project1"],
+                anc["project2"],
+                anc["project3"],
+                anc["project4"],
+                anc["task"],
+                r.get("title", ""),
+                self.state.display_name(str(r.get("assigned_to", ""))),
+                r.get("status", ""),
+                r.get("estimated_hours", ""),
+                r.get("actual_hours", ""),
+                period_str,
+                r.get("updated_at", ""),
+            ])
         ids = list(result.index)
         colors = [COLOR_OPTIONS.get(r.get("color", "Cyan"))
                   for _, r in result.iterrows()]
@@ -1606,6 +1773,13 @@ class SearchView(QWidget):
         week_ago = (today - datetime.timedelta(days=7)).isoformat()
         self.f_from.setText(week_ago)
         self.f_to.setText(today.isoformat())
+        self._on_search()
+
+    def _on_preset_today(self) -> None:
+        """今日更新されたノードを検索するプリセット"""
+        today = datetime.date.today().isoformat()
+        self.f_from.setText(today)
+        self.f_to.setText(today)
         self._on_search()
 
     def _on_export(self) -> None:
@@ -2248,3 +2422,231 @@ class ConfigView(QWidget):
             self.info.set_info("config.ini を保存しました（一部設定は再起動後に反映）")
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
+
+
+# ---------- AI取込ビュー ----------
+
+class AIImportView(QWidget):
+    """
+    AI取込タブ：LLMにクリップボード経由で指示を渡し、
+    返答を取り込んでノードを自動作成する。
+
+    ① 指示メッセージ取得: テンプレート + 既存プロジェクト一覧をクリップボードにコピー
+    ② 取り込み: LLM返答をパースして確認ダイアログ → DB登録 → Edit タブへ移動
+    """
+
+    import_done = Signal(list)  # 取り込んだ IDX のリスト
+
+    # llm_msg.md のパス（docs/ 以下）
+    _TEMPLATE_PATH = Path(__file__).parent.parent / "docs" / "llm_msg.md"
+
+    def __init__(self, state):
+        """AI取込ビューを初期化する"""
+        super().__init__()
+        self.state = state
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        # ── ボタン行 ──
+        btn_row = QHBoxLayout()
+        btn_get = QPushButton("📋 指示メッセージ取得")
+        btn_get.setStyleSheet(STYLE_BUTTON)
+        btn_get.setToolTip("テンプレート + 既存プロジェクト一覧をクリップボードにコピー")
+        btn_get.clicked.connect(self._on_get_prompt)
+        btn_row.addWidget(btn_get)
+
+        btn_import = QPushButton("📥 取り込み")
+        btn_import.setStyleSheet(STYLE_BUTTON)
+        btn_import.setToolTip("テキストエリアの内容を解析してアイテムを登録")
+        btn_import.clicked.connect(self._on_import)
+        btn_row.addWidget(btn_import)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        # ── テキストエリア ──
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setPlaceholderText(
+            "LLM の返答をここに貼り付けてください。\n"
+            "```items ブロックを含む返答を認識します。"
+        )
+        self.text_edit.setStyleSheet(
+            "QPlainTextEdit { font-family: monospace; font-size: 9pt; }"
+        )
+        layout.addWidget(self.text_edit, stretch=1)
+
+        self.info = InfoLabel()
+        layout.addWidget(self.info)
+
+    # ── 指示メッセージ生成 ──
+
+    def _on_get_prompt(self) -> None:
+        """テンプレートに既存プロジェクト一覧を付加してクリップボードにコピーする"""
+        try:
+            template = self._TEMPLATE_PATH.read_text(encoding="utf-8")
+        except Exception as e:
+            self.info.set_error(f"テンプレート読み込みエラー: {e}")
+            return
+
+        project_list = self._build_project_list()
+        msg = template + "\n\n" + project_list
+        QApplication.clipboard().setText(msg)
+        self.info.set_info("指示メッセージをクリップボードにコピーしました")
+
+    def _build_project_list(self) -> str:
+        """既存アイテム一覧を IDX・種別・タイトル・階層パスの形式で文字列化する"""
+        df = self.state.df_nodes
+        if df.empty:
+            return "【既存アイテム一覧】\n（アイテムなし）"
+
+        lines = ["【既存アイテム一覧（IDX | 種別 | タイトル | 階層パス）】"]
+        # deleted を除外し priority 順に表示
+        visible = df[~df["status"].isin(["deleted"])].copy()
+
+        def _path(idx: str) -> str:
+            parts = []
+            pid = str(df.loc[idx, "parent_id"]) if idx in df.index else ""
+            while pid and pid != "0" and pid in df.index:
+                parts.insert(0, str(df.loc[pid, "title"]))
+                pid = str(df.loc[pid, "parent_id"])
+            return " > ".join(parts) if parts else "(ルート)"
+
+        for idx, row in visible.iterrows():
+            ntype = str(row.get("node_type", ""))
+            title = str(row.get("title", ""))
+            path  = _path(str(idx))
+            lines.append(f"  {idx} | {ntype} | {title} | {path}")
+
+        return "\n".join(lines)
+
+    # ── 取り込み ──
+
+    def _on_import(self) -> None:
+        """テキストエリアの LLM 返答をパースし、確認後に DB へ登録する"""
+        text = self.text_edit.toPlainText().strip()
+        if not text:
+            self.info.set_error("テキストが空です")
+            return
+
+        items, errors = self._parse_llm_response(text)
+        if errors:
+            self.info.set_error("パースエラー: " + " / ".join(errors))
+            return
+        if not items:
+            self.info.set_error("取り込める内容が見つかりませんでした")
+            return
+
+        # 確認ダイアログ（プレビュー）
+        preview = "\n".join(
+            f"{i}. [{it['node_type']}] {it['title']}  (parent: {it['parent_idx']})"
+            for i, it in enumerate(items, 1)
+        )
+        reply = QMessageBox.question(
+            self, "取り込み確認",
+            f"{len(items)} 件を取り込みます。よろしいですか？\n\n{preview}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # DB 登録
+        imported_idxs = []
+        for it in items:
+            parent_idx = it["parent_idx"]
+            node_type  = it["node_type"]
+            # 親種別に合わせて子種別を自動補正
+            df = self.state.df_nodes
+            if parent_idx != "0" and parent_idx in df.index:
+                parent_type    = str(df.loc[parent_idx, "node_type"])
+                expected_child = DB.CHILD_TYPE.get(parent_type)
+                if expected_child and expected_child != node_type:
+                    node_type = expected_child
+
+            ds = DB.create_initial_node(
+                owner=self.state.user,
+                node_type=node_type,
+                title=it["title"],
+                parent_id=parent_idx,
+            )
+            if it.get("assigned_to"):
+                ds["assigned_to"] = it["assigned_to"]
+            if it.get("deadline"):
+                ds["deadline"] = it["deadline"]
+            if it.get("memo"):
+                ds["memo"] = it["memo"]
+
+            self.state.db.upsert_node(ds)
+            imported_idxs.append(str(ds.name))
+
+        self.state.df_nodes = self.state.db.read_nodes()
+        self.state.refresh()
+
+        self.info.set_info(f"{len(imported_idxs)} 件を取り込みました")
+        self.import_done.emit(imported_idxs)
+
+    def _parse_llm_response(self, text: str) -> tuple:
+        """
+        LLM 返答から ```items ブロックを抽出し、アイテムリストとエラーリストを返す。
+
+        フォーマット:
+            ```items
+            title: タイトル
+            parent_idx: <IDX>
+            node_type: task|ticket|...
+            assigned_to: ユーザー名（省略可）
+            deadline: YYYY-MM-DD（省略可）
+            memo: メモ（省略可）
+            ---
+            （複数アイテムは --- で区切る）
+            ```
+        """
+        items: list = []
+        errors: list = []
+        df = self.state.df_nodes
+
+        # ```items ... ``` ブロックを抽出
+        match = re.search(r"```items\s*(.*?)```", text, re.DOTALL)
+        if not match:
+            errors.append("```items ... ``` ブロックが見つかりません")
+            return items, errors
+
+        block   = match.group(1).strip()
+        entries = [e.strip() for e in block.split("---") if e.strip()]
+
+        for entry in entries:
+            item: dict = {}
+            for line in entry.splitlines():
+                if ":" in line:
+                    key, _, val = line.partition(":")
+                    item[key.strip()] = val.strip()
+
+            # 必須フィールド検証
+            if not item.get("title"):
+                errors.append("title が空のエントリがあります")
+                continue
+            if not item.get("parent_idx"):
+                errors.append(f"parent_idx が空: {item.get('title', '?')}")
+                continue
+            if not item.get("node_type"):
+                errors.append(f"node_type が空: {item.get('title', '?')}")
+                continue
+
+            # parent_idx の存在確認
+            parent_idx = item["parent_idx"]
+            if parent_idx != "0" and parent_idx not in df.index:
+                errors.append(f"parent_idx が存在しません: {parent_idx} (title: {item.get('title')})")
+                continue
+
+            # node_type の確認
+            if item["node_type"] not in DB.NODE_TYPES:
+                errors.append(f"不正な node_type: {item['node_type']} (title: {item.get('title')})")
+                continue
+
+            items.append(item)
+
+        return items, errors
+
+    def refresh(self) -> None:
+        """リフレッシュ（AI取込タブは状態保持のため何もしない）"""

@@ -8,6 +8,8 @@ import datetime
 from pathlib import Path
 
 import pandas as pd
+import math
+import datetime
 
 # --- 定数 ---
 # ノード種別の一覧（Project1〜4の階層構造 + タスク + チケット）
@@ -183,6 +185,34 @@ def _daily_schedule_create_sql() -> str:
     return f"CREATE TABLE IF NOT EXISTS daily_schedule ({', '.join(cols)});"
 
 
+def _to_sql_value(v):
+    """pandas / numpy の値をSQLiteに安全なPython標準型へ変換する"""
+    # pandasの欠損
+    if pd.isna(v):
+        return None
+    
+    # numpy / pandas scalar -> Python scalar
+    if hasattr(v, "item"):
+        try:
+            v = v.item()
+        except Exception:
+            pass
+    
+    # 日付系は文字列化 
+    if isinstance(v, (datetime.date, datetime.datetime)):
+        return v.isoformat()
+    
+    # 許可する基本型
+    if isinstance(v, (str, int, float, bytes, type(None))):
+        # Nan対策
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        return v
+    
+    # それ以外は文字列化
+    return str(v)
+
+
 class Database:
     """SQLite 接続・CRUD・工数集計を担当するクラス"""
 
@@ -275,8 +305,8 @@ class Database:
         try:
             # 既存行を一度削除してから再挿入（SQLite の UPSERT の代替）
             conn.execute("DELETE FROM nodes WHERE IDX=?", [ds.name])
-            row = {c: ds.get(c, None) for c in NODE_COLUMNS[1:]}
-            row_full = {"IDX": ds.name, **row}
+            row = {c: _to_sql_value(ds.get(c, None)) for c in NODE_COLUMNS[1:]}
+            row_full = {"IDX": _to_sql_value(ds.name), **row}
             cols = list(row_full.keys())
             vals = list(row_full.values())
             conn.execute(
@@ -305,9 +335,9 @@ class Database:
         try:
             for idx in target.index:
                 conn.execute("DELETE FROM nodes WHERE IDX=?", [idx])
-                row = {c: target.loc[idx, c] if c in target.columns else None
+                row = {c: _to_sql_value(target.loc[idx, c] if c in target.columns else None)
                        for c in NODE_COLUMNS[1:]}
-                row_full = {"IDX": idx, **row}
+                row_full = {"IDX": _to_sql_value(idx), **row}
                 cols = list(row_full.keys())
                 vals = list(row_full.values())
                 conn.execute(

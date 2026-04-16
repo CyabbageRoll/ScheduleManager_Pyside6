@@ -12,10 +12,12 @@ from PySide6.QtWidgets import (
     QTextEdit, QFormLayout, QScrollArea, QMessageBox, QHeaderView,
     QFrame, QStackedWidget, QSizePolicy, QToolBar, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QSpinBox, QCheckBox,
-    QStyledItemDelegate, QDateEdit, QTableWidgetSelectionRange,
+    QStyledItemDelegate, QDateEdit,
 )
-from PySide6.QtCore import Qt, QDate, Signal, QEvent, QTimer
-from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QAction, QPen
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QDate, Signal, QEvent, QTimer, QUrl
+from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QAction, QPen, QDesktopServices
 
 import db as DB
 import logic as LG
@@ -33,8 +35,9 @@ IDX_SEARCH  = 4
 IDX_TEAM    = 5
 IDX_ASSIGN  = 6
 IDX_MEMO    = 7
-IDX_VERSION = 8
-IDX_CONFIG  = 9
+IDX_VERSION  = 8
+IDX_CONFIG   = 9
+IDX_AIIMPORT = 10
 
 
 # ---------- 日次スケジュール用カスタムデリゲート ----------
@@ -452,6 +455,7 @@ class DailyScheduleWidget(QWidget):
                         0.0,
                         float(self.state.df_nodes.loc[old_t, "actual_hours"] or 0) - 0.25,
                     )
+                    self._propagate_actual_hours(old_t)
                 # 新しい値を設定
                 self.state.df_daily.loc[sch_idx, col] = ticket_idx
                 if ticket_idx and ticket_idx in self.state.df_nodes.index:
@@ -460,10 +464,27 @@ class DailyScheduleWidget(QWidget):
                     )
                     self.state.df_nodes.loc[ticket_idx, "updated_at"] = \
                         datetime.date.today().isoformat()
+                    self._propagate_actual_hours(ticket_idx)
 
         self.state.df_daily.loc[sch_idx, "Last_Update"] = \
             datetime.date.today().isoformat()
         self._rebuild_schedule()
+
+    def _propagate_actual_hours(self, node_idx: str) -> None:
+        """ノードの actual_hours 変更を祖先ノード（Task〜Project1）に伝播する"""
+        df = self.state.df_nodes
+        current_idx = node_idx
+        while True:
+            parent_id = str(df.loc[current_idx, "parent_id"] or "")
+            if not parent_id or parent_id == "0" or parent_id not in df.index:
+                break
+            # 親の actual_hours = 子（cancel/deleted 以外）の合計
+            children = df[
+                (df["parent_id"] == parent_id)
+                & (~df["status"].isin(["cancel", "deleted"]))
+            ]
+            df.loc[parent_id, "actual_hours"] = float(children["actual_hours"].sum())
+            current_idx = parent_id
 
 
 class MainWindow(QMainWindow):
@@ -569,6 +590,7 @@ class MainWindow(QMainWindow):
             ("📈 Analyze", IDX_ANALYSIS),
             ("ℹ Version", IDX_VERSION),
             ("⚙ Config",  IDX_CONFIG),
+            ("🤖 AI取込",  IDX_AIIMPORT),
         ]
         self._tab_btns: dict = {}
         for label, view_idx in views:
@@ -578,6 +600,15 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda checked, vi=view_idx: self._switch_view(vi))
             tb.addWidget(btn)
             self._tab_btns[view_idx] = btn
+
+        tb.addSeparator()
+
+        # マニュアルを開くボタン
+        manual_btn = QPushButton("📖 Manual")
+        manual_btn.setStyleSheet(STYLE_BUTTON)
+        manual_btn.setToolTip("マニュアルをブラウザで開く")
+        manual_btn.clicked.connect(self._on_open_manual)
+        tb.addWidget(manual_btn)
 
         # 項目7: 2行目のツールバーにメンバーボタンを追加
         self.addToolBarBreak()
@@ -612,6 +643,14 @@ class MainWindow(QMainWindow):
             tb2.addWidget(btn)
             self._member_btns[m] = btn
 
+    def _on_open_manual(self) -> None:
+        """マニュアルHTMLをデフォルトブラウザで開く"""
+        manual_path = Path(__file__).parent / "manual.html"
+        if manual_path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(manual_path)))
+        else:
+            QMessageBox.warning(self, "マニュアル", f"マニュアルファイルが見つかりません:\n{manual_path}")
+
     # ---------- 中央ウィジェット ----------
 
     def _build_central(self) -> None:
@@ -642,12 +681,13 @@ class MainWindow(QMainWindow):
         self.assign_view = ui_sub.AssignmentView(self.state)
         self.memo_view   = ui_sub.MemoView(self.state)
         self.ver_view    = ui_sub.VersionView(self.state, self.version)
-        self.config_view = ui_sub.ConfigView(self.state)
+        self.config_view     = ui_sub.ConfigView(self.state)
+        self.ai_import_view  = ui_sub.AIImportView(self.state)
 
         for w in [self.main_pane, self.gantt_view, self.road_view,
                   self.anal_view, self.search_view, self.team_view,
                   self.assign_view, self.memo_view, self.ver_view,
-                  self.config_view]:
+                  self.config_view, self.ai_import_view]:
             self.stack.addWidget(w)
 
         # シグナル接続：チケット選択 → スケジュールパネルへ
@@ -659,6 +699,8 @@ class MainWindow(QMainWindow):
         # 項目3: Request シグナル接続
         self.gantt_view.request_requested.connect(self._on_request_requested)
         self.road_view.request_requested.connect(self._on_request_requested)
+        # AI取込完了 → Edit タブへ
+        self.ai_import_view.import_done.connect(self._on_ai_import_done)
 
     # ---------- ショートカット ----------
 
@@ -777,6 +819,11 @@ class MainWindow(QMainWindow):
             self.state.df_nodes = self.state.db.read_nodes()
             self.state.refresh()
 
+    def _on_ai_import_done(self, idxs: list) -> None:
+        """AI取込完了後に Edit タブへ切替し取り込みキューをセットする"""
+        self._switch_view(IDX_MAIN)
+        self.main_pane.tree_pane.start_import_queue(idxs)
+
     # ---------- リフレッシュ ----------
 
     def refresh(self) -> None:
@@ -842,6 +889,8 @@ class TreePane(QWidget):
         self._selected_idx: Optional[str] = None
         self._filter_own: bool = True    # True = 自分に関係するノードのみ表示
         self._search_text: str = ""
+        self._import_queue: list = []    # AI取込キュー
+        self._import_pos: int = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -860,6 +909,13 @@ class TreePane(QWidget):
         self.filter_btn.setChecked(True)
         self.filter_btn.toggled.connect(self._on_filter_toggle)
         top_row.addWidget(self.filter_btn)
+        # AI取込確認用「次へ」ボタン（取込時のみ有効）
+        self._next_btn = QPushButton("次へ →")
+        self._next_btn.setStyleSheet(STYLE_BUTTON)
+        self._next_btn.setEnabled(False)
+        self._next_btn.setToolTip("AI取込で追加されたアイテムを順番に表示")
+        self._next_btn.clicked.connect(self._on_next_import)
+        top_row.addWidget(self._next_btn)
         top_row.addStretch()
         layout.addLayout(top_row)
 
@@ -945,6 +1001,17 @@ class TreePane(QWidget):
     def refresh(self) -> None:
         self.tree.blockSignals(True)
         self.tree.clear()
+
+        # P0 仮想ルートアイテムを先頭に追加（P1 の親として選択可能）
+        p0_item = QTreeWidgetItem(self.tree)
+        p0_item.setData(0, Qt.ItemDataRole.UserRole, "0")
+        p0_item.setText(0, "[P0] ────────────")
+        p0_item.setBackground(0, QColor("#CFD8DC"))
+        p0_item.setForeground(0, QColor("#37474F"))
+        _f = QFont()
+        _f.setBold(True)
+        p0_item.setFont(0, _f)
+
         df = self.state.df_nodes
         if not df.empty:
             own_ids = self._own_subtree_ids(df) if self._filter_own else None
@@ -957,12 +1024,15 @@ class TreePane(QWidget):
                 filter_ids = search_ids
             else:
                 filter_ids = None
-            self._build_tree(self.tree.invisibleRootItem(), df, "0", filter_ids)
+            # P1 以下を P0 仮想ルートの子として表示
+            self._build_tree(p0_item, df, "0", filter_ids)
         self.tree.expandAll()
-        self.tree.blockSignals(False)
-        # 選択を復元
+        # 選択を復元（シグナルをブロックしたまま実行して update_for_parent の呼び出しを防ぐ）
+        # blockSignals(False) を後に移動することで refresh 中に _normalize_priorities が
+        # 呼ばれるのを防ぐ（日付編集後に順序が変わるバグの修正）
         if self._selected_idx:
             self._restore_selection(self._selected_idx)
+        self.tree.blockSignals(False)
 
     # 種別ごとの短縮ラベル・背景色・文字色
     _TYPE_LABEL = {
@@ -1018,6 +1088,32 @@ class TreePane(QWidget):
 
             self._build_tree(item, df, idx, filter_ids)
 
+    def start_import_queue(self, idxs: list) -> None:
+        """AI取込後の確認キューをセットし先頭アイテムへ移動する"""
+        self._import_queue = list(idxs)
+        self._import_pos = 0
+        has_next = len(idxs) > 1
+        self._next_btn.setEnabled(has_next)
+        self._update_next_btn_label()
+        if idxs:
+            self._restore_selection(idxs[0])
+
+    def _on_next_import(self) -> None:
+        """AI取込キューの次のアイテムへ移動する"""
+        self._import_pos += 1
+        if self._import_pos >= len(self._import_queue):
+            self._import_pos = len(self._import_queue) - 1
+        self._restore_selection(self._import_queue[self._import_pos])
+        self._update_next_btn_label()
+        # 末尾に達したらボタンを無効化
+        if self._import_pos >= len(self._import_queue) - 1:
+            self._next_btn.setEnabled(False)
+
+    def _update_next_btn_label(self) -> None:
+        total = len(self._import_queue)
+        pos   = self._import_pos + 1
+        self._next_btn.setText(f"次へ → ({pos}/{total})")
+
     def _restore_selection(self, idx: str) -> None:
         it = self._find_item(self.tree.invisibleRootItem(), idx)
         if it:
@@ -1062,10 +1158,16 @@ class TreePane(QWidget):
             QMessageBox.information(self, "情報", "これ以上子ノードは作成できません")
             return
 
+        # 同じ親を持つ兄弟の最大 priority + 1 をデフォルトにする
+        df = self.state.df_nodes
+        siblings = df[df["parent_id"] == parent_idx]
+        default_priority = int(siblings["priority"].max()) + 1 if not siblings.empty else 1
+
         dlg = _NodeEditDialog(
             parent_idx=parent_idx,
             node_type=child_type,
             state=self.state,
+            default_priority=default_priority,
             parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -1249,15 +1351,18 @@ class TablePane(QWidget):
         self._parent_idx = parent_idx
         # ヘッダーラベルを更新
         df = self.state.df_nodes
-        if parent_idx and parent_idx in df.index:
+        type_labels = {
+            "project1": "Project1", "project2": "Project2",
+            "project3": "Project3", "project4": "Project4",
+            "task": "Task", "ticket": "Ticket",
+        }
+        if parent_idx == "0":
+            # P0 仮想ルートを選択した場合
+            self.header_label.setText("[P0] ルート  ▶  子 Project1 一覧")
+        elif parent_idx and parent_idx in df.index:
             row = df.loc[parent_idx]
             node_type = str(row.get("node_type", ""))
             title = str(row.get("title", ""))
-            type_labels = {
-                "project1": "Project1", "project2": "Project2",
-                "project3": "Project3", "project4": "Project4",
-                "task": "Task", "ticket": "Ticket",
-            }
             type_label = type_labels.get(node_type, node_type)
             child_type = DB.CHILD_TYPE.get(node_type)
             if child_type:
@@ -1271,7 +1376,28 @@ class TablePane(QWidget):
                 )
         else:
             self.header_label.setText("（ノードをツリーから選択してください）")
+        # 親が切り替わったときだけ連番化を実行（refresh() 経由では実行しない）
+        self._normalize_priorities(parent_idx)
         self._rebuild_table()
+
+    def _normalize_priorities(self, parent_idx: str) -> None:
+        """子ノードの priority を 1 から連番に修正して DB に保存する。
+        親ノードを選択したときにのみ呼び出す（状態再描画では呼ばない）。"""
+        df = self.state.df_nodes
+        children = df[df["parent_id"] == parent_idx].copy()
+        if children.empty:
+            return
+        children = children.sort_values("priority")
+        needs_save: list = []
+        for i, idx in enumerate(children.index):
+            expected = i + 1
+            if int(children.at[idx, "priority"]) != expected:
+                self.state.df_nodes.loc[idx, "priority"] = expected
+                self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+                needs_save.append(idx)
+        if needs_save and self.state.db:
+            for save_idx in needs_save:
+                self.state.db.upsert_node(self.state.df_nodes.loc[save_idx])
 
     def refresh(self) -> None:
         self._rebuild_table()
@@ -1388,16 +1514,23 @@ class TablePane(QWidget):
             return
         if self._parent_idx not in self.state.df_nodes.index and self._parent_idx != "0":
             return
-        parent_type = self.state.df_nodes.loc[self._parent_idx, "node_type"] \
-            if self._parent_idx in self.state.df_nodes.index else "project1"
-        child_type = DB.CHILD_TYPE.get(parent_type)  # Ticketはキーなし→None
+        # P0 仮想ルートの場合は child_type = project1、それ以外は CHILD_TYPE から取得
+        if self._parent_idx == "0":
+            child_type = "project1"
+        else:
+            parent_type = self.state.df_nodes.loc[self._parent_idx, "node_type"] \
+                if self._parent_idx in self.state.df_nodes.index else None
+            child_type = DB.CHILD_TYPE.get(parent_type) if parent_type else None
         if not child_type:
             QMessageBox.information(self, "情報", "Ticketには子ノードを作成できません")
             return
+        # テーブルの現在の行数 + 1 をデフォルト priority にする（連番化済みのテーブルと一致）
+        default_priority = self.table.rowCount() + 1
         dlg = _NodeEditDialog(
             parent_idx=self._parent_idx,
             node_type=child_type,
             state=self.state,
+            default_priority=default_priority,
             parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -1450,42 +1583,53 @@ class TablePane(QWidget):
         self.state.df_nodes = self.state.db.read_nodes()
         self.state.refresh()
 
-    def _on_move_up(self)   -> None: self._move(-1.5)
-    def _on_move_down(self) -> None: self._move(+1.5)
+    def _on_move_up(self)   -> None: self._swap_adjacent(-1)
+    def _on_move_down(self) -> None: self._swap_adjacent(+1)
 
-    def _move(self, delta: float) -> None:
-        """選択された全行の順序を変更し、移動後も選択を保持する"""
-        # 選択行の IDX を収集（重複排除）
-        selected_idxes = []
-        seen = set()
-        for sel_idx in self.table.selectedIndexes():
-            item = self.table.item(sel_idx.row(), 0)
-            if item:
-                node_idx = item.data(Qt.ItemDataRole.UserRole)
-                if node_idx and node_idx not in seen:
-                    seen.add(node_idx)
-                    selected_idxes.append(node_idx)
-
-        if not selected_idxes:
+    def _swap_adjacent(self, direction: int) -> None:
+        """現在行と隣接行の priority を入れ替えて配列の順序を変更し、DB に即時保存する。"""
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        target_row = row + direction
+        if target_row < 0 or target_row >= self.table.rowCount():
             return
 
-        for node_idx in selected_idxes:
-            if node_idx not in self.state.df_nodes.index:
-                continue
-            cur_priority = float(self.state.df_nodes.loc[node_idx, "priority"] or 0)
-            self.state.df_nodes.loc[node_idx, "priority"] = int(cur_priority + delta)
-            self.state.df_nodes.loc[node_idx, "updated_at"] = datetime.date.today().isoformat()
+        item_cur = self.table.item(row, 0)
+        item_adj = self.table.item(target_row, 0)
+        if not item_cur or not item_adj:
+            return
+
+        idx_cur = item_cur.data(Qt.ItemDataRole.UserRole)
+        idx_adj = item_adj.data(Qt.ItemDataRole.UserRole)
+        if not idx_cur or not idx_adj:
+            return
+        if idx_cur not in self.state.df_nodes.index or idx_adj not in self.state.df_nodes.index:
+            return
+
+        # priority を入れ替えて DB に即時保存（state.refresh で巻き戻らないようにする）
+        p_cur = int(self.state.df_nodes.loc[idx_cur, "priority"] or 0)
+        p_adj = int(self.state.df_nodes.loc[idx_adj, "priority"] or 0)
+        today = datetime.date.today().isoformat()
+
+        self.state.df_nodes.loc[idx_cur, "priority"] = p_adj
+        self.state.df_nodes.loc[idx_adj, "priority"] = p_cur
+        self.state.df_nodes.loc[idx_cur, "updated_at"] = today
+        self.state.df_nodes.loc[idx_adj, "updated_at"] = today
+
+        if self.state.db:
+            self.state.db.upsert_node(self.state.df_nodes.loc[idx_cur])
+            self.state.db.upsert_node(self.state.df_nodes.loc[idx_adj])
 
         self._rebuild_table()
 
-        # 移動後の選択を復元
+        # 移動後に idx_cur の行を選択する
         self.table.blockSignals(True)
         for r in range(self.table.rowCount()):
-            item = self.table.item(r, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) in seen:
-                self.table.setRangeSelected(
-                    QTableWidgetSelectionRange(r, 0, r, self.table.columnCount() - 1), True
-                )
+            it = self.table.item(r, 0)
+            if it and it.data(Qt.ItemDataRole.UserRole) == idx_cur:
+                self.table.setCurrentCell(r, 0)
+                break
         self.table.blockSignals(False)
 
     def _on_cell_clicked_for_edit(self, index) -> None:
@@ -1510,7 +1654,9 @@ class TablePane(QWidget):
         if not child_type:
             self.info.set_info("Ticket には子ノードを作成できません")
             return
-        # 末尾の優先度を求める
+        # 既存アイテムの priority を連番化してから末尾の優先度を求める
+        # （priority=99 のまま放置されているアイテムがある場合に正しい末尾番号を得るため）
+        self._normalize_priorities(self._parent_idx)
         df = self.state.df_nodes
         siblings = df[df["parent_id"] == self._parent_idx]
         max_priority = int(siblings["priority"].max()) + 1 if not siblings.empty else 1
@@ -1624,7 +1770,8 @@ class DetailPane(QWidget):
 
 class _NodeEditDialog(QDialog):
     def __init__(self, parent_idx: Optional[str], node_type: Optional[str],
-                 state, edit_idx: Optional[str] = None, parent=None):
+                 state, edit_idx: Optional[str] = None,
+                 default_priority: int = 99, parent=None):
         super().__init__(parent)
         self.state = state
         self._parent_idx = parent_idx
@@ -1641,7 +1788,8 @@ class _NodeEditDialog(QDialog):
         self.f_title = QLineEdit()
         self.f_priority = QSpinBox()
         self.f_priority.setRange(1, 999)
-        self.f_priority.setValue(99)
+        # 新規作成時はデフォルト priority を使用（編集時は既存値で上書き）
+        self.f_priority.setValue(default_priority)
         self.f_status = QComboBox()
         self.f_status.addItems(DB.STATUS_LIST[:-1])  # deleted 除外
         self.f_est = QDoubleSpinBox()

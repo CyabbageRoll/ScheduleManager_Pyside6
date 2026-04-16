@@ -241,6 +241,9 @@ class AppState:
         self.reload_nodes()
         self.reload_daily()
         self.reload_memo()
+        # daily_schedule の割り当てから actual_hours を再集計
+        if self.db and not self.df_nodes.empty:
+            self.df_nodes = self.db.recalc_actual_hours(self.df_nodes, self.df_daily)
 
     def reload_memo(self) -> None:
         """DB からメモ・常時表示メモを再読込"""
@@ -411,6 +414,9 @@ def main() -> None:
     state.reload_nodes()
     state.reload_daily()
     state.reload_memo()
+    # 起動時に daily_schedule から actual_hours を再集計
+    if not state.df_nodes.empty:
+        state.df_nodes = state.db.recalc_actual_hours(state.df_nodes, state.df_daily)
 
     # Qt アプリケーション起動
     app = QApplication.instance() or QApplication(sys.argv)

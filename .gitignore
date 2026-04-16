@@ -16,3 +16,8 @@ build/
 *.swo
 *.tmp
 *.DS_Store
+.claude/**
+docs/**
+claude.md
+hook.md
+src/db/schedule.sqlite

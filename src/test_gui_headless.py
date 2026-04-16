@@ -377,6 +377,182 @@ def test_gantt_view(win):
         ng("Projectフィルター", e)
 
 
+def test_actual_hours_propagation(win, task_idx, ticket_idx):
+    """
+    スロット割り当て時に Ticket の actual_hours が更新され、
+    親 Task にも伝播することを確認する。
+    """
+    print("\n[9] 工数伝播テスト（actual_hours）")
+    panel = win.schedule_panel
+    state = win.state
+    from db import DAILY_TIME_COLS
+
+    # 事前に全スロットをクリア（テスト独立性確保）
+    try:
+        panel._update_schedule_slots(list(range(len(DAILY_TIME_COLS))), "")
+        ok("全スロット初期化 OK")
+    except Exception as e:
+        ng("全スロット初期化", e)
+        return
+
+    before_ticket = float(state.df_nodes.loc[ticket_idx, "actual_hours"])
+    before_task   = float(state.df_nodes.loc[task_idx,   "actual_hours"])
+
+    # スロット 36（9:00）にチケットを割り当てる
+    try:
+        panel._update_schedule_slots([36], ticket_idx)
+        after_ticket = float(state.df_nodes.loc[ticket_idx, "actual_hours"])
+        assert abs(after_ticket - (before_ticket + 0.25)) < 1e-9, \
+            f"ticket actual_hours: {before_ticket} → {after_ticket} (期待: {before_ticket + 0.25})"
+        ok(f"Ticket actual_hours +0.25: {before_ticket:.2f} → {after_ticket:.2f}")
+    except Exception as e:
+        ng("Ticket actual_hours 増加", e)
+        return
+
+    # 親 Task の actual_hours が伝播して増えているか確認
+    try:
+        after_task = float(state.df_nodes.loc[task_idx, "actual_hours"])
+        assert abs(after_task - (before_task + 0.25)) < 1e-9, \
+            f"task actual_hours: {before_task} → {after_task} (期待: {before_task + 0.25})"
+        ok(f"Task actual_hours 伝播 +0.25: {before_task:.2f} → {after_task:.2f}")
+    except Exception as e:
+        ng("Task actual_hours 伝播", e)
+
+    # スロット 37（9:15）にも割り当てて 2 スロット分確認
+    try:
+        panel._update_schedule_slots([37], ticket_idx)
+        two_slot_ticket = float(state.df_nodes.loc[ticket_idx, "actual_hours"])
+        two_slot_task   = float(state.df_nodes.loc[task_idx,   "actual_hours"])
+        assert abs(two_slot_ticket - (before_ticket + 0.50)) < 1e-9, \
+            f"ticket 2スロット: {two_slot_ticket}"
+        assert abs(two_slot_task - (before_task + 0.50)) < 1e-9, \
+            f"task 2スロット: {two_slot_task}"
+        ok(f"2スロット割り当て後 Ticket={two_slot_ticket:.2f} Task={two_slot_task:.2f}")
+    except Exception as e:
+        ng("2スロット割り当て", e)
+
+    # Free（解除）で元に戻るか確認
+    try:
+        panel._update_schedule_slots([36, 37], "")
+        freed_ticket = float(state.df_nodes.loc[ticket_idx, "actual_hours"])
+        freed_task   = float(state.df_nodes.loc[task_idx,   "actual_hours"])
+        assert abs(freed_ticket - before_ticket) < 1e-9, \
+            f"Free後 ticket: {freed_ticket} (期待: {before_ticket})"
+        assert abs(freed_task - before_task) < 1e-9, \
+            f"Free後 task: {freed_task} (期待: {before_task})"
+        ok(f"Free後 Ticket={freed_ticket:.2f} Task={freed_task:.2f} (元に戻った)")
+    except Exception as e:
+        ng("Free後の actual_hours 復元", e)
+
+    # recalc_actual_hours との一致確認
+    try:
+        df_recalc = state.db.recalc_actual_hours(state.df_nodes, state.df_daily)
+        ticket_recalc = float(df_recalc.loc[ticket_idx, "actual_hours"])
+        task_recalc   = float(df_recalc.loc[task_idx,   "actual_hours"])
+        ticket_now    = float(state.df_nodes.loc[ticket_idx, "actual_hours"])
+        task_now      = float(state.df_nodes.loc[task_idx,   "actual_hours"])
+        assert abs(ticket_recalc - ticket_now) < 1e-9, \
+            f"Ticket recalc={ticket_recalc} vs memory={ticket_now}"
+        assert abs(task_recalc - task_now) < 1e-9, \
+            f"Task recalc={task_recalc} vs memory={task_now}"
+        ok(f"recalc_actual_hours との一致確認 OK (ticket={ticket_recalc:.2f}, task={task_recalc:.2f})")
+    except Exception as e:
+        ng("recalc_actual_hours との一致確認", e)
+
+
+def test_search_view(win, task_idx, ticket_idx):
+    """SearchView の ticket 固定検索と親階層列の確認"""
+    print("\n[10] SearchView テスト（ticket固定・親階層列）")
+    search_view = win.search_view
+
+    # type_checks が存在しないことを確認（削除済み）
+    try:
+        assert not hasattr(search_view, "type_checks"), "type_checks が残っている"
+        ok("type_checks（種別チェックボックス）が削除されている")
+    except Exception as e:
+        ng("type_checks 削除確認", e)
+
+    # 検索 → ticket のみ返る
+    try:
+        search_view._on_search()
+        rows = search_view.result_table.rowCount()
+        ok(f"検索実行 → {rows} 件")
+        for r in range(rows):
+            item = search_view.result_table.item(r, 0)
+            val = item.text() if item else ""
+            assert val == "ticket", f"行{r} 種類={val!r}"
+        ok("全結果行が ticket 種別")
+    except Exception as e:
+        ng("ticket 固定検索確認", e)
+
+    # 列数確認（12列）
+    try:
+        col_count = search_view.result_table.columnCount()
+        assert col_count == 13, f"列数: {col_count} (期待: 13)"
+        ok(f"結果テーブル列数: {col_count} 列")
+    except Exception as e:
+        ng("テーブル列数確認", e)
+
+    # Project1 列（列1）に親タイトルが表示されているか
+    try:
+        rows = search_view.result_table.rowCount()
+        has_pj1 = any(
+            (search_view.result_table.item(r, 1) or type("", (), {"text": lambda: ""})()).text() != ""
+            for r in range(rows)
+        )
+        ok(f"Project1 列にデータあり: {has_pj1}")
+    except Exception as e:
+        ng("Project1 列確認", e)
+
+    # _get_ancestors() の動作確認
+    try:
+        anc = search_view._get_ancestors(ticket_idx)
+        assert isinstance(anc, dict), "戻り値が dict でない"
+        assert set(anc.keys()) == {"project1", "project2", "project3", "project4", "task"}, \
+            f"keys: {set(anc.keys())}"
+        assert anc["task"] != "", f"task タイトルが空: {anc}"
+        ok(f"_get_ancestors() OK: task={anc['task']!r}, project1={anc['project1']!r}")
+    except Exception as e:
+        ng("_get_ancestors()", e)
+
+    # 期間実績工数の計算確認
+    try:
+        today = datetime.date.today().isoformat()
+        # 日付範囲なし → 空辞書
+        result_empty = search_view._calc_period_hours_batch([ticket_idx], "", "")
+        assert result_empty == {}, f"空辞書期待: {result_empty}"
+        ok("日付範囲なし → 空辞書を返す")
+    except Exception as e:
+        ng("期間実績（日付範囲なし）", e)
+
+    try:
+        today = datetime.date.today().isoformat()
+        # 日付範囲あり → 辞書に ticket_idx キーがある
+        result_with_date = search_view._calc_period_hours_batch([ticket_idx], today, today)
+        assert ticket_idx in result_with_date, f"ticket_idx がキーに存在しない: {result_with_date}"
+        ok(f"日付範囲あり → ticket_idx={ticket_idx[:12]}... の期間実績={result_with_date[ticket_idx]:.2f}h")
+    except Exception as e:
+        ng("期間実績（日付範囲あり）", e)
+
+    # 日付範囲指定時に 期間実績(h) 列（列11）が数値 or "0.0" を表示
+    try:
+        search_view.f_from.setText(today)
+        search_view.f_to.setText(today)
+        search_view._on_search()
+        rows = search_view.result_table.rowCount()
+        for r in range(rows):
+            item = search_view.result_table.item(r, 11)
+            val = item.text() if item else "-"
+            # "-" でなく数値文字列であることを確認
+            assert val != "-", f"行{r}: 期間実績が '-' のまま"
+        ok(f"日付範囲指定時 期間実績(h)列 に数値表示（{rows}行）")
+        # フィールドをリセット
+        search_view.f_from.setText("")
+        search_view.f_to.setText("")
+    except Exception as e:
+        ng("期間実績(h)列 表示確認", e)
+
+
 def test_save_load(state):
     """save() → load() のラウンドトリップ確認"""
     print("\n[8] save / load ラウンドトリップテスト")
@@ -418,6 +594,8 @@ def main():
             test_detail_pane(win, task_idx, ticket_idx)
             test_edit_delete(win, task_idx, ticket_idx)
             test_gantt_view(win)
+            test_actual_hours_propagation(win, task_idx, ticket_idx)
+            test_search_view(win, task_idx, ticket_idx)
             test_save_load(state)
 
     print("\n" + "=" * 55)
