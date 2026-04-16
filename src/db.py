@@ -320,6 +320,32 @@ class Database:
         finally:
             conn.close()
 
+    def upsert_nodes_bulk(self, series_list: list) -> None:
+        """複数ノードを 1 トランザクションで一括 upsert する（_normalize_priorities 等に使用）"""
+        if not series_list:
+            return
+        today = datetime.date.today().isoformat()
+        conn = self._connect()
+        try:
+            for ds in series_list:
+                ds = ds.copy()
+                ds["updated_at"] = today
+                conn.execute("DELETE FROM nodes WHERE IDX=?", [ds.name])
+                row = {c: _to_sql_value(ds.get(c, None)) for c in NODE_COLUMNS[1:]}
+                row_full = {"IDX": _to_sql_value(ds.name), **row}
+                cols = list(row_full.keys())
+                vals = list(row_full.values())
+                conn.execute(
+                    f"INSERT INTO nodes ({','.join(cols)}) VALUES ({','.join(['?'] * len(cols))})",
+                    vals,
+                )
+            conn.commit()
+            self._log(f"upsert_nodes_bulk: {len(series_list)} 件")
+        except Exception as e:
+            self._log(f"upsert_nodes_bulk エラー: {e}")
+        finally:
+            conn.close()
+
     def save_nodes(self, df: pd.DataFrame, user: str) -> None:
         """ユーザー自身の最近更新ノードを DB に保存する（直近 2 日以内を対象）"""
         if df.empty:

@@ -1173,13 +1173,13 @@ class TreePane(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             ds = dlg.get_series()
             self.state.df_nodes.loc[ds.name] = ds
-            # 親ノード（task 以上）には自動チケット生成
+            # 親ノード（task 以上）には自動チケット生成（auto_children は DB 側で作成するため read_nodes が必要）
             if child_type != "ticket":
                 self.state.db.create_auto_children(ds, self.state.user)
                 self.state.df_nodes = self.state.db.read_nodes()
             ds["updated_at"] = datetime.date.today().isoformat()
             self.state.db.upsert_node(ds)
-            self.state.df_nodes = self.state.db.read_nodes()
+            self.state.df_nodes.loc[ds.name] = ds  # read_nodes の代わりにインメモリ更新
             self.state.refresh()
 
     def _on_delete(self) -> None:
@@ -1204,7 +1204,7 @@ class TreePane(QWidget):
         self.state.df_nodes.loc[idx, "status"] = "deleted"
         self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
         self.state.db.upsert_node(self.state.df_nodes.loc[idx])
-        self.state.df_nodes = self.state.db.read_nodes()
+        # インメモリ更新済みのため read_nodes は不要
         self.state.refresh()
 
 
@@ -1396,8 +1396,10 @@ class TablePane(QWidget):
                 self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
                 needs_save.append(idx)
         if needs_save and self.state.db:
-            for save_idx in needs_save:
-                self.state.db.upsert_node(self.state.df_nodes.loc[save_idx])
+            # 1 トランザクションで一括保存（個別 upsert × N より高速）
+            self.state.db.upsert_nodes_bulk(
+                [self.state.df_nodes.loc[i] for i in needs_save]
+            )
 
     def refresh(self) -> None:
         self._rebuild_table()
@@ -1488,9 +1490,9 @@ class TablePane(QWidget):
         if self.state.db:
             self.state.db.upsert_node(self.state.df_nodes.loc[idx])
             # スケジュールに影響するフィールドが変更された場合は全体を再計算
+            # スケジュールに影響するフィールドが変更された場合はUI再描画（インメモリ更新済み）
             if field in ("status", "estimated_hours", "actual_hours",
                          "start_available", "deadline"):
-                self.state.df_nodes = self.state.db.read_nodes()
                 self.state.refresh()
         self.info.set_info(f"更新: {field} = {value}")
 
@@ -1536,7 +1538,7 @@ class TablePane(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             ds = dlg.get_series()
             self.state.db.upsert_node(ds)
-            self.state.df_nodes = self.state.db.read_nodes()
+            self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
             self.state.refresh()
 
     def _on_edit(self) -> None:
@@ -1557,7 +1559,7 @@ class TablePane(QWidget):
             ds = dlg.get_series()
             self.state.df_nodes.loc[ds.name] = ds
             self.state.db.upsert_node(ds)
-            self.state.df_nodes = self.state.db.read_nodes()
+            # インメモリ更新済みのため read_nodes は不要
             self.state.refresh()
 
     def _on_delete(self) -> None:
@@ -1580,7 +1582,7 @@ class TablePane(QWidget):
         self.state.df_nodes.loc[idx, "status"] = "deleted"
         self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
         self.state.db.upsert_node(self.state.df_nodes.loc[idx])
-        self.state.df_nodes = self.state.db.read_nodes()
+        # インメモリ更新済みのため read_nodes は不要
         self.state.refresh()
 
     def _on_move_up(self)   -> None: self._swap_adjacent(-1)
@@ -1671,7 +1673,7 @@ class TablePane(QWidget):
         ds["status"] = "todo"
         new_idx = ds.name
         self.state.db.upsert_node(ds)
-        self.state.df_nodes = self.state.db.read_nodes()
+        self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
         self._rebuild_table()
         # 追加した行のタイトル列に自動フォーカス
         for r in range(self.table.rowCount()):
