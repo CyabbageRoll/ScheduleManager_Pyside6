@@ -178,6 +178,7 @@ class AppState:
     memo_text: str = ""
     permanent_notice: str = ""  # 自分の常時表示メモ
     all_permanent_notices: Dict[str, str] = field(default_factory=dict)  # 全員の常時メモ
+    nodes_modified: bool = False  # 未保存変更フラグ（Ctrl+S 保存前に True になる）
 
     def __post_init__(self):
         if not self.current_user:
@@ -230,11 +231,14 @@ class AppState:
         """変更データを DB に書き込む"""
         if not self.db:
             return
-        self.db.save_nodes(self.df_nodes, self.current_user)
+        # nodes_modified が True のときのみ save_nodes を呼ぶ（DB アクセス最小化）
+        if self.nodes_modified:
+            self.db.save_nodes(self.df_nodes, self.current_user)
         self.db.save_daily_schedule(self.df_daily, self.current_user)
         self.db.save_daily_log(self.df_daily_log, self.current_user)
         self.db.save_memo(self.current_user, self.memo_text)
         self.db.save_permanent_notice(self.current_user, self.permanent_notice)
+        self.nodes_modified = False  # 保存後にフラグをリセット
 
     def load(self) -> None:
         """DB から最新データを全件再読込する"""

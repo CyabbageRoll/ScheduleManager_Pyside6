@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QFormLayout, QScrollArea, QMessageBox, QHeaderView,
     QFrame, QStackedWidget, QSizePolicy, QToolBar, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QSpinBox, QCheckBox,
-    QStyledItemDelegate, QDateEdit,
+    QStyledItemDelegate, QDateEdit, QAbstractItemDelegate,
 )
 from pathlib import Path
 
@@ -769,7 +769,8 @@ class MainWindow(QMainWindow):
 
     def _on_save(self) -> None:
         try:
-            self.state.save()
+            self.state.save()  # nodes_modified を False にリセットする
+            self.main_pane.table_pane._update_dirty_indicator()
             self.statusBar().showMessage("保存しました", 3000)
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
@@ -777,6 +778,8 @@ class MainWindow(QMainWindow):
     def _on_load(self) -> None:
         try:
             self.state.load()
+            self.state.nodes_modified = False  # 再読込後は未保存フラグをリセット
+            self.main_pane.table_pane._update_dirty_indicator()
             self.refresh()
             self.statusBar().showMessage("読み込みました", 3000)
         except Exception as e:
@@ -1175,13 +1178,11 @@ class TreePane(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             ds = dlg.get_series()
             self.state.df_nodes.loc[ds.name] = ds
-            # 親ノード（task 以上）には自動チケット生成（auto_children は DB 側で作成するため read_nodes が必要）
+            # 親ノード（task 以上）には「詳細作成」「完了」チケットを自動生成（インメモリのみ）
             if child_type != "ticket":
-                self.state.db.create_auto_children(ds, self.state.user)
-                self.state.df_nodes = self.state.db.read_nodes()
-            ds["updated_at"] = datetime.date.today().isoformat()
-            self.state.db.upsert_node(ds)
-            self.state.df_nodes.loc[ds.name] = ds  # read_nodes の代わりにインメモリ更新
+                for _child in DB.build_auto_children(ds, self.state.user):
+                    self.state.df_nodes.loc[_child.name] = _child
+            self.state.nodes_modified = True
             self.state.refresh()
 
     def _on_delete(self) -> None:
@@ -1205,8 +1206,7 @@ class TreePane(QWidget):
             return
         self.state.df_nodes.loc[idx, "status"] = "deleted"
         self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
-        self.state.db.upsert_node(self.state.df_nodes.loc[idx])
-        # インメモリ更新済みのため read_nodes は不要
+        self.state.nodes_modified = True
         self.state.refresh()
 
 
@@ -1233,35 +1233,63 @@ class _StatusDelegate(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
+class _DateClearWidget(QWidget):
+    """QDateEdit（カレンダーポップアップ付き）と × クリアボタンを一体化したデリゲート用ウィジェット"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cleared = False  # True のとき setModelData で空文字を書き込む
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.lineEdit().setReadOnly(True)
+        layout.addWidget(self.date_edit, 1)
+
+        self.clear_btn = QPushButton("×")
+        self.clear_btn.setFixedWidth(22)
+        self.clear_btn.setToolTip("日付をクリア")
+        layout.addWidget(self.clear_btn)
+
+
 class _DateDelegate(QStyledItemDelegate):
-    """日付列用デリゲート：セルクリック時にカレンダーポップアップを表示し、自由入力を禁止する"""
+    """日付列用デリゲート：カレンダーポップアップ + × クリアボタン付き"""
 
     def createEditor(self, parent, option, index):
-        edit = QDateEdit(parent)
-        edit.setCalendarPopup(True)
-        edit.setDisplayFormat("yyyy-MM-dd")
-        edit.lineEdit().setReadOnly(True)
+        widget = _DateClearWidget(parent)
         val = index.data(Qt.ItemDataRole.EditRole) or ""
         if val:
             d = QDate.fromString(str(val), "yyyy-MM-dd")
-            if d.isValid():
-                edit.setDate(d)
-            else:
-                edit.setDate(QDate.currentDate())
+            widget.date_edit.setDate(d if d.isValid() else QDate.currentDate())
         else:
-            edit.setDate(QDate.currentDate())
-        return edit
+            widget.date_edit.setDate(QDate.currentDate())
+        # × ボタン押下 → cleared フラグを立てて即コミット・クローズ
+        widget.clear_btn.clicked.connect(lambda: self._on_clear(widget))
+        return widget
 
-    def setEditorData(self, editor, index):
+    def _on_clear(self, widget: _DateClearWidget) -> None:
+        widget.cleared = True
+        self.commitData.emit(widget)
+        self.closeEditor.emit(widget, QAbstractItemDelegate.EndEditHint.NoHint)
+
+    def setEditorData(self, editor: _DateClearWidget, index) -> None:
         val = index.data(Qt.ItemDataRole.EditRole) or ""
         d = QDate.fromString(str(val), "yyyy-MM-dd")
         if d.isValid():
-            editor.setDate(d)
+            editor.date_edit.setDate(d)
 
-    def setModelData(self, editor, model, index):
-        model.setData(index, editor.date().toString("yyyy-MM-dd"), Qt.ItemDataRole.EditRole)
+    def setModelData(self, editor: _DateClearWidget, model, index) -> None:
+        if editor.cleared:
+            model.setData(index, "", Qt.ItemDataRole.EditRole)
+        else:
+            model.setData(index, editor.date_edit.date().toString("yyyy-MM-dd"),
+                          Qt.ItemDataRole.EditRole)
 
-    def updateEditorGeometry(self, editor, option, index):
+    def updateEditorGeometry(self, editor, option, index) -> None:
         editor.setGeometry(option.rect)
 
 
@@ -1294,15 +1322,30 @@ class TablePane(QWidget):
         )
         layout.addWidget(self.header_label)
 
-        # ボタン行
-        btn_row = ButtonRow([
+        # ボタン行（未保存インジケーター付き）
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(4)
+        for _lbl, _slot in [
             ("＋ 追加",   self._on_add),
             ("✏ 編集",   self._on_edit),
             ("🗑 削除",   self._on_delete),
             ("▲ 上へ",   self._on_move_up),
             ("▼ 下へ",   self._on_move_down),
-        ])
-        layout.addWidget(btn_row)
+        ]:
+            _btn = QPushButton(_lbl)
+            _btn.setStyleSheet(STYLE_BUTTON)
+            _btn.clicked.connect(_slot)
+            btn_layout.addWidget(_btn)
+        self._dirty_lbl = QLabel("⚠ 未保存の変更があります  [Ctrl+S で保存]")
+        self._dirty_lbl.setStyleSheet(
+            "QLabel { background: #E53935; color: white; font-weight: bold; "
+            "padding: 3px 8px; border-radius: 3px; }"
+        )
+        self._dirty_lbl.setVisible(False)
+        btn_layout.addWidget(self._dirty_lbl)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
 
         # テーブル（直接編集可）
         COLS = ["タイトル", "順序", "ステータス", "見積(h)", "実績(h)",
@@ -1407,6 +1450,15 @@ class TablePane(QWidget):
     def refresh(self) -> None:
         self._rebuild_table()
 
+    def _mark_dirty(self) -> None:
+        """編集が行われたことをマークし、未保存インジケーターを表示する"""
+        self.state.nodes_modified = True
+        self._dirty_lbl.setVisible(True)
+
+    def _update_dirty_indicator(self) -> None:
+        """state.nodes_modified に基づき未保存インジケーターの表示を更新する"""
+        self._dirty_lbl.setVisible(getattr(self.state, "nodes_modified", False))
+
     def _rebuild_table(self) -> None:
         """選択中の親ノードの子ノードをテーブルに再描画する。シグナルをブロックして再帰更新を防ぐ。"""
         self._rebuilding = True
@@ -1416,7 +1468,10 @@ class TablePane(QWidget):
             if not self._parent_idx:
                 return
             df = self.state.df_nodes
-            children = df[df["parent_id"] == self._parent_idx].copy()
+            # 論理削除済みノードは表示しない
+            children = df[
+                (df["parent_id"] == self._parent_idx) & (df["status"] != "deleted")
+            ].copy()
             if children.empty:
                 return
             children = children.sort_values("priority")
@@ -1453,6 +1508,7 @@ class TablePane(QWidget):
         finally:
             self.table.blockSignals(False)
             self._rebuilding = False
+            self._update_dirty_indicator()
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         """セル編集時にデータを即時更新する"""
@@ -1490,14 +1546,12 @@ class TablePane(QWidget):
             return
         self.state.df_nodes.loc[idx, field] = value
         self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
-        if self.state.db:
-            self.state.db.upsert_node(self.state.df_nodes.loc[idx])
-            # スケジュールに影響するフィールドが変更された場合は全体を再計算
-            # スケジュールに影響するフィールドが変更された場合はUI再描画（ツリー再構築なし）
-            if field in ("status", "estimated_hours", "actual_hours",
-                         "start_available", "deadline"):
-                self._rebuild_table()          # テーブル外観（done=グレー等）を更新
-                self.schedule_refresh.emit()   # スケジュールパネルのみリフレッシュ
+        self._mark_dirty()
+        # スケジュールに影響するフィールドが変更された場合はUI再描画（ツリー再構築なし）
+        if field in ("status", "estimated_hours", "actual_hours",
+                     "start_available", "deadline"):
+            self._rebuild_table()          # テーブル外観（done=グレー等）を更新
+            self.schedule_refresh.emit()   # スケジュールパネルのみリフレッシュ
         self.info.set_info(f"更新: {field} = {value}")
 
     def _current_idx(self) -> Optional[str]:
@@ -1541,8 +1595,8 @@ class TablePane(QWidget):
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             ds = dlg.get_series()
-            self.state.db.upsert_node(ds)
             self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
+            self._mark_dirty()
             self.state.refresh()
 
     def _on_edit(self) -> None:
@@ -1561,9 +1615,8 @@ class TablePane(QWidget):
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             ds = dlg.get_series()
-            self.state.df_nodes.loc[ds.name] = ds
-            self.state.db.upsert_node(ds)
-            # インメモリ更新済みのため read_nodes は不要
+            self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
+            self._mark_dirty()
             self.state.refresh()
 
     def _on_delete(self) -> None:
@@ -1585,8 +1638,7 @@ class TablePane(QWidget):
             return
         self.state.df_nodes.loc[idx, "status"] = "deleted"
         self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
-        self.state.db.upsert_node(self.state.df_nodes.loc[idx])
-        # インメモリ更新済みのため read_nodes は不要
+        self._mark_dirty()
         self.state.refresh()
 
     def _on_move_up(self)   -> None: self._swap_adjacent(-1)
@@ -1622,14 +1674,7 @@ class TablePane(QWidget):
         self.state.df_nodes.loc[idx_adj, "priority"] = p_cur
         self.state.df_nodes.loc[idx_cur, "updated_at"] = today
         self.state.df_nodes.loc[idx_adj, "updated_at"] = today
-
-        if self.state.db:
-            # 1 トランザクションで一括保存（2回の個別 open/commit/close を削減）
-            self.state.db.upsert_nodes_bulk([
-                self.state.df_nodes.loc[idx_cur],
-                self.state.df_nodes.loc[idx_adj],
-            ])
-
+        self._mark_dirty()
         self._rebuild_table()
 
         # 移動後に idx_cur の行を選択する
@@ -1679,8 +1724,8 @@ class TablePane(QWidget):
         ds["estimated_hours"] = 1.0
         ds["status"] = "todo"
         new_idx = ds.name
-        self.state.db.upsert_node(ds)
         self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
+        self._mark_dirty()
         self._rebuild_table()
         # 追加した行のタイトル列に自動フォーカス
         for r in range(self.table.rowCount()):
@@ -1691,7 +1736,7 @@ class TablePane(QWidget):
                 break
 
     def eventFilter(self, obj, event) -> bool:
-        """Alt+↑↓ でステータス列の値をサイクルする"""
+        """Alt+↑↓ でステータス列の値をサイクル / Delete で日付列をクリア"""
         if obj is self.table and event.type() == QEvent.Type.KeyPress:
             key = event.key()
             mod = event.modifiers()
@@ -1709,6 +1754,15 @@ class TablePane(QWidget):
                         else:
                             i = (i + 1) % len(status_list)
                         item.setText(status_list[i])
+                        return True
+            elif key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and not mod:
+                row = self.table.currentRow()
+                col = self.table.currentColumn()
+                if col in {5, 6}:  # 開始可能日(5)・納期(6)列
+                    item = self.table.item(row, col)
+                    if item and (item.flags() & Qt.ItemFlag.ItemIsEditable):
+                        item.setText("")
+                        self._mark_dirty()
                         return True
         return super().eventFilter(obj, event)
 
@@ -1805,10 +1859,33 @@ class _NodeEditDialog(QDialog):
         self.f_est.setRange(0, 9999)
         self.f_est.setDecimals(2)
         self.f_est.setSingleStep(0.25)
-        self.f_start = QLineEdit()
-        self.f_start.setPlaceholderText("YYYY-MM-DD")
-        self.f_deadline = QLineEdit()
-        self.f_deadline.setPlaceholderText("YYYY-MM-DD")
+        # 開始可能日: カレンダー選択ボタン（空=未設定）
+        self.f_start = DateButton(allow_empty=True)
+        start_row = QWidget()
+        start_layout = QHBoxLayout(start_row)
+        start_layout.setContentsMargins(0, 0, 0, 0)
+        start_layout.addWidget(self.f_start)
+        start_clear = QPushButton("×")
+        start_clear.setFixedWidth(28)
+        start_clear.setToolTip("開始可能日をクリア")
+        start_clear.clicked.connect(self.f_start.clear_date)
+        start_layout.addWidget(start_clear)
+
+        # 納期: カレンダー選択ボタン（開始可能日の月を初期表示月として使用）
+        self.f_deadline = DateButton(
+            allow_empty=True,
+            anchor_date_func=lambda: self.f_start.get_date(),
+        )
+        deadline_row = QWidget()
+        deadline_layout = QHBoxLayout(deadline_row)
+        deadline_layout.setContentsMargins(0, 0, 0, 0)
+        deadline_layout.addWidget(self.f_deadline)
+        deadline_clear = QPushButton("×")
+        deadline_clear.setFixedWidth(28)
+        deadline_clear.setToolTip("納期をクリア")
+        deadline_clear.clicked.connect(self.f_deadline.clear_date)
+        deadline_layout.addWidget(deadline_clear)
+
         self.f_color = ColorCombo()
         self.f_memo = QTextEdit()
         self.f_memo.setMaximumHeight(80)
@@ -1817,8 +1894,8 @@ class _NodeEditDialog(QDialog):
         form.addRow("順序:",         self.f_priority)
         form.addRow("ステータス:",   self.f_status)
         form.addRow("見積工数(h):",  self.f_est)
-        form.addRow("開始可能日:",   self.f_start)
-        form.addRow("納期:",         self.f_deadline)
+        form.addRow("開始可能日:",   start_row)
+        form.addRow("納期:",         deadline_row)
         form.addRow("表示色:",       self.f_color)
         form.addRow("メモ:",         self.f_memo)
 
@@ -1840,8 +1917,8 @@ class _NodeEditDialog(QDialog):
             if si >= 0:
                 self.f_status.setCurrentIndex(si)
             self.f_est.setValue(float(row.get("estimated_hours", 0)))
-            self.f_start.setText(str(row.get("start_available", "") or ""))
-            self.f_deadline.setText(str(row.get("deadline", "") or ""))
+            self.f_start.set_date(str(row.get("start_available", "") or ""))
+            self.f_deadline.set_date(str(row.get("deadline", "") or ""))
             self.f_color.set_color(str(row.get("color", "Cyan")))
             self.f_memo.setPlainText(str(row.get("memo", "")))
 
@@ -1867,8 +1944,8 @@ class _NodeEditDialog(QDialog):
         ds["priority"]        = self.f_priority.value()
         ds["status"]          = self.f_status.currentText()
         ds["estimated_hours"] = self.f_est.value()
-        ds["start_available"] = self.f_start.text().strip() or None
-        ds["deadline"]        = self.f_deadline.text().strip() or None
+        ds["start_available"] = self.f_start.get_date() or None
+        ds["deadline"]        = self.f_deadline.get_date() or None
         ds["color"]           = self.f_color.current_color()
         ds["memo"]            = self.f_memo.toPlainText()
         ds["updated_at"]      = datetime.date.today().isoformat()

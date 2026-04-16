@@ -34,29 +34,56 @@ class DateButton(QPushButton):
     クリックするとカレンダーポップアップを表示する日付選択ボタン。
     date_changed シグナルで変更後の日付文字列（YYYY-MM-DD）を通知する。
     カレンダーのダブルクリックでも即座に確定される。
+
+    allow_empty=True の場合は「未設定」状態をサポートする。
+    anchor_date_func を指定すると、日付未設定でカレンダーを開く際に
+    その戻り値（YYYY-MM-DD）の月を初期表示月として使用する。
     """
     date_changed = Signal(str)
 
-    def __init__(self, parent=None, initial_date: str = ""):
+    def __init__(self, parent=None, initial_date: str = "",
+                 allow_empty: bool = False,
+                 anchor_date_func: Optional[Callable[[], str]] = None):
         super().__init__(parent)
-        self._date = initial_date or datetime.date.today().isoformat()
+        self._allow_empty = allow_empty
+        self._anchor_date_func = anchor_date_func
+        # allow_empty=False の場合は空文字を今日に補完（従来動作）
+        if allow_empty:
+            self._date = initial_date
+        else:
+            self._date = initial_date or datetime.date.today().isoformat()
         self._update_text()
         self.clicked.connect(self._open_calendar)
         self.setStyleSheet(STYLE_BUTTON)
 
     def get_date(self) -> str:
+        """選択中の日付文字列（未設定の場合は空文字）を返す"""
         return self._date
 
     def set_date(self, date_str: str) -> None:
         self._date = date_str
         self._update_text()
 
+    def clear_date(self) -> None:
+        """日付をクリアして未設定状態にする（allow_empty=True の場合のみ有効）"""
+        if self._allow_empty:
+            self._date = ""
+            self._update_text()
+            self.date_changed.emit("")
+
     def _update_text(self) -> None:
-        self.setText(f"📅 {self._date}")
+        if self._date:
+            self.setText(f"📅 {self._date}")
+        else:
+            self.setText("📅 未設定")
 
     def _open_calendar(self) -> None:
         """カレンダーダイアログを開き、選択された日付でボタン表示を更新してシグナルを送出する"""
-        dlg = _CalendarDialog(self._date, self)
+        # 表示開始月: 現在の日付 > アンカー関数の戻り値 > 今日
+        display_date = self._date
+        if not display_date and self._anchor_date_func:
+            display_date = self._anchor_date_func()
+        dlg = _CalendarDialog(display_date or datetime.date.today().isoformat(), self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._date = dlg.selected_date()
             self._update_text()

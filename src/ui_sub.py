@@ -1485,51 +1485,105 @@ class RoadmapView(QWidget):
 # ---------- 工数分析 ----------
 
 class AnalysisView(QWidget):
+    """
+    工数分析タブ。
+    集計レベル（P1〜Task）・親ノード・ユーザーを選択して棒グラフで工数を可視化し、
+    超過チケット一覧を表示する。
+    """
+
+    # ノード階層の順序
+    _LEVEL_ORDER = ["project1", "project2", "project3", "project4", "task"]
+
     def __init__(self, state):
         super().__init__()
         self.state = state
+
+        # matplotlib を遅延インポート（起動時のオーバーヘッドを避ける）
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+        import matplotlib
+        matplotlib.rcParams["font.family"] = ["Hiragino Sans", "Yu Gothic",
+                                               "Noto Sans CJK JP", "sans-serif"]
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
         layout.addWidget(QLabel("📈 工数分析"))
         layout.addWidget(Separator())
 
-        # 期間選択
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("期間:"))
-        self.from_edit = QLineEdit()
-        self.from_edit.setPlaceholderText("YYYY-MM-DD")
-        self.from_edit.setMaximumWidth(120)
-        filter_row.addWidget(self.from_edit)
-        filter_row.addWidget(QLabel("〜"))
-        self.to_edit = QLineEdit()
-        self.to_edit.setPlaceholderText("YYYY-MM-DD")
-        self.to_edit.setMaximumWidth(120)
-        filter_row.addWidget(self.to_edit)
-        btn = QPushButton("集計")
-        btn.setStyleSheet(STYLE_BUTTON)
-        btn.clicked.connect(self._calc)
-        filter_row.addWidget(btn)
-        filter_row.addStretch()
-        layout.addLayout(filter_row)
+        # ── コントロールパネル ──────────────────────────────
+        ctrl_box = QGroupBox("集計設定")
+        ctrl_vlay = QVBoxLayout(ctrl_box)
+
+        # 集計レベル
+        level_row = QHBoxLayout()
+        level_row.addWidget(QLabel("集計レベル:"))
+        self._level_btns: dict[str, QRadioButton] = {}
+        self._level_grp = QButtonGroup(self)
+        for lbl, typ in [("P1", "project1"), ("P2", "project2"),
+                          ("P3", "project3"), ("P4", "project4"), ("Task", "task")]:
+            rb = QRadioButton(lbl)
+            self._level_btns[typ] = rb
+            self._level_grp.addButton(rb)
+            level_row.addWidget(rb)
+        self._level_btns["project1"].setChecked(True)
+        level_row.addStretch()
+        ctrl_vlay.addLayout(level_row)
+
+        # 親ノード選択（P2 以下のとき表示）
+        self._parent_box = QGroupBox("対象ノード（親選択）")
+        parent_inner = QVBoxLayout(self._parent_box)
+        self._parent_scroll = QScrollArea()
+        self._parent_scroll.setWidgetResizable(True)
+        self._parent_scroll.setMaximumHeight(80)
+        self._parent_widget = QWidget()
+        self._parent_layout = QHBoxLayout(self._parent_widget)
+        self._parent_layout.setContentsMargins(4, 4, 4, 4)
+        self._parent_scroll.setWidget(self._parent_widget)
+        parent_inner.addWidget(self._parent_scroll)
+        self._parent_checks: dict[str, QCheckBox] = {}
+        ctrl_vlay.addWidget(self._parent_box)
+        self._parent_box.setVisible(False)
+
+        # ユーザー選択
+        user_row = QHBoxLayout()
+        user_row.addWidget(QLabel("ユーザー:"))
+        self._all_user_cb = QCheckBox("全員")
+        self._all_user_cb.setChecked(True)
+        self._all_user_cb.stateChanged.connect(self._on_all_user_toggled)
+        user_row.addWidget(self._all_user_cb)
+        self._user_checks: dict[str, QCheckBox] = {}
+        for m in state.members:
+            cb = QCheckBox(state.display_name(m))
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._on_user_check_changed)
+            user_row.addWidget(cb)
+            self._user_checks[m] = cb
+        user_row.addStretch()
+        ctrl_vlay.addLayout(user_row)
+
+        # 集計ボタン
+        calc_btn = QPushButton("集計")
+        calc_btn.setStyleSheet(STYLE_BUTTON)
+        calc_btn.clicked.connect(self._calc)
+        ctrl_vlay.addWidget(calc_btn)
+
+        layout.addWidget(ctrl_box)
+
+        # レベル変更時に親ノード選択を更新
+        for rb in self._level_btns.values():
+            rb.toggled.connect(self._on_level_changed)
+
+        # ── 棒グラフ ───────────────────────────────────────
+        self._fig = Figure(tight_layout=True)
+        self._ax = self._fig.add_subplot(111)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setMinimumHeight(220)
+        layout.addWidget(self._canvas, stretch=2)
 
         layout.addWidget(Separator())
 
-        # 担当者別工数テーブル
-        layout.addWidget(QLabel("担当者別 実績工数"))
-        COLS = ["担当者", "実績工数(h)", "見積工数(h)", "チケット数"]
-        self.member_table = ScrollableTable(COLS, [150, 100, 100, 80])
-        self.member_table.setMaximumHeight(200)
-        layout.addWidget(self.member_table)
-
-        # PJ 別テーブル
-        layout.addWidget(QLabel("Project1 別 実績工数"))
-        PJ_COLS = ["Project1", "実績工数(h)", "見積工数(h)"]
-        self.pj_table = ScrollableTable(PJ_COLS, [220, 100, 100])
-        self.pj_table.setMaximumHeight(200)
-        layout.addWidget(self.pj_table)
-
-        # 見積 vs 実績アラート
+        # ── 超過チケット一覧 ───────────────────────────────
         layout.addWidget(QLabel("見積 vs 実績（超過チケット）"))
         AL_COLS = ["タイトル", "担当者", "見積(h)", "実績(h)", "納期"]
         self.alert_table = ScrollableTable(AL_COLS, [200, 90, 65, 65, 100])
@@ -1538,63 +1592,174 @@ class AnalysisView(QWidget):
         self.info = InfoLabel()
         layout.addWidget(self.info)
 
-        # 初期日付
-        today = datetime.date.today()
-        month_start = today.replace(day=1).isoformat()
-        self.from_edit.setText(month_start)
-        self.to_edit.setText(today.isoformat())
+    # ── ユーザー選択ヘルパー ─────────────────────────────
+
+    def _on_all_user_toggled(self, state: int) -> None:
+        """全員チェック変化 → 個別チェックに同期"""
+        checked = bool(state)
+        for cb in self._user_checks.values():
+            cb.blockSignals(True)
+            cb.setChecked(checked)
+            cb.blockSignals(False)
+
+    def _on_user_check_changed(self) -> None:
+        """個別ユーザーチェック変化 → 全員チェックを更新"""
+        all_checked = all(cb.isChecked() for cb in self._user_checks.values())
+        self._all_user_cb.blockSignals(True)
+        self._all_user_cb.setChecked(all_checked)
+        self._all_user_cb.blockSignals(False)
+
+    # ── レベル選択ヘルパー ───────────────────────────────
+
+    def _current_level_type(self) -> str:
+        for typ, rb in self._level_btns.items():
+            if rb.isChecked():
+                return typ
+        return "project1"
+
+    def _parent_type_of(self, node_type: str) -> Optional[str]:
+        """node_type の一つ上の親タイプを返す（project1 は None）"""
+        i = self._LEVEL_ORDER.index(node_type) if node_type in self._LEVEL_ORDER else -1
+        return self._LEVEL_ORDER[i - 1] if i > 0 else None
+
+    def _on_level_changed(self) -> None:
+        """集計レベル変更 → 親ノード選択パネルを更新"""
+        level = self._current_level_type()
+        parent_type = self._parent_type_of(level)
+        if parent_type is None:
+            self._parent_box.setVisible(False)
+            return
+        # 既存チェックボックスを全削除
+        for i in reversed(range(self._parent_layout.count())):
+            item = self._parent_layout.itemAt(i)
+            if item and item.widget():
+                item.widget().deleteLater()
+        self._parent_checks.clear()
+        # 親レベルのノードをチェックボックスとして列挙
+        df = self.state.df_nodes
+        parents = df[df["node_type"] == parent_type]
+        for idx, row in parents.iterrows():
+            cb = QCheckBox(str(row.get("title", idx)))
+            cb.setChecked(True)
+            self._parent_layout.addWidget(cb)
+            self._parent_checks[str(idx)] = cb
+        self._parent_layout.addStretch()
+        self._parent_box.setVisible(True)
+
+    # ── 集計・描画 ───────────────────────────────────────
+
+    def _find_ancestor_at_type(self, idx: str, target_type: str) -> Optional[str]:
+        """idx の祖先を遡り node_type == target_type の IDX を返す（なければ None）"""
+        df = self.state.df_nodes
+        current: Optional[str] = idx
+        visited: set[str] = set()
+        while current and current not in visited:
+            if current not in df.index:
+                return None
+            row = df.loc[current]
+            if str(row.get("node_type", "")) == target_type:
+                return current
+            visited.add(current)
+            parent = str(row.get("parent_id", ""))
+            current = parent if parent else None
+        return None
 
     def refresh(self) -> None:
+        """タブ切替・データ更新時に呼ばれる"""
+        self._on_level_changed()
         self._calc()
 
     def _calc(self) -> None:
+        """集計してグラフと超過チケット一覧を更新する"""
         df = self.state.df_nodes
         if df.empty:
             return
 
-        # 担当者別集計
-        tickets = df[df["node_type"] == "ticket"].copy()
-        member_data = {}
-        for _, row in tickets.iterrows():
-            m = str(row.get("assigned_to", ""))
-            if m not in member_data:
-                member_data[m] = {"actual": 0.0, "est": 0.0, "cnt": 0}
-            member_data[m]["actual"] += float(row.get("actual_hours", 0) or 0)
-            member_data[m]["est"]    += float(row.get("estimated_hours", 0) or 0)
-            member_data[m]["cnt"]    += 1
-        m_rows = [[self.state.display_name(m), f"{v['actual']:.2f}", f"{v['est']:.2f}", v['cnt']]
-                  for m, v in member_data.items()]
-        self.member_table.set_rows(sorted(m_rows, key=lambda x: -float(x[1])))
+        level = self._current_level_type()
+        parent_type = self._parent_type_of(level)
 
-        # PJ1 別集計
-        pj1_list = df[df["node_type"] == "project1"]
-        pj_rows = []
-        for idx, row in pj1_list.iterrows():
-            pj_rows.append([
-                row.get("title", ""),
-                f"{float(row.get('actual_hours', 0) or 0):.2f}",
-                f"{float(row.get('estimated_hours', 0) or 0):.2f}",
-            ])
-        self.pj_table.set_rows(pj_rows)
+        # 選択ユーザー（None = 全員）
+        if self._all_user_cb.isChecked():
+            user_set: Optional[set[str]] = None
+        else:
+            user_set = {u for u, cb in self._user_checks.items() if cb.isChecked()}
 
-        # 超過チケット
-        over = tickets[
-            tickets.apply(
-                lambda r: float(r.get("actual_hours", 0) or 0)
-                          > float(r.get("estimated_hours", 0) or 0) * 1.0
-                          and float(r.get("estimated_hours", 0) or 0) > 0,
+        # 選択親ノード（None = 全て）
+        parent_idxs: Optional[set[str]] = None
+        if parent_type is not None:
+            parent_idxs = {idx for idx, cb in self._parent_checks.items()
+                           if cb.isChecked()}
+
+        # 集計レベルのノードを取得
+        groups = df[df["node_type"] == level]
+        if parent_idxs is not None:
+            groups = groups[groups["parent_id"].isin(parent_idxs)]
+
+        # 各グループの初期レコード
+        agg: dict[str, dict] = {
+            str(idx): {
+                "title": str(row.get("title", "")),
+                "actual": 0.0,
+                "est": 0.0,
+            }
+            for idx, row in groups.iterrows()
+        }
+
+        if user_set is None:
+            # 全員: ノード自身の集計値をそのまま使用
+            for idx in list(agg.keys()):
+                row = df.loc[idx]
+                agg[idx]["actual"] = float(row.get("actual_hours", 0) or 0)
+                agg[idx]["est"]    = float(row.get("estimated_hours", 0) or 0)
+        else:
+            # 特定ユーザーのみ: チケットを走査して積み上げ
+            tickets = df[(df["node_type"] == "ticket") &
+                         (df["assigned_to"].isin(user_set))]
+            for t_idx, t_row in tickets.iterrows():
+                anc = self._find_ancestor_at_type(str(t_idx), level)
+                if anc and anc in agg:
+                    agg[anc]["actual"] += float(t_row.get("actual_hours", 0) or 0)
+                    agg[anc]["est"]    += float(t_row.get("estimated_hours", 0) or 0)
+
+        # ── 棒グラフ描画 ──────────────────────────────────
+        self._ax.clear()
+        if agg:
+            labels  = [v["title"] for v in agg.values()]
+            ests    = [v["est"]    for v in agg.values()]
+            actuals = [v["actual"] for v in agg.values()]
+            x = list(range(len(labels)))
+            w = 0.35
+            self._ax.bar([i - w / 2 for i in x], ests,    w, label="見積(h)", color="#90CAF9")
+            self._ax.bar([i + w / 2 for i in x], actuals, w, label="実績(h)", color="#A5D6A7")
+            self._ax.set_xticks(x)
+            self._ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+            self._ax.set_ylabel("工数 (h)", fontsize=9)
+            self._ax.legend(fontsize=8)
+            self._ax.set_title(f"{level} レベル 工数分析", fontsize=10)
+        self._canvas.draw()
+
+        # ── 超過チケット一覧 ──────────────────────────────
+        tickets_all = df[df["node_type"] == "ticket"]
+        if user_set is not None:
+            tickets_all = tickets_all[tickets_all["assigned_to"].isin(user_set)]
+        over = tickets_all[
+            tickets_all.apply(
+                lambda r: (float(r.get("actual_hours", 0) or 0)
+                           > float(r.get("estimated_hours", 0) or 0)
+                           and float(r.get("estimated_hours", 0) or 0) > 0),
                 axis=1,
             )
         ]
         al_rows = [[
-            r.get("title", ""), self.state.display_name(str(r.get("assigned_to", ""))),
+            r.get("title", ""),
+            self.state.display_name(str(r.get("assigned_to", ""))),
             f"{float(r.get('estimated_hours', 0)):.2f}",
             f"{float(r.get('actual_hours', 0)):.2f}",
             r.get("deadline", ""),
         ] for _, r in over.iterrows()]
         self.alert_table.set_rows(al_rows)
         self.info.set_info(
-            f"チケット数: {len(tickets)} / 超過: {len(al_rows)}"
+            f"集計: {len(agg)} ノード / 超過チケット: {len(al_rows)}"
         )
 
 

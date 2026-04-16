@@ -76,6 +76,26 @@ def daily_sch_idx(date_str: str, username: str) -> str:
     return f"{date_str}-{username}"
 
 
+def build_auto_children(parent_ds: pd.Series, owner: str) -> list:
+    """
+    親ノード作成時に「詳細作成」「完了」チケットを自動生成して返す（DB 書き込みなし）。
+    遅延保存（Ctrl+S 保存）に対応するため、DB への書き込みを行わない。
+    create_auto_children の代替として TreePane._on_new で使用する。
+    """
+    children = []
+    for i, title in enumerate(["詳細作成", "完了"]):
+        child = create_initial_node(
+            owner=owner,
+            node_type="ticket",
+            title=title,
+            parent_id=parent_ds.name,
+            priority=i + 1,
+            color=parent_ds.get("color", "Cyan"),
+        )
+        children.append(child)
+    return children
+
+
 def create_initial_node(owner: str, node_type: str, title: str,
                         parent_id: str = "0", priority: int = 99,
                         color: str = "") -> pd.Series:
@@ -347,13 +367,11 @@ class Database:
             conn.close()
 
     def save_nodes(self, df: pd.DataFrame, user: str) -> None:
-        """ユーザー自身の最近更新ノードを DB に保存する（直近 2 日以内を対象）"""
+        """ユーザー自身が担当するノードを DB に保存する"""
         if df.empty:
             return
-        # 直近 2 日以内に更新された、自分が担当するノードのみ保存対象とする
-        threshold = (datetime.date.today() - datetime.timedelta(days=2)).isoformat()
-        mask = (df.get("assigned_to", pd.Series(dtype=str)) == user) & \
-               (df.get("updated_at", pd.Series(dtype=str)) >= threshold)
+        # 自分が担当するノードのみ保存対象とする（2日フィルター廃止）
+        mask = df.get("assigned_to", pd.Series(dtype=str)) == user
         target = df[mask]
         if target.empty:
             return
