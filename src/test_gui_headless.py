@@ -105,10 +105,13 @@ def test_state_properties(state):
 
     try:
         state.current_member = "tanaka@email.com"
-        assert state.user == "tanaka@email.com"
-        state.current_member = "yamada@email.com"
-        ok("current_member setter → user が連動する")
+        # 仕様: user はログインユーザー固定（メンバーボタンで変わらない）
+        assert state.user == "yamada@email.com", f"user={state.user}"
+        assert state.current_member == "tanaka@email.com"
+        state.current_member = "yamada@email.com"  # 元に戻す
+        ok("current_member setter → login_user は変わらない（表示メンバーのみ変更）")
     except Exception as e:
+        state.current_member = "yamada@email.com"  # 失敗時も必ず元に戻す
         ng("current_member setter", e)
 
     try:

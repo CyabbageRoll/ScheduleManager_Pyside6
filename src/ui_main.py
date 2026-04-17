@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QFormLayout, QScrollArea, QMessageBox, QHeaderView,
     QFrame, QStackedWidget, QSizePolicy, QToolBar, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QSpinBox, QCheckBox,
-    QStyledItemDelegate, QDateEdit, QAbstractItemDelegate,
+    QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu,
 )
 from pathlib import Path
 
@@ -592,6 +592,7 @@ class MainWindow(QMainWindow):
             ("⚙ Config",  IDX_CONFIG),
             ("🤖 AI取込",  IDX_AIIMPORT),
         ]
+        self._tab_style = _TAB_STYLE  # バッジリセット時に使用
         self._tab_btns: dict = {}
         for label, view_idx in views:
             btn = QPushButton(label)
@@ -645,7 +646,7 @@ class MainWindow(QMainWindow):
 
     def _on_open_manual(self) -> None:
         """マニュアルHTMLをデフォルトブラウザで開く"""
-        manual_path = Path(__file__).parent / "manual.html"
+        manual_path = Path(__file__).parent / "documents" / "manual.html"
         if manual_path.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(manual_path)))
         else:
@@ -701,6 +702,7 @@ class MainWindow(QMainWindow):
         # 項目3: Request シグナル接続
         self.gantt_view.request_requested.connect(self._on_request_requested)
         self.road_view.request_requested.connect(self._on_request_requested)
+        self.main_pane.tree_pane.request_requested.connect(self._on_request_requested)
         # AI取込完了 → Edit タブへ
         self.ai_import_view.import_done.connect(self._on_ai_import_done)
 
@@ -732,6 +734,9 @@ class MainWindow(QMainWindow):
         cur = self.stack.currentWidget()
         if hasattr(cur, "refresh"):
             cur.refresh()
+        # 未処理 Request バッジを常に最新化（起動時含む）
+        if hasattr(self, "_tab_btns"):
+            self._update_request_tab_badge()
 
     # ---------- スロット ----------
 
@@ -771,6 +776,8 @@ class MainWindow(QMainWindow):
         try:
             self.state.save()  # nodes_modified を False にリセットする
             self.main_pane.table_pane._update_dirty_indicator()
+            # 保存後にノード階層（TreePane）を更新する
+            self.main_pane.tree_pane.refresh()
             self.statusBar().showMessage("保存しました", 3000)
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
@@ -839,6 +846,30 @@ class MainWindow(QMainWindow):
         cur = self.stack.currentWidget()
         if hasattr(cur, "refresh") and cur is not self.main_pane:
             cur.refresh()
+        # 未処理 Request の件数に応じてタブボタンを強調表示
+        self._update_request_tab_badge()
+
+    def _update_request_tab_badge(self) -> None:
+        """自分宛の未処理 Request 件数をタブボタンに表示する"""
+        df_asgn = self.state.df_assignments
+        pending = 0
+        if not df_asgn.empty:
+            pending = int(
+                ((df_asgn["to_user"] == self.state.user) & (df_asgn["status"] == "pending")).sum()
+            )
+        btn = self._tab_btns.get(IDX_ASSIGN)
+        if btn is None:
+            return
+        if pending > 0:
+            btn.setText(f"📨 Request ({pending})")
+            btn.setStyleSheet(
+                btn.styleSheet() +
+                "QPushButton { background: #E53935; color: white; font-weight: bold; }"
+                "QPushButton:checked { background: #B71C1C; color: white; }"
+            )
+        else:
+            btn.setText("📨 Request")
+            btn.setStyleSheet(self._tab_style)
 
 
 # ---------- 3 ペインレイアウト ----------
@@ -886,7 +917,8 @@ class TreePane(QWidget):
     ノードの新規作成・削除・検索・自分のみフィルタ機能を持つ。
     ノード選択時に node_selected シグナルで IDX を TablePane へ通知する。
     """
-    node_selected = Signal(str)  # 選択された IDX
+    node_selected     = Signal(str)  # 選択された IDX
+    request_requested = Signal(str)  # 右クリック Request 選択時に IDX を送出
 
     def __init__(self, state):
         super().__init__()
@@ -937,6 +969,8 @@ class TreePane(QWidget):
         self.tree.header().setStretchLastSection(True)
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tree.currentItemChanged.connect(self._on_item_changed)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_context_menu)
         self.tree.setIndentation(18)
         self.tree.setRootIsDecorated(True)
         # 階層線と種別を視覚的に分かりやすくするスタイル
@@ -1134,6 +1168,20 @@ class TreePane(QWidget):
                 return found
         return None
 
+    def _on_context_menu(self, pos) -> None:
+        """ツリーの右クリックメニューを表示する"""
+        item = self.tree.itemAt(pos)
+        if not item:
+            return
+        idx = item.data(0, Qt.ItemDataRole.UserRole)
+        if not idx or idx == "0":
+            return
+        menu = QMenu(self)
+        act_req = menu.addAction("📨 Request")
+        act = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if act == act_req:
+            self.request_requested.emit(idx)
+
     def _on_item_changed(self, current, previous) -> None:
         if not current:
             return
@@ -1191,6 +1239,10 @@ class TreePane(QWidget):
         idx = self._selected_idx
         df = self.state.df_nodes
         if idx not in df.index:
+            return
+        # 他ユーザーのノードは削除不可
+        if str(df.loc[idx, "assigned_to"]) != self.state.user:
+            QMessageBox.warning(self, "削除不可", "他ユーザーのデータは削除できません")
             return
         # 実績工数がある場合は削除不可
         if float(df.loc[idx, "actual_hours"] or 0) > 0:
@@ -1625,6 +1677,10 @@ class TablePane(QWidget):
             return
         df = self.state.df_nodes
         if idx not in df.index:
+            return
+        # 他ユーザーのノードは削除不可
+        if str(df.loc[idx, "assigned_to"]) != self.state.user:
+            QMessageBox.warning(self, "削除不可", "他ユーザーのデータは削除できません")
             return
         if float(df.loc[idx, "actual_hours"] or 0) > 0:
             QMessageBox.warning(self, "削除不可", "実績工数が記録されているため削除できません")

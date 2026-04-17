@@ -79,8 +79,8 @@ class GanttView(QWidget):
         status_row.addWidget(QLabel("表示ステータス:"))
         self._status_group = QButtonGroup(self)
         self._status_radios = {}
-        for key, label in [("all", "全て"), ("todo", "todo"), ("done", "done"),
-                            ("cancel", "cancel"), ("regularly", "regularly")]:
+        for key, label in [("all", "全て"), ("todo", "todo"), ("regularly", "regularly"),
+                            ("done", "done"), ("cancel", "cancel")]:
             rb = QRadioButton(label)
             self._status_group.addButton(rb)
             self._status_radios[key] = rb
@@ -795,8 +795,8 @@ class RoadmapView(QWidget):
         super().__init__()
         self.state = state
         self._selected_parent_idxs: set = set()
-        self._current_level = "Task"
-        self._cell_unit = "日"  # "日" / "週" / "月"
+        self._current_level = "Project4"
+        self._cell_unit = "週"  # "日" / "週" / "月"
         self._date_col_extra: int = 0  # 日付列幅の追加ピクセル数
 
         layout = QVBoxLayout(self)
@@ -813,7 +813,7 @@ class RoadmapView(QWidget):
             bg = self._LVL_BG[label]; fg = self._LVL_FG[label]
             btn = QPushButton(label)
             btn.setCheckable(True)
-            btn.setChecked(label == "Task")
+            btn.setChecked(label == "Project4")
             btn.setStyleSheet(
                 f"QPushButton {{ background:{bg}; color:{fg}; border:2px solid {fg};"
                 f" border-radius:10px; padding:3px 12px; font-weight:bold; font-size:8pt; }}"
@@ -831,7 +831,7 @@ class RoadmapView(QWidget):
         for unit in ["日", "週", "月"]:
             btn = QPushButton(unit)
             btn.setCheckable(True)
-            btn.setChecked(unit == "日")
+            btn.setChecked(unit == "週")
             btn.setStyleSheet(
                 "QPushButton { background:#E3F2FD; color:#1565C0; border:2px solid #1565C0;"
                 " border-radius:10px; padding:3px 10px; font-size:8pt; }"
@@ -2049,8 +2049,15 @@ class AssignmentView(QWidget):
         req_form = QFormLayout(req_box)
         self.req_ticket = QComboBox()
         self.req_ticket.setMinimumWidth(250)
+        self.req_ticket.currentIndexChanged.connect(self._on_target_changed)
 
-        # 項目2: 送り先をチェックボックスで複数選択
+        # 動作説明ラベル（ノードタイプに応じて切替）
+        self._req_info_lbl = QLabel("")
+        self._req_info_lbl.setStyleSheet(
+            "QLabel { color: #555; font-style: italic; padding: 2px 0; }"
+        )
+
+        # 送り先: ticket は複数選択可、task以上は1名のみ
         self._req_to_checks: dict[str, QCheckBox] = {}
         checks_widget = QWidget()
         checks_layout = QHBoxLayout(checks_widget)
@@ -2061,13 +2068,16 @@ class AssignmentView(QWidget):
             if m == state.user:
                 # 自分自身はチェック不可
                 cb.setEnabled(False)
+            else:
+                cb.toggled.connect(self._on_check_toggled)
             checks_layout.addWidget(cb)
             self._req_to_checks[m] = cb
         checks_layout.addStretch()
 
         self.req_msg = QLineEdit()
         self.req_msg.setPlaceholderText("メッセージ")
-        req_form.addRow("チケット:", self.req_ticket)
+        req_form.addRow("対象:", self.req_ticket)
+        req_form.addRow("", self._req_info_lbl)
         req_form.addRow("送り先:", checks_widget)
         req_form.addRow("メッセージ:", self.req_msg)
         send_btn = QPushButton("依頼送信")
@@ -2078,10 +2088,13 @@ class AssignmentView(QWidget):
 
         layout.addWidget(Separator())
 
-        # 受信一覧
+        # 受信一覧（親階層付き）
         layout.addWidget(QLabel("受信した依頼"))
-        COLS = ["チケット", "依頼者", "メッセージ", "状態", "日時"]
-        self.recv_table = ScrollableTable(COLS, [180, 90, 200, 80, 100])
+        RECV_COLS = ["P1", "P2", "P3", "P4", "Task", "Ticket", "依頼者", "メッセージ", "状態", "日時"]
+        self.recv_table = ScrollableTable(RECV_COLS, [80, 80, 80, 80, 80, 120, 70, 150, 60, 90])
+        self.recv_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         layout.addWidget(self.recv_table, stretch=1)
 
         resp_row = ButtonRow([
@@ -2093,44 +2106,111 @@ class AssignmentView(QWidget):
         self.info = InfoLabel()
         layout.addWidget(self.info)
 
+    # Requestできるノードタイプ（ticket含む全階層）
+    _REQUESTABLE_TYPES = ("project1", "project2", "project3", "project4", "task", "ticket")
+    # 種別の短縮ラベル（表示用）
+    _TYPE_SHORT = {
+        "project1": "P1", "project2": "P2", "project3": "P3", "project4": "P4",
+        "task": "Task", "ticket": "Tkt",
+    }
+
+    # 階層順（P1〜Ticket の 6 段階）
+    _HIERARCHY = ["project1", "project2", "project3", "project4", "task", "ticket"]
+
+    def _node_hierarchy_row(self, t_idx: str) -> tuple:
+        """ノード IDX から [P1, P2, P3, P4, Task, Ticket] のタイトルと
+        グレーアウトフラグ（bool リスト）を返す。
+        対象ノードより下位の列は空欄でグレーアウト。"""
+        df = self.state.df_nodes
+        if t_idx not in df.index:
+            return [""] * 6, [True] * 6
+        target_type = str(df.loc[t_idx, "node_type"])
+        target_pos = self._HIERARCHY.index(target_type) if target_type in self._HIERARCHY else 5
+        # 祖先をたどってタイプ→タイトルの辞書を作成
+        path: dict = {}
+        cur = t_idx
+        for _ in range(10):
+            if cur not in df.index:
+                break
+            ntype = str(df.loc[cur, "node_type"])
+            path[ntype] = str(df.loc[cur, "title"])
+            parent_id = str(df.loc[cur, "parent_id"])
+            if not parent_id or parent_id == "0":
+                break
+            cur = parent_id
+        titles = []
+        grayed = []
+        for i, t in enumerate(self._HIERARCHY):
+            if i > target_pos:
+                titles.append("")
+                grayed.append(True)
+            else:
+                titles.append(path.get(t, ""))
+                grayed.append(False)
+        return titles, grayed
+
     def refresh(self) -> None:
-        # チケット一覧を更新
+        # 依頼対象一覧を更新（project1~4, task, ticket すべて対象）
         df = self.state.df_nodes
         self.req_ticket.clear()
-        tickets = df[
-            (df["node_type"] == "ticket")
+        targets = df[
+            (df["node_type"].isin(self._REQUESTABLE_TYPES))
             & (df["assigned_to"] == self.state.user)
             & (~df["status"].isin(["deleted", "done"]))
         ]
-        for idx, row in tickets.iterrows():
-            self.req_ticket.addItem(row["title"], userData=idx)
+        for idx, row in targets.iterrows():
+            type_short = self._TYPE_SHORT.get(str(row.get("node_type", "")), "")
+            label = f"[{type_short}] {row['title']}" if type_short else row["title"]
+            self.req_ticket.addItem(label, userData=idx)
 
-        # 受信依頼一覧
+        # 受信依頼一覧（current_member ベースで閲覧、承諾/拒否は login_user のみ）
         df_asgn = self.state.df_assignments
+        self.recv_table.setRowCount(0)
         if df_asgn.empty:
-            self.recv_table.set_rows([])
             return
-        mine = df_asgn[df_asgn["to_user"] == self.state.user]
-        rows = []
-        ids = []
-        for idx, row in mine.iterrows():
-            t_idx = row.get("ticket_id", "")
-            t_title = df.loc[t_idx, "title"] if t_idx in df.index else t_idx
-            rows.append([
-                t_title,
-                row.get("from_user", ""),
-                row.get("message", ""),
-                row.get("status", ""),
-                row.get("created_at", ""),
-            ])
-            ids.append(idx)
-        self.recv_table.set_rows(rows, ids)
+        view_member = self.state.current_member
+        # 承諾/拒否後 10 日経過したアイテムは非表示（pending は常に表示）
+        cutoff = (datetime.date.today() - datetime.timedelta(days=10)).isoformat()
+        responded = df_asgn["responded_at"].fillna("") if "responded_at" in df_asgn.columns \
+            else pd.Series("", index=df_asgn.index)
+        visible = df_asgn[
+            (df_asgn["to_user"] == view_member)
+            & (
+                (df_asgn["status"] == "pending")
+                | (responded >= cutoff)
+            )
+        ]
+        _GRAY = QColor("#BDBDBD")
+        _MINE_BG = QColor("#E3F2FD")  # 自分宛の行は薄青で強調
+        for asgn_idx, asgn_row in visible.iterrows():
+            t_idx = asgn_row.get("ticket_id", "")
+            hier_titles, hier_grayed = self._node_hierarchy_row(t_idx)
+            extra = [
+                self.state.display_name(str(asgn_row.get("from_user", ""))),
+                str(asgn_row.get("message", "")),
+                str(asgn_row.get("status", "")),
+                str(asgn_row.get("created_at", "")),
+            ]
+            all_vals = hier_titles + extra
+            is_mine = (str(asgn_row.get("to_user", "")) == self.state.user)
+            r = self.recv_table.rowCount()
+            self.recv_table.insertRow(r)
+            for c, val in enumerate(all_vals):
+                item = QTableWidgetItem(val)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setData(Qt.ItemDataRole.UserRole, asgn_idx)
+                if c < 6 and hier_grayed[c]:
+                    # 下位列はグレーアウト
+                    item.setBackground(_GRAY)
+                elif is_mine:
+                    item.setBackground(_MINE_BG)
+                self.recv_table.setItem(r, c, item)
 
     def _on_send(self) -> None:
         """依頼を送信する"""
         t_idx = self.req_ticket.currentData()
         if not t_idx:
-            QMessageBox.information(self, "情報", "チケットを選択してください")
+            QMessageBox.information(self, "情報", "対象を選択してください")
             return
 
         # チェックされたメンバーを収集（自分自身を除外）
@@ -2156,6 +2236,39 @@ class AssignmentView(QWidget):
         names = ", ".join(self.state.display_name(m) for m in selected_members)
         QMessageBox.information(self, "完了", f"{names} へ依頼しました")
 
+    def _current_node_type(self) -> str:
+        """現在コンボで選択中のノードタイプを返す"""
+        t_idx = self.req_ticket.currentData()
+        if t_idx and t_idx in self.state.df_nodes.index:
+            return str(self.state.df_nodes.loc[t_idx, "node_type"])
+        return ""
+
+    def _on_target_changed(self, _index: int) -> None:
+        """対象コンボ変更時に送付先の制限と説明文を切り替える"""
+        ntype = self._current_node_type()
+        is_ticket = (ntype == "ticket")
+        if is_ticket:
+            self._req_info_lbl.setText("※ ticket: 対象のコピーを送付先に作成します（自分のアイテムは削除されません）")
+        elif ntype:
+            self._req_info_lbl.setText("※ task/project: 担当者の変更のみ（送付先は1名のみ選択してください）")
+        else:
+            self._req_info_lbl.setText("")
+        # チェックボックスをすべてリセット
+        for cb in self._req_to_checks.values():
+            cb.setChecked(False)
+
+    def _on_check_toggled(self, checked: bool) -> None:
+        """task以上のとき、チェックを1名のみに制限する"""
+        ntype = self._current_node_type()
+        if checked and ntype and ntype != "ticket":
+            # チェックされた送信者: 他のチェックを外す
+            sender_cb = self.sender()
+            for m, cb in self._req_to_checks.items():
+                if cb is not sender_cb:
+                    cb.blockSignals(True)
+                    cb.setChecked(False)
+                    cb.blockSignals(False)
+
     def select_ticket(self, ticket_idx: str) -> None:
         """外部から呼ばれた時にチケットを選択状態にする"""
         for i in range(self.req_ticket.count()):
@@ -2163,28 +2276,49 @@ class AssignmentView(QWidget):
                 self.req_ticket.setCurrentIndex(i)
                 break
 
+    def _own_selected_ids(self) -> list:
+        """選択行のうち、ログインユーザー宛（to_user == user）の IDX のみ返す"""
+        result = []
+        for asgn_idx in self.recv_table.selected_ids():
+            if asgn_idx not in self.state.df_assignments.index:
+                continue
+            if self.state.df_assignments.loc[asgn_idx, "to_user"] == self.state.user:
+                result.append(asgn_idx)
+        return result
+
     def _on_accept(self) -> None:
-        asgn_idx = self.recv_table.selected_id()
-        if not asgn_idx:
+        asgn_ids = self._own_selected_ids()
+        if not asgn_ids:
+            self.info.set_info("⚠ 承諾できる依頼が選択されていません（自分宛のみ承諾可）")
             return
-        t_idx = self.state.df_assignments.loc[asgn_idx, "ticket_id"]
-        if t_idx in self.state.df_nodes.index:
-            # インメモリを更新
-            self.state.df_nodes.loc[t_idx, "assigned_to"] = self.state.user
-            self.state.df_nodes.loc[t_idx, "updated_at"] = \
-                datetime.date.today().isoformat()
-            # 担当者変更をその場でDBに即時保存（次回起動まで待たずに反映）
-            self.state.db.upsert_node(self.state.df_nodes.loc[t_idx])
-        self.state.db.respond_assignment(asgn_idx, "accepted")
+        today = datetime.date.today().isoformat()
+        for asgn_idx in asgn_ids:
+            t_idx = self.state.df_assignments.loc[asgn_idx, "ticket_id"]
+            if t_idx in self.state.df_nodes.index:
+                # 担当者をログインユーザーに変更（インメモリ＋DB即時保存）
+                self.state.df_nodes.loc[t_idx, "assigned_to"] = self.state.user
+                self.state.df_nodes.loc[t_idx, "updated_at"] = today
+                self.state.db.upsert_node(self.state.df_nodes.loc[t_idx])
+            self.state.db.respond_assignment(asgn_idx, "accepted")
         self.state.df_assignments = self.state.db.read_assignments()
         self.refresh()
-        QMessageBox.information(self, "完了", "承諾しました")
+        count = len(asgn_ids)
+        msg = "承諾しました" if count == 1 else f"{count}件をまとめて承諾しました"
+        QMessageBox.information(self, "完了", msg)
 
     def _on_reject(self) -> None:
-        asgn_idx = self.recv_table.selected_id()
-        if not asgn_idx:
+        candidates = self._own_selected_ids()
+        # 承諾済みは拒否不可
+        asgn_ids = [
+            i for i in candidates
+            if i in self.state.df_assignments.index
+            and self.state.df_assignments.loc[i, "status"] != "accepted"
+        ]
+        if not asgn_ids:
+            self.info.set_info("⚠ 拒否できる依頼がありません（承諾済みまたは対象外）")
             return
-        self.state.db.respond_assignment(asgn_idx, "rejected")
+        for asgn_idx in asgn_ids:
+            self.state.db.respond_assignment(asgn_idx, "rejected")
         self.state.df_assignments = self.state.db.read_assignments()
         self.refresh()
 
@@ -2603,7 +2737,7 @@ class AIImportView(QWidget):
     import_done = Signal(list)  # 取り込んだ IDX のリスト
 
     # llm_msg.md のパス（docs/ 以下）
-    _TEMPLATE_PATH = Path(__file__).parent.parent / "docs" / "llm_msg.md"
+    _TEMPLATE_PATH = Path(__file__).parent / "documents" / "llm_msg.md"
 
     def __init__(self, state):
         """AI取込ビューを初期化する"""

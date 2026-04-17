@@ -163,7 +163,9 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
 class AppState:
     config: AppConfig
 
-    # 現在の操作ユーザー・日付
+    # ログインユーザー（起動時に固定、以降変更不可）
+    login_user: str = ""
+    # 表示対象メンバー（メンバーボタンで切り替え可能）
     current_user: str = ""
     current_date: str = ""
 
@@ -181,8 +183,10 @@ class AppState:
     nodes_modified: bool = False  # 未保存変更フラグ（Ctrl+S 保存前に True になる）
 
     def __post_init__(self):
+        if not self.login_user:
+            self.login_user = self.config.username
         if not self.current_user:
-            self.current_user = self.config.username
+            self.current_user = self.login_user
         if not self.current_date:
             self.current_date = datetime.date.today().isoformat()
 
@@ -209,8 +213,8 @@ class AppState:
 
     @property
     def user(self) -> str:
-        """current_user の簡易アクセス用エイリアス（UI コード内で state.user として参照）"""
-        return self.current_user
+        """ログインユーザーを返す（メンバーボタン切り替えで変わらない）"""
+        return self.login_user
 
     @property
     def current_member(self) -> str:
@@ -233,11 +237,11 @@ class AppState:
             return
         # nodes_modified が True のときのみ save_nodes を呼ぶ（DB アクセス最小化）
         if self.nodes_modified:
-            self.db.save_nodes(self.df_nodes, self.current_user)
-        self.db.save_daily_schedule(self.df_daily, self.current_user)
-        self.db.save_daily_log(self.df_daily_log, self.current_user)
-        self.db.save_memo(self.current_user, self.memo_text)
-        self.db.save_permanent_notice(self.current_user, self.permanent_notice)
+            self.db.save_nodes(self.df_nodes, self.login_user)
+        self.db.save_daily_schedule(self.df_daily, self.login_user)
+        self.db.save_daily_log(self.df_daily_log, self.login_user)
+        self.db.save_memo(self.login_user, self.memo_text)
+        self.db.save_permanent_notice(self.login_user, self.permanent_notice)
         self.nodes_modified = False  # 保存後にフラグをリセット
 
     def load(self) -> None:
@@ -252,8 +256,8 @@ class AppState:
     def reload_memo(self) -> None:
         """DB からメモ・常時表示メモを再読込"""
         if self.db:
-            self.memo_text              = self.db.read_memo(self.current_user)
-            self.permanent_notice       = self.db.read_permanent_notice(self.current_user)
+            self.memo_text              = self.db.read_memo(self.login_user)
+            self.permanent_notice       = self.db.read_permanent_notice(self.login_user)
             self.all_permanent_notices  = self.db.read_all_permanent_notices()
 
 
@@ -352,7 +356,7 @@ def _get_os_login() -> str:
 
 
 # デバッグモードで「自分」として扱うテスト用 ID（id001 = 山田）
-DEBUG_YAMADA_ID = "id001"
+DEBUG_YAMADA_ID = "id003"
 
 
 def main() -> None:
@@ -362,7 +366,7 @@ def main() -> None:
         "--debug",
         action="store_true",
         help=(
-            "デバッグモード: OSログイン名に関係なく id001（山田）として起動する"
+            "デバッグモード: OSログイン名に関係なく id001として起動する"
         ),
     )
     args = parser_args.parse_args()
