@@ -2086,17 +2086,22 @@ class AssignmentView(QWidget):
         layout.addWidget(QLabel("📨 タスク依頼"))
         layout.addWidget(Separator())
 
-        # 依頼作成
-        req_box = QGroupBox("依頼を送る")
-        req_form = QFormLayout(req_box)
-        # Edit と同様のノード階層ツリーで対象を選択
+        # ── 左右 Splitter（Edit タブと同様の配置）──────────────────────────
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter, stretch=1)
+
+        # ── 左ペイン: 対象選択ツリー ──────────────────────────────────────
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 4, 0)
+        tree_label = QLabel("対象 (送る項目を選択)")
+        tree_label.setStyleSheet("QLabel { font-weight: bold; padding-bottom: 2px; }")
+        left_layout.addWidget(tree_label)
+
         self.req_tree = QTreeWidget()
         self.req_tree.setColumnCount(1)
         self.req_tree.setHeaderLabels(["ノード階層"])
         self.req_tree.header().setStretchLastSection(True)
-        self.req_tree.setMinimumWidth(280)
-        self.req_tree.setMinimumHeight(120)
-        self.req_tree.setMaximumHeight(200)
         self.req_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.req_tree.setIndentation(16)
         self.req_tree.setStyleSheet("""
@@ -2106,12 +2111,29 @@ class AssignmentView(QWidget):
         """)
         self.req_tree.itemClicked.connect(self._on_req_item_clicked)
         self.req_tree.itemSelectionChanged.connect(self._on_target_changed)
+        left_layout.addWidget(self.req_tree, stretch=1)
+
+        # 凡例
+        legend_lbl = QLabel("★ = 自分のアイテム  ○ = 上位階層（選択不可）")
+        legend_lbl.setStyleSheet("QLabel { color: #888; font-size: 11px; padding-top: 2px; }")
+        left_layout.addWidget(legend_lbl)
+        splitter.addWidget(left_widget)
+
+        # ── 右ペイン: 依頼フォーム + 受信一覧 ──────────────────────────────
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+
+        # 依頼作成フォーム
+        req_box = QGroupBox("依頼を送る")
+        req_form = QFormLayout(req_box)
 
         # 動作説明ラベル（ノードタイプに応じて切替）
         self._req_info_lbl = QLabel("")
         self._req_info_lbl.setStyleSheet(
             "QLabel { color: #555; font-style: italic; padding: 2px 0; }"
         )
+        req_form.addRow("説明:", self._req_info_lbl)
 
         # 送り先: ticket は複数選択可、task以上は1名のみ
         self._req_to_checks: dict[str, QCheckBox] = {}
@@ -2132,32 +2154,34 @@ class AssignmentView(QWidget):
 
         self.req_msg = QLineEdit()
         self.req_msg.setPlaceholderText("メッセージ")
-        req_form.addRow("対象:", self.req_tree)
-        req_form.addRow("", self._req_info_lbl)
         req_form.addRow("送り先:", checks_widget)
         req_form.addRow("メッセージ:", self.req_msg)
         send_btn = QPushButton("依頼送信")
         send_btn.setStyleSheet(STYLE_BUTTON)
         send_btn.clicked.connect(self._on_send)
         req_form.addRow("", send_btn)
-        layout.addWidget(req_box)
+        right_layout.addWidget(req_box)
 
-        layout.addWidget(Separator())
+        right_layout.addWidget(Separator())
 
         # 受信一覧（親階層付き）
-        layout.addWidget(QLabel("受信した依頼"))
+        right_layout.addWidget(QLabel("受信した依頼"))
         RECV_COLS = ["P1", "P2", "P3", "P4", "Task", "Ticket", "依頼者", "メッセージ", "状態", "日時"]
         self.recv_table = ScrollableTable(RECV_COLS, [80, 80, 80, 80, 80, 120, 70, 150, 60, 90])
         self.recv_table.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        layout.addWidget(self.recv_table, stretch=1)
+        right_layout.addWidget(self.recv_table, stretch=1)
 
         resp_row = ButtonRow([
             ("✅ 承諾", self._on_accept),
             ("❌ 拒否", self._on_reject),
         ])
-        layout.addWidget(resp_row)
+        right_layout.addWidget(resp_row)
+        splitter.addWidget(right_widget)
+
+        # 左:右 = 1:2 の初期幅
+        splitter.setSizes([300, 600])
 
         self.info = InfoLabel()
         layout.addWidget(self.info)
@@ -2261,7 +2285,9 @@ class AssignmentView(QWidget):
             type_short = self._TYPE_SHORT.get(node_type, node_type)
             status_icon = {"done": "✓", "cancel": "✗", "regularly": "↻"}.get(
                 str(row.get("status", "")), "")
-            label = f"[{type_short}] {status_icon} {row['title']}".strip()
+            # 自分のアイテム(選択可能)は ★、上位階層(選択不可)は ○ で区別
+            own_icon = "★" if idx in selectable_ids else "○"
+            label = f"{own_icon} [{type_short}] {status_icon} {row['title']}".strip()
             item.setText(0, label)
             item.setData(0, Qt.ItemDataRole.UserRole, idx)
             # 種別ごとの背景色・文字色
