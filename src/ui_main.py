@@ -299,6 +299,8 @@ class DailyScheduleWidget(QWidget):
             "Last_Update":   today,
         }
         self.state.df_daily_log.loc[idx] = row
+        self.state.schedule_modified = True
+        self.state.notify_dirty()
         self.info.set_info("保存しました")
 
     def _on_save_permanent(self) -> None:
@@ -469,6 +471,10 @@ class DailyScheduleWidget(QWidget):
 
         self.state.df_daily.loc[sch_idx, "Last_Update"] = \
             datetime.date.today().isoformat()
+        # df_daily と df_nodes(actual_hours) が変更されたため両フラグをセット
+        self.state.schedule_modified = True
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
         self._rebuild_schedule()
 
     def _propagate_actual_hours(self, node_idx: str) -> None:
@@ -506,8 +512,9 @@ class MainWindow(QMainWindow):
         self._build_central()
         self._setup_shortcuts()
 
-        # AppState にリフレッシュ関数を登録
+        # AppState にリフレッシュ関数・dirty 通知コールバックを登録
         state.refresh_func = self.refresh
+        state.dirty_changed_func = self._update_save_btn_style
 
         self._switch_view(IDX_GANTT)
 
@@ -549,12 +556,15 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        # Save / Load
-        for label, slot in [("💾 保存 (Ctrl+S)", self._on_save),
-                             ("🔄 読込 (Ctrl+R)", self._on_load)]:
+        # Save / Load（保存ボタンは dirty 時に橙色で強調するため参照を保持）
+        self._save_btn = None
+        for i, (label, slot) in enumerate([("💾 保存 (Ctrl+S)", self._on_save),
+                                            ("🔄 読込 (Ctrl+R)", self._on_load)]):
             act = QAction(label, self)
             act.triggered.connect(slot)
             tb.addAction(act)
+            if i == 0:  # 保存ボタン（i==0）の QToolButton 参照を保持
+                self._save_btn = tb.widgetForAction(act)
 
         tb.addSeparator()
 
@@ -706,6 +716,10 @@ class MainWindow(QMainWindow):
         self.main_pane.tree_pane.request_requested.connect(self._on_request_requested)
         # AI取込完了 → Edit タブへ
         self.ai_import_view.import_done.connect(self._on_ai_import_done)
+        # Edit タブの dirty 変化 → 保存ボタン色更新
+        self.main_pane.table_pane.dirty_changed.connect(self._update_save_btn_style)
+        # Edit タブのインメモリ変更 → ツリーと現在表示中ビューを更新
+        self.main_pane.table_pane.nodes_changed.connect(self._on_nodes_changed)
 
     # ---------- ショートカット ----------
 
@@ -773,10 +787,28 @@ class MainWindow(QMainWindow):
             btn.setChecked(m == member)
         self.refresh()
 
+    def _update_save_btn_style(self) -> None:
+        """dirty 状態に応じて保存ボタンの色を変える（橙色: 未保存あり / 通常: 保存済み）
+        nodes_modified（ノード変更）または schedule_modified（日次/メモ変更）のどちらかが
+        True であれば橙色にする。"""
+        if not self._save_btn:
+            return
+        dirty = (getattr(self.state, "nodes_modified", False) or
+                 getattr(self.state, "schedule_modified", False))
+        if dirty:
+            self._save_btn.setStyleSheet(
+                "QToolButton { background: #E65100; color: white; font-weight: bold; "
+                "border-radius: 3px; padding: 4px 8px; }"
+                "QToolButton:hover { background: #BF360C; }"
+            )
+        else:
+            self._save_btn.setStyleSheet("")  # デフォルトに戻す
+
     def _on_save(self) -> None:
         try:
             self.state.save()  # nodes_modified を False にリセットする
             self.main_pane.table_pane._update_dirty_indicator()
+            self._update_save_btn_style()
             # 保存後にノード階層（TreePane）を更新する
             self.main_pane.tree_pane.refresh()
             self.statusBar().showMessage("保存しました", 3000)
@@ -786,8 +818,10 @@ class MainWindow(QMainWindow):
     def _on_load(self) -> None:
         try:
             self.state.load()
-            self.state.nodes_modified = False  # 再読込後は未保存フラグをリセット
+            self.state.nodes_modified = False     # 再読込後は未保存フラグをリセット
+            self.state.schedule_modified = False  # 再読込後は未保存フラグをリセット
             self.main_pane.table_pane._update_dirty_indicator()
+            self._update_save_btn_style()
             self.refresh()
             self.statusBar().showMessage("読み込みました", 3000)
         except Exception as e:
@@ -827,15 +861,28 @@ class MainWindow(QMainWindow):
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             ds = dlg.get_series()
-            self.state.df_nodes.loc[ds.name] = ds
-            self.state.db.upsert_node(ds)
-            self.state.df_nodes = self.state.db.read_nodes()
+            self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新のみ（DB書き込みはCtrl+S）
+            self.state.nodes_modified = True
+            self._update_save_btn_style()
             self.state.refresh()
 
     def _on_ai_import_done(self, idxs: list) -> None:
         """AI取込完了後に Edit タブへ切替し取り込みキューをセットする"""
         self._switch_view(IDX_MAIN)
         self.main_pane.tree_pane.start_import_queue(idxs)
+
+    def _on_nodes_changed(self) -> None:
+        """Edit のインメモリ変更をツリーと現在表示中ビューへ伝播する。
+        singleShot(0) で遅延することで、テーブルの itemChanged 処理中に
+        同期的なツリー再構築が発生してレイアウトイベントが積まれるのを防ぐ。"""
+        QTimer.singleShot(0, self._do_nodes_refresh)
+
+    def _do_nodes_refresh(self) -> None:
+        """ツリーと現在表示中ビューの実際の更新処理"""
+        self.main_pane.tree_pane.refresh()
+        cur = self.stack.currentWidget()
+        if hasattr(cur, "refresh") and cur is not self.main_pane:
+            cur.refresh()
 
     # ---------- リフレッシュ ----------
 
@@ -849,6 +896,8 @@ class MainWindow(QMainWindow):
             cur.refresh()
         # 未処理 Request の件数に応じてタブボタンを強調表示
         self._update_request_tab_badge()
+        # Plan タブ等の変更後も保存ボタン色を最新状態に同期
+        self._update_save_btn_style()
 
     def _update_request_tab_badge(self) -> None:
         """自分宛の未処理 Request 件数をタブボタンに表示する"""
@@ -1356,6 +1405,8 @@ class TablePane(QWidget):
     """
     node_selected    = Signal(str)
     schedule_refresh = Signal()  # スケジュールパネルのみ軽量リフレッシュ
+    dirty_changed    = Signal()  # 未保存状態が変化したとき（MainWindow の保存ボタン色変更用）
+    nodes_changed    = Signal()  # ノードのインメモリ変更（ツリー・他タブへの伝播用）
 
     def __init__(self, state):
         super().__init__()
@@ -1391,13 +1442,6 @@ class TablePane(QWidget):
             _btn.setStyleSheet(STYLE_BUTTON)
             _btn.clicked.connect(_slot)
             btn_layout.addWidget(_btn)
-        self._dirty_lbl = QLabel("⚠ 未保存の変更があります  [Ctrl+S で保存]")
-        self._dirty_lbl.setStyleSheet(
-            "QLabel { background: #E53935; color: white; font-weight: bold; "
-            "padding: 3px 8px; border-radius: 3px; }"
-        )
-        self._dirty_lbl.setVisible(False)
-        btn_layout.addWidget(self._dirty_lbl)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
@@ -1411,11 +1455,12 @@ class TablePane(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        # エクセルライク: 任意キー押下またはシングルクリックで編集開始
+        # エクセルライク: 任意キー押下またはダブルクリックで編集開始
+        # SelectedClicked は削除: Qt が clicked シグナル emit 前に edit() を実行するため
+        # _on_cell_clicked_for_edit と二重衝突して "edit: editing failed" が出る
         self.table.setEditTriggers(
             QAbstractItemView.EditTrigger.AnyKeyPressed |
-            QAbstractItemView.EditTrigger.DoubleClicked |
-            QAbstractItemView.EditTrigger.SelectedClicked
+            QAbstractItemView.EditTrigger.DoubleClicked
         )
         # ステータス・日付列: シングルクリックでエディタを開く
         self.table.clicked.connect(self._on_cell_clicked_for_edit)
@@ -1478,37 +1523,35 @@ class TablePane(QWidget):
         self._rebuild_table()
 
     def _normalize_priorities(self, parent_idx: str) -> None:
-        """子ノードの priority を 1 から連番に修正して DB に保存する。
-        親ノードを選択したときにのみ呼び出す（状態再描画では呼ばない）。"""
+        """子ノードの priority を 1 から連番に修正してインメモリを更新する。
+        DB への書き込みはユーザーが明示的に保存（Ctrl+S）したときのみ行う。"""
         df = self.state.df_nodes
         children = df[df["parent_id"] == parent_idx].copy()
         if children.empty:
             return
         children = children.sort_values("priority")
-        needs_save: list = []
+        changed = False
         for i, idx in enumerate(children.index):
             expected = i + 1
             if int(children.at[idx, "priority"]) != expected:
                 self.state.df_nodes.loc[idx, "priority"] = expected
                 self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
-                needs_save.append(idx)
-        if needs_save and self.state.db:
-            # 1 トランザクションで一括保存（個別 upsert × N より高速）
-            self.state.db.upsert_nodes_bulk(
-                [self.state.df_nodes.loc[i] for i in needs_save]
-            )
+                changed = True
+        if changed:
+            self._mark_dirty()
 
     def refresh(self) -> None:
         self._rebuild_table()
 
     def _mark_dirty(self) -> None:
-        """編集が行われたことをマークし、未保存インジケーターを表示する"""
+        """編集が行われたことをマークし、保存ボタン色変更・ノード変更シグナルを送る"""
         self.state.nodes_modified = True
-        self._dirty_lbl.setVisible(True)
+        self.dirty_changed.emit()   # MainWindow の保存ボタン色を更新
+        self.nodes_changed.emit()   # ツリー・他タブへの伝播
 
     def _update_dirty_indicator(self) -> None:
-        """state.nodes_modified に基づき未保存インジケーターの表示を更新する"""
-        self._dirty_lbl.setVisible(getattr(self.state, "nodes_modified", False))
+        """state.nodes_modified の変化を MainWindow の保存ボタン色に反映する"""
+        self.dirty_changed.emit()
 
     def _rebuild_table(self) -> None:
         """選択中の親ノードの子ノードをテーブルに再描画する。シグナルをブロックして再帰更新を防ぐ。"""
@@ -1655,14 +1698,16 @@ class TablePane(QWidget):
             QTimer.singleShot(0, self._move_to_next_est_cell)
 
     def _move_to_next_title_cell(self) -> None:
-        """タイトル編集後に次の行のタイトルセルへ移動して編集開始する"""
+        """タイトル編集後に次の行のタイトルセルへ移動する。
+
+        editItem は廃止: AnyKeyPressed トリガーで編集開始するため不要。
+        """
         row = self.table.currentRow()
         next_row = row + 1
         if 0 <= next_row < self.table.rowCount():
             next_item = self.table.item(next_row, 0)
             if next_item and (next_item.flags() & Qt.ItemFlag.ItemIsEditable):
                 self.table.setCurrentCell(next_row, 0)
-                self.table.editItem(next_item)
 
     def _move_to_next_est_cell(self) -> None:
         """見積もり工数編集後に一つ下の行の同列を選択状態にする"""
@@ -1819,13 +1864,29 @@ class TablePane(QWidget):
                 self.table.edit(index)
 
     def _focus_blank_row(self) -> None:
-        """末尾の空白行（新規入力行）にフォーカスして編集開始する"""
+        """末尾の空白行（新規入力行）にフォーカスしてスクロールする。
+
+        editItem は廃止: AnyKeyPressed トリガーによりユーザーが任意のキーを
+        押すことで自動的に編集モードに入る。editItem を呼ぶと編集状態のタイミング
+        問題で "edit: editing failed" 警告が発生するため使用しない。
+        """
         last_row = self.table.rowCount() - 1
-        if last_row >= 0:
-            item = self.table.item(last_row, 0)
-            if item and item.data(Qt.ItemDataRole.UserRole) == "__new__":
-                self.table.setCurrentCell(last_row, 0)
-                self.table.editItem(item)
+        if last_row < 0:
+            return
+        item = self.table.item(last_row, 0)
+        if not (item and item.data(Qt.ItemDataRole.UserRole) == "__new__"):
+            return
+        self.table.setCurrentCell(last_row, 0)
+
+        def _scroll_to_row() -> None:
+            r = self.table.rowCount() - 1
+            it = self.table.item(r, 0) if r >= 0 else None
+            if it and it.data(Qt.ItemDataRole.UserRole) == "__new__":
+                self.table.scrollToItem(
+                    it, QAbstractItemView.ScrollHint.EnsureVisible
+                )
+
+        QTimer.singleShot(0, _scroll_to_row)
 
     def _get_child_type(self) -> Optional[str]:
         """現在選択中の親ノードに対する子ノードタイプを返す。作成不可なら None。"""
@@ -1861,10 +1922,14 @@ class TablePane(QWidget):
         ds["status"] = "todo"
         self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
         self._mark_dirty()
-        self._rebuild_table()
         self.info.set_info(f"追加: {title}")
-        # 再描画後に末尾の空白行へ移動して連続入力できるようにする
-        QTimer.singleShot(0, self._focus_blank_row)
+        # itemChanged シグナル処理中に setRowCount(0) を呼ぶと
+        # "commitData called with an editor that does not belong to this view"
+        # エラーが出るため、テーブル再描画をイベントループの次のターンに遅延する
+        def _deferred_rebuild() -> None:
+            self._rebuild_table()
+            self._focus_blank_row()
+        QTimer.singleShot(0, _deferred_rebuild)
 
     def eventFilter(self, obj, event) -> bool:
         """キーボード操作のハンドリング"""

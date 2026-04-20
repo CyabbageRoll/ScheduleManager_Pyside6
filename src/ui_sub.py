@@ -12,6 +12,7 @@ import pandas as pd
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QTableWidget,
     QTableWidgetItem, QAbstractItemView, QHeaderView, QComboBox,
+    QListWidget, QListWidgetItem,
     QLineEdit, QPushButton, QCheckBox, QScrollArea, QFrame,
     QMessageBox, QFormLayout, QSplitter, QFileDialog, QGroupBox,
     QSizePolicy, QRadioButton, QButtonGroup, QCalendarWidget, QMenu,
@@ -704,17 +705,15 @@ class GanttView(QWidget):
                 new_date = datetime.date(qd.year(), qd.month(), qd.day()).isoformat()
                 self.state.df_nodes.loc[idx, field] = new_date
                 self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
-                if self.state.db:
-                    self.state.db.upsert_node(self.state.df_nodes.loc[idx])
-                    self.state.df_nodes = self.state.db.read_nodes()
+                # DB 書き込みはユーザー保存（Ctrl+S）時のみ行う
+                self.state.nodes_modified = True
                 self.state.refresh()
 
         def _set_status(s: str) -> None:
             self.state.df_nodes.loc[idx, "status"] = s
             self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
-            if self.state.db:
-                self.state.db.upsert_node(self.state.df_nodes.loc[idx])
-                self.state.df_nodes = self.state.db.read_nodes()
+            # DB 書き込みはユーザー保存（Ctrl+S）時のみ行う
+            self.state.nodes_modified = True
             self.state.refresh()
 
         def _delete_ticket() -> None:
@@ -2090,9 +2089,23 @@ class AssignmentView(QWidget):
         # 依頼作成
         req_box = QGroupBox("依頼を送る")
         req_form = QFormLayout(req_box)
-        self.req_ticket = QComboBox()
-        self.req_ticket.setMinimumWidth(250)
-        self.req_ticket.currentIndexChanged.connect(self._on_target_changed)
+        # Edit と同様のノード階層ツリーで対象を選択
+        self.req_tree = QTreeWidget()
+        self.req_tree.setColumnCount(1)
+        self.req_tree.setHeaderLabels(["ノード階層"])
+        self.req_tree.header().setStretchLastSection(True)
+        self.req_tree.setMinimumWidth(280)
+        self.req_tree.setMinimumHeight(120)
+        self.req_tree.setMaximumHeight(200)
+        self.req_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.req_tree.setIndentation(16)
+        self.req_tree.setStyleSheet("""
+            QTreeWidget { border: 1px solid #CFD8DC; }
+            QTreeWidget::item { padding: 2px 2px; }
+            QTreeWidget::item:selected { background: #B3E5FC; color: black; }
+        """)
+        self.req_tree.itemClicked.connect(self._on_req_item_clicked)
+        self.req_tree.itemSelectionChanged.connect(self._on_target_changed)
 
         # 動作説明ラベル（ノードタイプに応じて切替）
         self._req_info_lbl = QLabel("")
@@ -2119,7 +2132,7 @@ class AssignmentView(QWidget):
 
         self.req_msg = QLineEdit()
         self.req_msg.setPlaceholderText("メッセージ")
-        req_form.addRow("対象:", self.req_ticket)
+        req_form.addRow("対象:", self.req_tree)
         req_form.addRow("", self._req_info_lbl)
         req_form.addRow("送り先:", checks_widget)
         req_form.addRow("メッセージ:", self.req_msg)
@@ -2155,6 +2168,17 @@ class AssignmentView(QWidget):
     _TYPE_SHORT = {
         "project1": "P1", "project2": "P2", "project3": "P3", "project4": "P4",
         "task": "Task", "ticket": "Tkt",
+    }
+    # ツリー表示用の背景色・文字色（TreePane と同仕様）
+    _TREE_BG = {
+        "project1": "#E3F2FD", "project2": "#E8F5E9",
+        "project3": "#FFF9C4", "project4": "#F3E5F5",
+        "task":     "#ECEFF1", "ticket":   "#FFFFFF",
+    }
+    _TREE_FG = {
+        "project1": "#1565C0", "project2": "#2E7D32",
+        "project3": "#F57F17", "project4": "#6A1B9A",
+        "task":     "#37474F", "ticket":   "#546E7A",
     }
 
     # 階層順（P1〜Ticket の 6 段階）
@@ -2192,19 +2216,71 @@ class AssignmentView(QWidget):
                 grayed.append(False)
         return titles, grayed
 
-    def refresh(self) -> None:
-        # 依頼対象一覧を更新（project1~4, task, ticket すべて対象）
+    def _build_req_tree(self) -> None:
+        """依頼対象ノードをノード階層ツリーに再描画する（自分担当の未完了ノードのみ）"""
+        self.req_tree.blockSignals(True)
+        self.req_tree.clear()
         df = self.state.df_nodes
-        self.req_ticket.clear()
-        targets = df[
+        if df.empty:
+            self.req_tree.blockSignals(False)
+            return
+        # 自分が担当する requestable なノードのIDXセット
+        own_ids = set(df[
             (df["node_type"].isin(self._REQUESTABLE_TYPES))
             & (df["assigned_to"] == self.state.user)
             & (~df["status"].isin(["deleted", "done"]))
-        ]
-        for idx, row in targets.iterrows():
-            type_short = self._TYPE_SHORT.get(str(row.get("node_type", "")), "")
-            label = f"[{type_short}] {row['title']}" if type_short else row["title"]
-            self.req_ticket.addItem(label, userData=idx)
+        ].index)
+        # 祖先ノードもツリー表示するために親IDXセットを作成
+        visible_ids: set = set(own_ids)
+        for idx in own_ids:
+            cur = idx
+            for _ in range(10):
+                if cur not in df.index:
+                    break
+                pid = str(df.loc[cur, "parent_id"])
+                if not pid or pid == "0":
+                    break
+                visible_ids.add(pid)
+                cur = pid
+        self._build_req_subtree(self.req_tree.invisibleRootItem(), df, "0", visible_ids, own_ids)
+        self.req_tree.expandAll()
+        self.req_tree.blockSignals(False)
+
+    def _build_req_subtree(self, parent_item, df, parent_id: str,
+                           visible_ids: set, selectable_ids: set) -> None:
+        """再帰的に子ノードをツリーに追加する（selectable_ids のみ選択可能）"""
+        children = df[df["parent_id"] == parent_id].copy()
+        if children.empty:
+            return
+        children = children.sort_values("priority")
+        for idx, row in children.iterrows():
+            if idx not in visible_ids:
+                continue
+            item = QTreeWidgetItem(parent_item)
+            node_type = str(row.get("node_type", ""))
+            type_short = self._TYPE_SHORT.get(node_type, node_type)
+            status_icon = {"done": "✓", "cancel": "✗", "regularly": "↻"}.get(
+                str(row.get("status", "")), "")
+            label = f"[{type_short}] {status_icon} {row['title']}".strip()
+            item.setText(0, label)
+            item.setData(0, Qt.ItemDataRole.UserRole, idx)
+            # 種別ごとの背景色・文字色
+            item.setBackground(0, QColor(self._TREE_BG.get(node_type, "#FFFFFF")))
+            item.setForeground(0, QColor(self._TREE_FG.get(node_type, "#000000")))
+            # 選択不可ノード（祖先のみ表示）はグレーアウト・選択不可
+            if idx not in selectable_ids:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                item.setForeground(0, QColor("#AAAAAA"))
+            # P1/P2/Task は太字
+            if node_type in ("project1", "project2", "task"):
+                f = QFont()
+                f.setBold(True)
+                item.setFont(0, f)
+            self._build_req_subtree(item, df, idx, visible_ids, selectable_ids)
+
+    def refresh(self) -> None:
+        # 依頼対象ツリーを更新
+        self._build_req_tree()
 
         # 受信依頼一覧（current_member ベースで閲覧、承諾/拒否は login_user のみ）
         df_asgn = self.state.df_assignments
@@ -2249,11 +2325,56 @@ class AssignmentView(QWidget):
                     item.setBackground(_MINE_BG)
                 self.recv_table.setItem(r, c, item)
 
+    def _on_req_item_clicked(self, clicked_item: QTreeWidgetItem) -> None:
+        """ツリーアイテムクリック時に task以上 と ticket の同時選択を禁止する"""
+        c_idx = clicked_item.data(0, Qt.ItemDataRole.UserRole)
+        if c_idx is None:
+            return
+        df = self.state.df_nodes
+        c_type = str(df.loc[c_idx, "node_type"]) if c_idx in df.index else ""
+        c_is_ticket = (c_type == "ticket")
+        # 選択中の他アイテムに異なるカテゴリが含まれるか確認
+        for sel_item in self.req_tree.selectedItems():
+            if sel_item is clicked_item:
+                continue
+            s_idx = sel_item.data(0, Qt.ItemDataRole.UserRole)
+            if s_idx is None:
+                continue
+            s_type = str(df.loc[s_idx, "node_type"]) if s_idx in df.index else ""
+            s_is_ticket = (s_type == "ticket")
+            if c_is_ticket != s_is_ticket:
+                QMessageBox.warning(
+                    self, "選択エラー",
+                    "task以上とticketは同時に選択できません。\n"
+                    "同じ種別のアイテムのみを選択してください。"
+                )
+                # クリックしたアイテムの選択を解除
+                self.req_tree.blockSignals(True)
+                clicked_item.setSelected(False)
+                self.req_tree.blockSignals(False)
+                self._on_target_changed()
+                return
+
     def _on_send(self) -> None:
-        """依頼を送信する"""
-        t_idx = self.req_ticket.currentData()
-        if not t_idx:
-            QMessageBox.information(self, "情報", "対象を選択してください")
+        """依頼を送信する（複数案件選択可、送り先は同一）"""
+        # 選択中の全対象アイテムを取得
+        selected_tree_items = self.req_tree.selectedItems()
+        if not selected_tree_items:
+            QMessageBox.information(self, "情報", "対象を1件以上選択してください")
+            return
+        t_idxs = [
+            it.data(0, Qt.ItemDataRole.UserRole)
+            for it in selected_tree_items
+            if it.data(0, Qt.ItemDataRole.UserRole) is not None
+        ]
+
+        # 複数選択時はノードタイプが混在していないか確認
+        df = self.state.df_nodes
+        types = {str(df.loc[i, "node_type"]) for i in t_idxs if i in df.index}
+        if len(types) > 1:
+            QMessageBox.warning(self, "エラー",
+                                "異なる種別（ticket / task / project）が混在しています。\n"
+                                "同じ種別のアイテムのみ同時選択できます。")
             return
 
         # チェックされたメンバーを収集（自分自身を除外）
@@ -2265,11 +2386,66 @@ class AssignmentView(QWidget):
             QMessageBox.warning(self, "エラー", "送り先を1人以上選択してください")
             return
 
-        # 選択された全メンバーに送信
-        for to_user in selected_members:
-            self.state.db.create_assignment(
-                t_idx, self.state.user, to_user, self.req_msg.text()
-            )
+        # 重複チェック
+        df_asgn = self.state.df_assignments
+        pending_asgn = df_asgn[df_asgn["status"] == "pending"] if not df_asgn.empty else df_asgn
+        msg = self.req_msg.text()
+        node_type = next(iter(types)) if types else ""
+        is_ticket = (node_type == "ticket")
+
+        # キャンセルが必要な assignment IDX のリスト
+        to_cancel: list[str] = []
+
+        for t_idx in t_idxs:
+            title = str(df.loc[t_idx, "title"]) if t_idx in df.index else t_idx
+            if is_ticket:
+                # ticket: ticket_id + to_user の組み合わせで重複確認
+                for to_user in selected_members:
+                    if pending_asgn.empty:
+                        continue
+                    dup = pending_asgn[
+                        (pending_asgn["ticket_id"] == t_idx)
+                        & (pending_asgn["to_user"] == to_user)
+                    ]
+                    if not dup.empty:
+                        QMessageBox.warning(
+                            self, "送付済み",
+                            f"「{title}」は既に {self.state.display_name(to_user)} へ"
+                            f"送付済みです（未処理）。\n送信を取り消しました。"
+                        )
+                        return
+            else:
+                # task以上: 同一 ticket_id の pending request があれば重複（送付先問わず）
+                if not pending_asgn.empty:
+                    dup = pending_asgn[pending_asgn["ticket_id"] == t_idx]
+                    if not dup.empty:
+                        existing_row = dup.iloc[0]
+                        existing_to = self.state.display_name(
+                            str(existing_row.get("to_user", ""))
+                        )
+                        new_to = ", ".join(
+                            self.state.display_name(m) for m in selected_members
+                        )
+                        ret = QMessageBox.question(
+                            self, "重複確認",
+                            f"「{title}」は既に {existing_to} への未処理依頼があります。\n"
+                            f"送付先を {new_to} へ振り替えますか？\n\n"
+                            f"「いいえ」を選ぶと送信を取り消します。",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        )
+                        if ret == QMessageBox.StandardButton.No:
+                            return
+                        # 振替: 既存の pending request を cancel してから新規送信
+                        to_cancel.extend(list(dup.index))
+
+        # cancel が必要な request を処理
+        for asgn_idx in to_cancel:
+            self.state.db.respond_assignment(asgn_idx, "cancelled")
+
+        # 選択された全アイテム × 全メンバーに送信
+        for t_idx in t_idxs:
+            for to_user in selected_members:
+                self.state.db.create_assignment(t_idx, self.state.user, to_user, msg)
         self.state.df_assignments = self.state.db.read_assignments()
         self.req_msg.clear()
         # チェックボックスをリセット
@@ -2277,17 +2453,21 @@ class AssignmentView(QWidget):
             cb.setChecked(False)
         self.refresh()
         names = ", ".join(self.state.display_name(m) for m in selected_members)
-        QMessageBox.information(self, "完了", f"{names} へ依頼しました")
+        QMessageBox.information(self, "完了",
+                                f"{len(t_idxs)} 件を {names} へ依頼しました")
 
     def _current_node_type(self) -> str:
-        """現在コンボで選択中のノードタイプを返す"""
-        t_idx = self.req_ticket.currentData()
+        """ツリーで選択中のアイテムのノードタイプを返す（複数選択時は最初の1件）"""
+        items = self.req_tree.selectedItems()
+        if not items:
+            return ""
+        t_idx = items[0].data(0, Qt.ItemDataRole.UserRole)
         if t_idx and t_idx in self.state.df_nodes.index:
             return str(self.state.df_nodes.loc[t_idx, "node_type"])
         return ""
 
-    def _on_target_changed(self, _index: int) -> None:
-        """対象コンボ変更時に送付先の制限と説明文を切り替える"""
+    def _on_target_changed(self) -> None:
+        """対象ツリー選択変更時に送付先の制限と説明文を切り替える"""
         ntype = self._current_node_type()
         is_ticket = (ntype == "ticket")
         if is_ticket:
@@ -2313,11 +2493,18 @@ class AssignmentView(QWidget):
                     cb.blockSignals(False)
 
     def select_ticket(self, ticket_idx: str) -> None:
-        """外部から呼ばれた時にチケットを選択状態にする"""
-        for i in range(self.req_ticket.count()):
-            if self.req_ticket.itemData(i) == ticket_idx:
-                self.req_ticket.setCurrentIndex(i)
-                break
+        """外部から呼ばれた時にノードをツリーで選択状態にする"""
+        def _find_and_select(parent_item, idx: str) -> bool:
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                if child.data(0, Qt.ItemDataRole.UserRole) == idx:
+                    self.req_tree.setCurrentItem(child)
+                    return True
+                if _find_and_select(child, idx):
+                    return True
+            return False
+        root = self.req_tree.invisibleRootItem()
+        _find_and_select(root, ticket_idx)
 
     def _own_selected_ids(self) -> list:
         """選択行のうち、ログインユーザー宛（to_user == user）の IDX のみ返す"""
@@ -2396,6 +2583,8 @@ class MemoView(QWidget):
 
     def _on_changed(self) -> None:
         self.state.memo_text = self.editor.toPlainText()
+        self.state.schedule_modified = True
+        self.state.notify_dirty()
 
     def _on_save(self) -> None:
         self.state.db.save_memo(self.state.user, self.state.memo_text)

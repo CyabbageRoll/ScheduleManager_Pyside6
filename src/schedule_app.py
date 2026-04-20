@@ -180,7 +180,8 @@ class AppState:
     memo_text: str = ""
     permanent_notice: str = ""  # 自分の常時表示メモ
     all_permanent_notices: Dict[str, str] = field(default_factory=dict)  # 全員の常時メモ
-    nodes_modified: bool = False  # 未保存変更フラグ（Ctrl+S 保存前に True になる）
+    nodes_modified: bool = False     # ノード変更フラグ（Ctrl+S 保存前に True になる）
+    schedule_modified: bool = False  # 日次スケジュール/ログ/メモ変更フラグ
 
     def __post_init__(self):
         if not self.login_user:
@@ -225,6 +226,12 @@ class AppState:
     def current_member(self, value: str) -> None:
         self.current_user = value
 
+    def notify_dirty(self) -> None:
+        """保存ボタン色を更新するコールバックを呼ぶ（MainWindow が dirty_changed_func を登録）"""
+        func = getattr(self, "dirty_changed_func", None)
+        if callable(func):
+            func()
+
     def refresh(self) -> None:
         """MainWindow から登録された UI リフレッシュ関数を呼び出す"""
         func = getattr(self, "refresh_func", None)
@@ -242,7 +249,8 @@ class AppState:
         self.db.save_daily_log(self.df_daily_log, self.login_user)
         self.db.save_memo(self.login_user, self.memo_text)
         self.db.save_permanent_notice(self.login_user, self.permanent_notice)
-        self.nodes_modified = False  # 保存後にフラグをリセット
+        self.nodes_modified = False     # 保存後にフラグをリセット
+        self.schedule_modified = False  # 保存後にフラグをリセット
 
     def load(self) -> None:
         """DB から最新データを全件再読込する"""
