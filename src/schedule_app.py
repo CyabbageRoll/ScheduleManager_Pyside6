@@ -450,6 +450,20 @@ def main() -> None:
     font.setPointSize(config.font_size)
     app.setFont(font)
 
+    # Qt 内部メッセージをロガーへリダイレクト（コンソール出力を抑制）
+    # "edit: editing failed" 等の Qt 警告をプロンプトに表示しないようにする
+    from PySide6.QtCore import qInstallMessageHandler, QtMsgType as _QtMsg
+
+    def _qt_msg_handler(mode, _context, message):
+        """Qt 内部メッセージをファイルログのみに記録する（コンソール非表示）。"""
+        if mode in (_QtMsg.QtFatalMsg, _QtMsg.QtCriticalMsg):
+            logger.error(f"[Qt] {message}")
+        else:
+            # Debug / Info / Warning はすべてファイルのみ（level=DEBUG でコンソール非表示）
+            logger.debug(f"[Qt] {message}")
+
+    qInstallMessageHandler(_qt_msg_handler)
+
     # メインウィンドウ表示
     try:
         from ui_main import MainWindow

@@ -517,6 +517,25 @@ class Database:
         finally:
             conn.close()
 
+    def respond_assignments_bulk(self, assignment_idxs: list, response: str) -> None:
+        """複数の依頼に対する応答を 1 トランザクションで一括記録する"""
+        if not assignment_idxs:
+            return
+        today = datetime.date.today().isoformat()
+        conn = self._connect()
+        try:
+            for asgn_idx in assignment_idxs:
+                conn.execute(
+                    "UPDATE task_assignments SET status=?, responded_at=? WHERE IDX=?",
+                    [response, today, asgn_idx],
+                )
+            conn.commit()
+            self._log(f"respond_assignments_bulk: {len(assignment_idxs)} 件 → {response}")
+        except Exception as e:
+            self._log(f"respond_assignments_bulk エラー: {e}")
+        finally:
+            conn.close()
+
     # ---------- memo ----------
 
     def read_memo(self, username: str) -> str:

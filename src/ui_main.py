@@ -959,6 +959,50 @@ class _Main3Pane(QWidget):
         self.table_pane.refresh()
 
 
+# ---------- ドラッグ&ドロップ対応ツリーウィジェット ----------
+
+class DndTreeWidget(QTreeWidget):
+    """親ノード移動のドラッグ&ドロップをサポートするツリーウィジェット。
+    ドロップ時に node_reparented シグナルを emit し、
+    デフォルトの Qt 移動処理は行わない（データモデルは TreePane が更新する）。
+    """
+    # (dragged_idx: str, new_parent_idx: str)
+    node_reparented = Signal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+
+    def dropEvent(self, event) -> None:
+        """ドロップ時にシグナルを emit する。Qt のデフォルト移動処理は行わない。"""
+        dragged_item = self.currentItem()
+        if not dragged_item:
+            event.ignore()
+            return
+
+        dragged_idx = dragged_item.data(0, Qt.ItemDataRole.UserRole)
+        if not dragged_idx:
+            event.ignore()
+            return
+
+        target_item = self.itemAt(event.position().toPoint())
+        if target_item is None:
+            event.ignore()
+            return
+
+        new_parent_idx = target_item.data(0, Qt.ItemDataRole.UserRole)
+        if new_parent_idx is None or new_parent_idx == dragged_idx:
+            event.ignore()
+            return
+
+        # デフォルトの Qt 移動処理を防ぎ、シグナルで通知する
+        event.ignore()
+        self.node_reparented.emit(dragged_idx, new_parent_idx)
+
+
 # ---------- 左ペイン：階層ツリー ----------
 
 class TreePane(QWidget):
@@ -1013,7 +1057,8 @@ class TreePane(QWidget):
         layout.addWidget(self.search_input)
 
         # ツリーウィジェット（1列：タイトル列をインデントして階層を表現）
-        self.tree = QTreeWidget()
+        # DndTreeWidget でドラッグ&ドロップによる親変更をサポート
+        self.tree = DndTreeWidget()
         self.tree.setColumnCount(1)
         self.tree.setHeaderLabels(["ノード階層"])
         self.tree.header().setStretchLastSection(True)
@@ -1021,6 +1066,7 @@ class TreePane(QWidget):
         self.tree.currentItemChanged.connect(self._on_item_changed)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_context_menu)
+        self.tree.node_reparented.connect(self._on_node_reparented)
         self.tree.setIndentation(18)
         self.tree.setRootIsDecorated(True)
         # 階層線と種別を視覚的に分かりやすくするスタイル
@@ -1231,6 +1277,73 @@ class TreePane(QWidget):
         act = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if act == act_req:
             self.request_requested.emit(idx)
+
+    def _on_node_reparented(self, dragged_idx: str, new_parent_idx: str) -> None:
+        """ドラッグ&ドロップによる親変更を処理する。
+        バリデーション→確認ダイアログ→インメモリ更新→dirty フラグ→ツリー再構築の順で実行する。
+        """
+        df = self.state.df_nodes
+        if dragged_idx not in df.index:
+            return
+
+        dragged_type = str(df.loc[dragged_idx, "node_type"])
+
+        # 新しい親の種別バリデーション
+        if new_parent_idx == "0":
+            if dragged_type != "project1":
+                type_lbl = self._TYPE_LABEL.get(dragged_type, dragged_type)
+                QMessageBox.warning(self, "移動不可",
+                    f"P0直下には Project1 のみ配置できます。\n（{type_lbl} はドロップできません）")
+                return
+        else:
+            if new_parent_idx not in df.index:
+                return
+            new_parent_type = str(df.loc[new_parent_idx, "node_type"])
+            expected = DB.CHILD_TYPE.get(new_parent_type)
+            if expected != dragged_type:
+                dragged_lbl     = self._TYPE_LABEL.get(dragged_type, dragged_type)
+                parent_lbl      = self._TYPE_LABEL.get(new_parent_type, new_parent_type)
+                expected_lbl    = self._TYPE_LABEL.get(expected, expected) if expected else "？"
+                QMessageBox.warning(self, "移動不可（階層変更禁止）",
+                    f"[{dragged_lbl}] は [{parent_lbl}] の子にはなれません。\n"
+                    f"[{parent_lbl}] の子は [{expected_lbl}] のみです。")
+                return
+
+        # 現在の親と同じなら何もしない
+        current_parent = str(df.loc[dragged_idx, "parent_id"])
+        if current_parent == new_parent_idx:
+            return
+
+        # 循環参照チェック（dragged_idx の子孫を新しい親にはできない）
+        cur = new_parent_idx
+        while cur and cur != "0" and cur in df.index:
+            if cur == dragged_idx:
+                QMessageBox.warning(self, "移動不可", "子孫ノードを祖先に移動することはできません。")
+                return
+            cur = str(df.loc[cur, "parent_id"])
+
+        # ユーザー確認ダイアログ
+        dragged_title = str(df.loc[dragged_idx, "title"])
+        if new_parent_idx == "0":
+            parent_title = "[P0] トップレベル"
+        else:
+            parent_title = str(df.loc[new_parent_idx, "title"])
+        ret = QMessageBox.question(
+            self, "親の変更確認",
+            f"「{dragged_title}」を\n「{parent_title}」の下に移動しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        # インメモリ更新・dirty フラグ・ツリー再構築
+        df.loc[dragged_idx, "parent_id"] = new_parent_idx
+        self._selected_idx = dragged_idx
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
+        self.refresh()
+        # テーブルも更新する
+        self.node_selected.emit(dragged_idx)
 
     def _on_item_changed(self, current, previous) -> None:
         if not current:

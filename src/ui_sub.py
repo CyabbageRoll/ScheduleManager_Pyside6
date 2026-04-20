@@ -1097,22 +1097,76 @@ class RoadmapView(QWidget):
             self.edit_popup_requested.emit(idx)
 
     def _on_context_menu(self, pos) -> None:
-        """右クリックコンテキストメニューを表示"""
+        """右クリックコンテキストメニューを表示。
+        自分のノードには開始日・完了日変更、ToDo・Done も表示する（Mainタブ準拠）。
+        """
         row = self.table.rowAt(pos.y())
         if row < 0:
             return
         idx = self._get_idx_at(row)
-        if not idx:
+        if not idx or idx not in self.state.df_nodes.index:
             return
+
+        df = self.state.df_nodes
+        is_own = (str(df.loc[idx, "assigned_to"]) == self.state.user)
+
+        def _change_date(field: str) -> None:
+            """日付選択ダイアログを表示して値を更新する（インメモリのみ、Ctrl+S で保存）"""
+            dlg = QDialog(self)
+            dlg.setWindowTitle("日付選択")
+            vlayout = QVBoxLayout(dlg)
+            cal = QCalendarWidget()
+            cur_val = df.loc[idx, field]
+            if cur_val:
+                try:
+                    d = datetime.date.fromisoformat(str(cur_val))
+                    cal.setSelectedDate(QDate(d.year, d.month, d.day))
+                except Exception:
+                    pass
+            vlayout.addWidget(cal)
+            btns = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            )
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+            vlayout.addWidget(btns)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                qd = cal.selectedDate()
+                new_date = datetime.date(qd.year(), qd.month(), qd.day()).isoformat()
+                df.loc[idx, field] = new_date
+                df.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+                self.state.nodes_modified = True
+                self.state.notify_dirty()
+                self._rebuild_table()
+
+        def _set_status(s: str) -> None:
+            """ステータスを変更する（インメモリのみ、Ctrl+S で保存）"""
+            df.loc[idx, "status"] = s
+            df.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+            self.state.nodes_modified = True
+            self.state.notify_dirty()
+            self._rebuild_table()
+
         menu = QMenu(self)
-        act_edit = menu.addAction("Edit（Editタブで開く）")
-        # 項目3: Requestメニューを追加
-        act_req = menu.addAction("📨 Request")
-        chosen = menu.exec(QCursor.pos())
-        if chosen == act_edit:
-            self.edit_requested.emit(idx)
-        elif chosen == act_req:
-            self.request_requested.emit(idx)
+        menu.addAction(QAction("Edit（Editタブで開く）", self,
+                               triggered=lambda: self.edit_requested.emit(idx)))
+
+        if is_own:
+            menu.addSeparator()
+            menu.addAction(QAction("📅 開始日変更", self,
+                                   triggered=lambda: _change_date("start_available")))
+            menu.addAction(QAction("🏁 完了日変更", self,
+                                   triggered=lambda: _change_date("deadline")))
+            menu.addSeparator()
+            for s_key, s_label in [("todo", "☐ ToDo"), ("done", "✓ Done")]:
+                act = QAction(s_label, self)
+                act.triggered.connect(lambda checked=False, s=s_key: _set_status(s))
+                menu.addAction(act)
+
+        menu.addSeparator()
+        menu.addAction(QAction("📨 Request", self,
+                               triggered=lambda: self.request_requested.emit(idx)))
+        menu.exec(QCursor.pos())
 
     # ── 実績データ ──
 
@@ -2548,14 +2602,35 @@ class AssignmentView(QWidget):
             self.info.set_info("⚠ 承諾できる依頼が選択されていません（自分宛のみ承諾可）")
             return
         today = datetime.date.today().isoformat()
+        nodes_to_upsert: list = []
+
         for asgn_idx in asgn_ids:
             t_idx = self.state.df_assignments.loc[asgn_idx, "ticket_id"]
-            if t_idx in self.state.df_nodes.index:
-                # 担当者をログインユーザーに変更（インメモリ＋DB即時保存）
+            if t_idx not in self.state.df_nodes.index:
+                continue
+            node_type = str(self.state.df_nodes.loc[t_idx, "node_type"])
+            if node_type == "ticket":
+                # ticket の場合は担当者変更ではなくコピーを作成する
+                # 元チケットは変更せず、自分宛の新規チケットをインメモリに追加
+                new_row = self.state.df_nodes.loc[t_idx].copy()
+                new_idx = DB.generate_idx(self.state.user)
+                new_row.name = new_idx
+                new_row["assigned_to"] = self.state.user
+                new_row["created_at"] = today
+                new_row["updated_at"] = today
+                self.state.df_nodes.loc[new_idx] = new_row
+                nodes_to_upsert.append(self.state.df_nodes.loc[new_idx])
+            else:
+                # ticket 以外（task / project）は担当者を変更
                 self.state.df_nodes.loc[t_idx, "assigned_to"] = self.state.user
                 self.state.df_nodes.loc[t_idx, "updated_at"] = today
-                self.state.db.upsert_node(self.state.df_nodes.loc[t_idx])
-            self.state.db.respond_assignment(asgn_idx, "accepted")
+                nodes_to_upsert.append(self.state.df_nodes.loc[t_idx])
+
+        # DB 書き込みを 1 トランザクションにまとめて処理（複数承諾時の速度改善）
+        if nodes_to_upsert:
+            self.state.db.upsert_nodes_bulk(nodes_to_upsert)
+        self.state.db.respond_assignments_bulk(asgn_ids, "accepted")
+
         self.state.df_assignments = self.state.db.read_assignments()
         self.refresh()
         count = len(asgn_ids)
