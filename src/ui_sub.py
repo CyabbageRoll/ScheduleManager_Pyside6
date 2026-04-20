@@ -1502,8 +1502,12 @@ class AnalysisView(QWidget):
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
         from matplotlib.figure import Figure
         import matplotlib
-        matplotlib.rcParams["font.family"] = ["Hiragino Sans", "Yu Gothic",
-                                               "Noto Sans CJK JP", "sans-serif"]
+        import matplotlib.font_manager as _fm
+        # システムにインストール済みのフォントのみ指定（未インストールは警告が出るため除外）
+        _installed = {f.name for f in _fm.fontManager.ttflist}
+        _candidates = ["Hiragino Sans", "Yu Gothic", "Noto Sans CJK JP", "sans-serif"]
+        matplotlib.rcParams["font.family"] = [f for f in _candidates
+                                               if f in _installed or f == "sans-serif"]
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -1585,8 +1589,13 @@ class AnalysisView(QWidget):
 
         # ── 超過チケット一覧 ───────────────────────────────
         layout.addWidget(QLabel("見積 vs 実績（超過チケット）"))
-        AL_COLS = ["タイトル", "担当者", "見積(h)", "実績(h)", "納期"]
-        self.alert_table = ScrollableTable(AL_COLS, [200, 90, 65, 65, 100])
+        AL_COLS = ["親", "チケット名", "担当者", "見積(h)", "実績(h)", "納期", "メモ"]
+        AL_WIDTHS = [280, 160, 90, 65, 65, 100, 200]
+        self._AL_COL_MEMO = 6  # メモ列のインデックス
+        self.alert_table = ScrollableTable(AL_COLS, AL_WIDTHS)
+        # メモ列のみダブルクリックで編集可能にする
+        self.alert_table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self.alert_table.itemChanged.connect(self._on_alert_memo_changed)
         layout.addWidget(self.alert_table, stretch=1)
 
         self.info = InfoLabel()
@@ -1750,17 +1759,51 @@ class AnalysisView(QWidget):
                 axis=1,
             )
         ]
-        al_rows = [[
-            r.get("title", ""),
-            self.state.display_name(str(r.get("assigned_to", ""))),
-            f"{float(r.get('estimated_hours', 0)):.2f}",
-            f"{float(r.get('actual_hours', 0)):.2f}",
-            r.get("deadline", ""),
-        ] for _, r in over.iterrows()]
-        self.alert_table.set_rows(al_rows)
+        al_rows = []
+        al_ids = []
+        for t_idx, r in over.iterrows():
+            # Project1 から直接の親まで全祖先タイトルを " > " 区切りで表示
+            ancestor_titles: list[str] = []
+            cur_id = str(r.get("parent_id", ""))
+            visited: set[str] = set()
+            while cur_id and cur_id not in visited and cur_id in df.index:
+                visited.add(cur_id)
+                ancestor_titles.insert(0, str(df.loc[cur_id, "title"] or ""))
+                cur_id = str(df.loc[cur_id, "parent_id"] or "")
+            parent_chain = " > ".join(ancestor_titles) if ancestor_titles else ""
+            al_rows.append([
+                parent_chain,
+                r.get("title", ""),
+                self.state.display_name(str(r.get("assigned_to", ""))),
+                f"{float(r.get('estimated_hours', 0)):.2f}",
+                f"{float(r.get('actual_hours', 0)):.2f}",
+                r.get("deadline", ""),
+                r.get("memo", ""),
+            ])
+            al_ids.append(str(t_idx))
+        self.alert_table.blockSignals(True)
+        self.alert_table.set_rows(al_rows, row_ids=al_ids)
+        # メモ列のみ編集可能フラグを追加
+        for row_i in range(self.alert_table.rowCount()):
+            memo_item = self.alert_table.item(row_i, self._AL_COL_MEMO)
+            if memo_item:
+                memo_item.setFlags(memo_item.flags() | Qt.ItemFlag.ItemIsEditable)
+        self.alert_table.blockSignals(False)
         self.info.set_info(
             f"集計: {len(agg)} ノード / 超過チケット: {len(al_rows)}"
         )
+
+    def _on_alert_memo_changed(self, item: QTableWidgetItem) -> None:
+        """超過チケット一覧のメモ列が編集されたとき、df_nodes を更新する"""
+        if item.column() != self._AL_COL_MEMO:
+            return
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        if not idx or idx not in self.state.df_nodes.index:
+            return
+        new_memo = item.text()
+        self.state.df_nodes.loc[idx, "memo"] = new_memo
+        self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+        self.state.nodes_modified = True
 
 
 # ---------- 検索 ----------

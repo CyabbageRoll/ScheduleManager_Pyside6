@@ -17,7 +17,7 @@
     --border: #CFD8DC;
     --bg: #FAFAFA;
     --code-bg: #ECEFF1;
-    --sidebar-w: 260px;
+    --sidebar-w: 270px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -56,6 +56,7 @@
     margin-top: 8px;
   }
   nav#sidebar a.indent { padding-left: 32px; }
+  nav#sidebar a.indent2 { padding-left: 44px; }
 
   /* ── メインコンテンツ ── */
   main {
@@ -126,6 +127,12 @@
     border-radius: 3px; font-size: 12.5px;
     font-family: "Courier New", monospace;
   }
+  pre {
+    background: var(--code-bg); padding: 12px 16px;
+    border-radius: 6px; font-size: 12.5px;
+    font-family: "Courier New", monospace;
+    overflow-x: auto; margin-bottom: 12px;
+  }
 
   /* ── バッジ ── */
   .badge {
@@ -172,12 +179,28 @@
     background: linear-gradient(180deg, #1E88E5 0%, #1565C0 100%);
     color: white; border-color: #0D47A1;
   }
+  .tab-btn.badge-red {
+    background: linear-gradient(180deg, #EF5350 0%, #C62828 100%);
+    color: white; border-color: #B71C1C;
+  }
 
   /* ── hr ── */
   hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
 
   /* ── アンカーオフセット調整 ── */
   [id] { scroll-margin-top: 16px; }
+
+  /* ── フローチャート ── */
+  .flow {
+    display: flex; align-items: center; flex-wrap: wrap;
+    gap: 8px; margin: 12px 0;
+  }
+  .flow-step {
+    background: white; border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 14px;
+    font-size: 13px; font-weight: bold;
+  }
+  .flow-arrow { color: #90A4AE; font-size: 18px; }
 </style>
 </head>
 <body>
@@ -199,9 +222,14 @@
   <a href="#edit-tab">✏ Edit（データ編集）</a>
   <a class="indent" href="#edit-tree">階層ツリー</a>
   <a class="indent" href="#edit-table">チケット一覧テーブル</a>
+  <a class="indent" href="#edit-priority">優先順位（priority）</a>
+  <a class="indent" href="#edit-save">保存のしくみ</a>
   <a href="#team-tab">👥 Team（チームログ）</a>
   <a href="#search-tab">🔍 Search（検索）</a>
   <a href="#request-tab">📨 Request（タスク依頼）</a>
+  <a class="indent" href="#request-send">依頼を送る</a>
+  <a class="indent" href="#request-recv">受信した依頼を処理する</a>
+  <a href="#ai-tab">🤖 AI取込</a>
   <a href="#memo-tab">📝 Memo（メモ）</a>
   <a href="#analyze-tab">📈 Analyze（分析）</a>
   <a href="#version-tab">ℹ Version</a>
@@ -231,12 +259,13 @@
 <div class="card">
   <h4>主な機能</h4>
   <ul>
-    <li><strong>階層管理</strong>: Project1〜Project4 → Task → Ticket の5階層でタスクを体系化</li>
+    <li><strong>階層管理</strong>: Project1〜Project4 → Task → Ticket の6階層でタスクを体系化</li>
     <li><strong>ガントチャート（Main）</strong>: 誰がいつ何をするかを日単位で可視化</li>
     <li><strong>ロードマップ（Plan）</strong>: 日/週/月単位の長期スケジュール表示</li>
     <li><strong>日次スケジュール</strong>: 15分刻みでその日の作業を記録</li>
     <li><strong>チームログ（Team）</strong>: メンバー全員の勤務状況・連絡事項を一覧表示</li>
-    <li><strong>タスク依頼（Request）</strong>: 他メンバーへのチケット依頼</li>
+    <li><strong>タスク依頼（Request）</strong>: 他メンバーへのタスク・チケット依頼</li>
+    <li><strong>AI取込</strong>: LLM（AI）の返答からタスクを自動作成</li>
     <li><strong>工数分析（Analyze）</strong>: 見積vs実績の比較・超過アラート</li>
   </ul>
 </div>
@@ -263,11 +292,11 @@
 
 <table>
   <tr><th>設定項目</th><th>説明</th><th>例</th></tr>
-  <tr><td><code>username</code></td><td>自分のメールアドレス</td><td><code>yamada@example.com</code></td></tr>
-  <tr><td><code>members</code></td><td>チームメンバーのメールアドレス（カンマ区切り）</td><td><code>yamada@example.com, tanaka@example.com</code></td></tr>
+  <tr><td><code>username</code></td><td>自分のログインユーザー名</td><td><code>yamada</code></td></tr>
+  <tr><td><code>members</code></td><td>チームメンバーのユーザー名（カンマ区切り）</td><td><code>yamada, tanaka, suzuki</code></td></tr>
   <tr><td><code>server_dir</code></td><td>DBファイルの保存先フォルダ</td><td><code>./db</code>（共有フォルダなら <code>//server/share/db</code>）</td></tr>
   <tr><td><code>daily_task_hour</code></td><td>1日の標準作業時間（時間）</td><td><code>5.0</code></td></tr>
-  <tr><td><code>[DisplayNames]</code></td><td>メール→表示名のマッピング</td><td><code>yamada@example.com = 山田</code></td></tr>
+  <tr><td><code>[DisplayNames]</code></td><td>ユーザー名→画面表示名のマッピング</td><td><code>yamada = 山田</code></td></tr>
 </table>
 
 <div class="card warn">
@@ -297,19 +326,24 @@
   <span class="tab-btn">✏ Edit</span>
   <span class="tab-btn">👥 Team</span>
   <span class="tab-btn">🔍 Search</span>
-  <span class="tab-btn">📨 Request</span>
+  <span class="tab-btn badge-red">📨 Request <small>3</small></span>
   <span class="tab-btn">📝 Memo</span>
   <span class="tab-btn">📈 Analyze</span>
   <span class="tab-btn">ℹ Version</span>
   <span class="tab-btn">⚙ Config</span>
+  <span class="tab-btn">🤖 AI取込</span>
 </p>
+<p>未処理の Request が届いているとき、Request タブのボタンが<strong>赤背景</strong>で件数を表示します。</p>
 
 <h3>メンバー切替ボタン（2行目）</h3>
 <p>ツールバー2行目に各メンバーのボタンが並びます。クリックすると表示対象メンバーが切り替わります。</p>
 
 <div class="card info">
-  <strong>💡 「自分」と「表示メンバー」</strong><br>
-  <code>config.ini</code> の <code>username</code> が「自分」です。ガントや日次スケジュールの <em>操作</em>（割り当て・編集）は自分のデータのみ可能ですが、<em>表示</em> は2行目のボタンで他のメンバーに切り替えられます。
+  <strong>💡 「自分（ログインユーザー）」と「表示メンバー」の違い</strong><br>
+  アプリ起動時のOSログインユーザーが「自分」として固定されます。<br>
+  ガントや日次スケジュールの <em>操作</em>（割り当て・編集・削除）は自分のデータのみ可能ですが、
+  <em>表示</em> は2行目のボタンで他のメンバーに切り替えられます。
+  Request の受信一覧も切替メンバーのものを閲覧できますが、<strong>承諾・拒否は自分宛の依頼のみ</strong>可能です。
 </div>
 
 <hr>
@@ -363,7 +397,7 @@
 <h4>フィルター</h4>
 <table>
   <tr><th>フィルター</th><th>説明</th></tr>
-  <tr><td>ステータス（ラジオ）</td><td>Todo / All / Done / Cancel / Regularly から選択（デフォルト: Todo）</td></tr>
+  <tr><td>ステータス（ラジオ）</td><td>全て / Todo / Regularly / Done / Cancel から選択（デフォルト: Todo）</td></tr>
   <tr><td>Project ドロップダウン</td><td>表示する Project1 を絞り込み</td></tr>
   <tr><td>担当ドロップダウン</td><td>表示する担当者を絞り込み</td></tr>
   <tr><td>期間（DateButton）</td><td>表示する日付範囲を選択</td></tr>
@@ -377,9 +411,6 @@
   <tr><td>左側の緑縦線</td><td>開始可能日（この日より前には作業しない）</td></tr>
   <tr><td><span style="background:#EF5350;color:white;padding:2px 6px;border-radius:3px;">🔨赤</span></td><td>作業日が納期を超過（要対応）</td></tr>
 </table>
-
-<h4>チケットの割り当て</h4>
-<p>日次スケジュールで時間帯を選択した状態で、ガントのチケット行をクリックすると割り当てが完了します。</p>
 
 <h4>右クリックメニュー</h4>
 <p>ガントのチケット行を右クリックするとメニューが表示されます。</p>
@@ -413,13 +444,19 @@
 <h3>上部コントロール</h3>
 <table>
   <tr><th>コントロール</th><th>説明</th></tr>
-  <tr><td>表示レベルボタン</td><td><span class="badge green">Project2</span> <span class="badge yellow">Project3</span> <span class="badge purple">Project4</span> <span class="badge gray">Task</span> — 何の単位でバーを表示するか選択</td></tr>
-  <tr><td>単位ボタン</td><td><span class="badge blue">日</span> <span class="badge blue">週</span> <span class="badge blue">月</span> — セル1列あたりの時間単位</td></tr>
-  <tr><td>期間（DateButton）</td><td>表示する期間の開始・終了を選択（デフォルト: 会計年度）</td></tr>
+  <tr><td>表示レベルボタン</td><td><span class="badge green">Project2</span> <span class="badge yellow">Project3</span> <span class="badge purple">Project4</span> <span class="badge gray">Task</span> — 何の単位でバーを表示するか（デフォルト: Project4）</td></tr>
+  <tr><td>単位ボタン</td><td><span class="badge blue">日</span> <span class="badge blue">週</span> <span class="badge blue">月</span> — セル1列あたりの時間単位（デフォルト: 週）</td></tr>
+  <tr><td>期間（DateButton）</td><td>表示する期間の開始・終了を選択</td></tr>
+  <tr><td>クイック期間ボタン</td><td>今期・1Q・2Q・3Q・4Q・Next30d・Next06m・Next01y — ワンクリックで期間を切替</td></tr>
+  <tr><td>列幅 −/+</td><td>日付列の幅を一括で5pxずつ変更</td></tr>
 </table>
 
 <h3>左ツリー：親の絞り込み</h3>
-<p>左側のツリーから親ノードをクリックすると、その配下のアイテムのみを表示できます。（全て）を選択すると全件表示。</p>
+<p>左側のツリーから親ノードをクリックすると、その配下のアイテムのみを表示できます。</p>
+<ul>
+  <li>「（全て）」を選択すると全件表示</li>
+  <li><kbd>Ctrl+クリック</kbd> で複数の親ノードを同時に選択できます</li>
+</ul>
 
 <h3>スケジュールバーの色</h3>
 <table>
@@ -435,7 +472,7 @@
 <ul>
   <li><strong>ダブルクリック</strong>: ポップアップダイアログで編集（自分のデータのみ）</li>
   <li><strong>右クリック → Edit</strong>: Edit タブでそのノードを表示</li>
-  <li><strong>右クリック → Request</strong>: Request タブへ移動</li>
+  <li><strong>右クリック → 📨 Request</strong>: Request タブへ移動して依頼を送る</li>
 </ul>
 
 <hr>
@@ -445,15 +482,20 @@
 <p>プロジェクト・タスク・チケットの作成・編集・削除を行うメインの編集画面です。</p>
 
 <h3 id="edit-tree">左ペイン：階層ツリー</h3>
-<p>Project1（最上位）〜 Ticket（最下位）の5階層が木構造で表示されます。</p>
-<ul>
-  <li>ノードをクリックすると、右ペインにその子ノード一覧が表示されます</li>
-  <li>右クリックで新規追加・削除が可能です</li>
-  <li>ノードの種別は色とラベルで区別できます</li>
-</ul>
+<p>Project1（最上位）〜 Ticket（最下位）の6階層が木構造で表示されます。</p>
+
+<div class="card">
+  <h4>ツリーの見かた</h4>
+  <ul>
+    <li>先頭の <strong>[P0]</strong>（仮想ルート）をクリックすると、右ペインに全 Project1 の一覧が表示されます</li>
+    <li>各ノードをクリックすると、右ペインにその直下の子ノード一覧が表示されます</li>
+    <li>右クリックで <strong>新規追加・削除・📨 Request 送信</strong> ができます</li>
+  </ul>
+</div>
 
 <table>
   <tr><th>種別</th><th>ラベル</th><th>説明</th></tr>
+  <tr><td>（仮想）</td><td>[P0]</td><td>ルート。クリックで P1 一覧を表示</td></tr>
   <tr><td><span class="badge" style="background:#E3F2FD;color:#1565C0;border-color:#90CAF9;">[P1]</span></td><td>Project1</td><td>最上位の大プロジェクト</td></tr>
   <tr><td><span class="badge" style="background:#E8F5E9;color:#2E7D32;border-color:#A5D6A7;">[P2]</span></td><td>Project2</td><td>サブプロジェクト</td></tr>
   <tr><td><span class="badge" style="background:#FFF9C4;color:#F57F17;border-color:#FFE082;">[P3]</span></td><td>Project3</td><td>フェーズ・カテゴリ</td></tr>
@@ -463,19 +505,19 @@
 </table>
 
 <h3 id="edit-table">右ペイン：チケット一覧テーブル</h3>
-<p>選択されたノードの子アイテムを一覧表示します。Excel のように直接編集できます。</p>
+<p>選択されたノードの子アイテムを一覧表示します。セルを直接編集できます。</p>
 
 <h4>テーブルの列</h4>
 <table>
   <tr><th>列</th><th>説明</th><th>編集方法</th></tr>
-  <tr><td>順番</td><td>表示・処理の優先順位（数値が小さいほど優先）</td><td>▲▼ボタン or 直接入力</td></tr>
+  <tr><td>順番</td><td>表示・処理の優先順位（数値が小さいほど優先）</td><td>▲▼ボタン で隣接行と入れ替え</td></tr>
   <tr><td>タイトル</td><td>チケット名</td><td>キー入力で即編集</td></tr>
-  <tr><td>ステータス</td><td>現在の状態</td><td>クリック→一覧 / <kbd>Alt+↑↓</kbd></td></tr>
-  <tr><td>担当者</td><td>チケット担当者</td><td>クリック→一覧</td></tr>
+  <tr><td>ステータス</td><td>現在の状態</td><td>クリック→一覧選択 / <kbd>Alt+↑↓</kbd></td></tr>
+  <tr><td>担当者</td><td>チケット担当者</td><td>クリック→一覧選択</td></tr>
   <tr><td>見積(h)</td><td>見積作業時間</td><td>数字キー入力</td></tr>
   <tr><td>実績(h)</td><td>実際の作業時間（自動集計）</td><td>読み取り専用</td></tr>
-  <tr><td>開始可能日</td><td>この日以降から作業可能</td><td>クリック→カレンダー</td></tr>
-  <tr><td>納期</td><td>完了期限</td><td>クリック→カレンダー</td></tr>
+  <tr><td>開始可能日</td><td>この日以降から作業可能</td><td>クリック→カレンダー選択</td></tr>
+  <tr><td>納期</td><td>完了期限</td><td>クリック→カレンダー選択</td></tr>
   <tr><td>メモ</td><td>補足メモ</td><td>キー入力</td></tr>
 </table>
 
@@ -485,7 +527,7 @@
   <tr><td>行を選択</td><td>クリック（複数選択は <kbd>Shift</kbd> / <kbd>Ctrl</kbd> + クリック）</td></tr>
   <tr><td>セルを編集</td><td>セルに移動してそのままキー入力、またはダブルクリック</td></tr>
   <tr><td>次のセルへ移動</td><td><kbd>Tab</kbd> / <kbd>→</kbd> / <kbd>↓</kbd></td></tr>
-  <tr><td>行を追加</td><td>テーブル最終行で <kbd>Ctrl+Enter</kbd>（デフォルト: 見積1h、ToDo）</td></tr>
+  <tr><td>新規行を追加</td><td>テーブル最終行で <kbd>Ctrl+Enter</kbd>（デフォルト: 見積1h・Todo）</td></tr>
   <tr><td>ステータス変更</td><td>ステータス列をクリック、または <kbd>Alt+↑</kbd>/<kbd>Alt+↓</kbd></td></tr>
   <tr><td>日付を変更</td><td>開始可能日・納期列をクリック → カレンダー表示</td></tr>
   <tr><td>優先順位を上げる</td><td>▲ ボタン（複数選択も可）</td></tr>
@@ -500,6 +542,30 @@
 
 <div class="card tip">
   <strong>✅ 子ノードの追加制限</strong>: Ticket は最下位ノードのため、Ticket を選択した状態では子ノードを追加できません。
+</div>
+
+<h3 id="edit-priority">優先順位（priority）について</h3>
+<p>各アイテムには「順番」として優先順位が割り振られます。数字が小さいほど優先度が高く、ガントチャートの作業順序に影響します。</p>
+
+<ul>
+  <li>テーブル上の <strong>▲ / ▼</strong> ボタンで隣接行と優先順位を入れ替えられます（複数選択可）</li>
+  <li>アイテムを追加すると、自動的に末尾の順番が割り振られます</li>
+  <li>削除・追加操作後は、1から連番になるよう自動的に整理されます</li>
+</ul>
+
+<h3 id="edit-save">保存のしくみ（遅延保存）</h3>
+<p>Edit タブでの変更は <strong>すぐにはDBへ書き込まれません</strong>。<kbd>Ctrl+S</kbd>（または「💾 保存」ボタン）を押したときに初めて保存されます。</p>
+
+<div class="card warn">
+  <strong>⚠ 未保存の変更がある場合</strong><br>
+  テーブル上部に「<span style="color:#E65100;font-weight:bold;">⚠ 未保存の変更があります</span>」と表示されます。
+  アプリを閉じる前・Ctrl+R（再読み込み）を実行する前に必ず <kbd>Ctrl+S</kbd> で保存してください。
+</div>
+
+<div class="card info">
+  <strong>💡 再読み込みするとどうなる？</strong><br>
+  <kbd>Ctrl+R</kbd>（読込）を実行すると、<strong>保存していない変更はすべて破棄</strong>され、DBの最新データで上書きされます。
+  保存し忘れに注意してください。
 </div>
 
 <hr>
@@ -546,30 +612,143 @@
   <li><strong>📤 CSV 出力 / Excel 出力</strong>: 検索結果をファイルに保存</li>
 </ul>
 
+<h4>検索結果の列</h4>
+<p>検索結果には <strong>Project1〜Project4・Task</strong> の親階層列も表示されるため、どのプロジェクト配下のアイテムかが一目でわかります。また「期間実績(h)」列で指定期間内の工数も確認できます。</p>
+
 <hr>
 
 <!-- ===================== Request タブ ===================== -->
 <h2 id="request-tab">📨 Request タブ（タスク依頼）</h2>
-<p>自分の担当チケットを他のメンバーに依頼したり、受け取った依頼を承諾・拒否します。</p>
+<p>自分が担当するアイテムを他のメンバーに依頼したり、受け取った依頼を承諾・拒否します。</p>
 
-<h3>依頼を送る</h3>
+<div class="card info">
+  <strong>💡 未処理の依頼がある場合</strong><br>
+  Request タブのボタンが<strong style="color:#C62828;">赤背景</strong>に変わり、未処理件数が表示されます。
+  タブ切替時・起動時に自動更新されます。
+</div>
+
+<h3 id="request-send">依頼を送る</h3>
+
+<h4>対象の種別と動作の違い</h4>
+<table>
+  <tr><th>対象の種別</th><th>動作</th><th>送り先の選択</th></tr>
+  <tr><td>Ticket</td><td>対象チケットのコピーを送り先に作成（担当者を送り先に変更）</td><td>複数人に同時送信可能</td></tr>
+  <tr><td>Task / Project1〜4</td><td>そのアイテムの担当者を送り先に変更</td><td>1名のみ選択可</td></tr>
+</table>
+
+<h4>依頼の手順</h4>
 <ol class="steps">
-  <li>「チケット」ドロップダウンから依頼したいチケットを選択</li>
-  <li>「送り先」の中から依頼先メンバーにチェックを入れる（複数選択可）</li>
+  <li>「対象」ドロップダウンから依頼したいアイテムを選択<br>
+      （<code>[P1] 大プロジェクト</code> / <code>[Task] 作業名</code> / <code>[Tkt] チケット名</code> の形式で表示されます）</li>
+  <li>種別に応じた動作説明が表示されます（Ticket: コピー作成 / Task以上: 担当者変更）</li>
+  <li>「送り先」から依頼先メンバーにチェックを入れる</li>
   <li>「メッセージ」に一言コメントを記入（任意）</li>
   <li>「依頼送信」ボタンをクリック</li>
 </ol>
 
 <div class="card info">
-  <strong>💡 ガント・Plan からも依頼可能</strong>: ガントや Plan でチケットを右クリック → 📨 Request を選ぶと、そのチケットが自動選択された状態で Request タブが開きます。
+  <strong>💡 ガント・Plan・Edit ツリーからも依頼可能</strong><br>
+  ガント・Plan・Edit ツリーのアイテムを<strong>右クリック → 📨 Request</strong> を選ぶと、
+  そのアイテムが自動選択された状態で Request タブが開きます。
 </div>
 
-<h3>受信した依頼を処理する</h3>
+<h3 id="request-recv">受信した依頼を処理する</h3>
+
+<h4>受信一覧の見かた</h4>
+<p>受信一覧テーブルには以下の列が表示されます。</p>
+<table>
+  <tr><th>列</th><th>説明</th></tr>
+  <tr><td>P1 / P2 / P3 / P4 / Task</td><td>依頼対象の親階層タイトル（対象より下位の列はグレーアウト）</td></tr>
+  <tr><td>Ticket</td><td>依頼対象のチケット/アイテム名</td></tr>
+  <tr><td>依頼者</td><td>依頼を送ってきたメンバー</td></tr>
+  <tr><td>メッセージ</td><td>依頼時のコメント</td></tr>
+  <tr><td>状態</td><td>pending（未処理）/ accepted（承諾済）/ rejected（拒否済）</td></tr>
+  <tr><td>日時</td><td>依頼が届いた日時</td></tr>
+</table>
+
+<div class="card info">
+  <strong>💡 閲覧と操作の違い</strong><br>
+  ツールバー2行目で表示メンバーを切り替えると、そのメンバーの受信一覧を<strong>閲覧</strong>できます。
+  ただし<strong>承諾・拒否の操作は自分（ログインユーザー）宛の依頼のみ</strong>可能です。
+</div>
+
+<h4>承諾・拒否の手順</h4>
 <ol class="steps">
-  <li>下の「受信した依頼」テーブルから処理する依頼を選択</li>
-  <li><strong>✅ 承諾</strong>: そのチケットの担当者が自分に変更されます</li>
-  <li><strong>❌ 拒否</strong>: 依頼を却下します（チケットは変更されません）</li>
+  <li>受信一覧から処理する依頼を選択（<kbd>Ctrl+クリック</kbd>や<kbd>Shift+クリック</kbd>で複数選択可）</li>
+  <li><strong>✅ 承諾</strong>をクリック → 一括で承諾。アイテムの担当者が自分に変更されます</li>
+  <li><strong>❌ 拒否</strong>をクリック → 依頼を却下（アイテムは変更されません）</li>
 </ol>
+
+<div class="card warn">
+  <strong>⚠ 注意事項</strong>
+  <ul>
+    <li>一度<strong>承諾した依頼は拒否できません</strong></li>
+    <li>承諾・拒否から<strong>10日経過した依頼は受信一覧から自動的に消えます</strong>（データは保持されます）</li>
+  </ul>
+</div>
+
+<hr>
+
+<!-- ===================== AI取込 タブ ===================== -->
+<h2 id="ai-tab">🤖 AI取込タブ</h2>
+<p>LLM（AI）にタスク整理を依頼し、その回答をそのまま取り込んでアイテムを自動作成する機能です。</p>
+
+<h3>使い方の流れ</h3>
+<div class="flow">
+  <div class="flow-step">① 指示メッセージ取得</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">② AI（ChatGPT等）に貼り付け</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">③ AI返答を貼り付け</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">④ 取り込みボタン</div>
+  <div class="flow-arrow">→</div>
+  <div class="flow-step">⑤ Edit で確認</div>
+</div>
+
+<ol class="steps">
+  <li>
+    <strong>📋 指示メッセージ取得</strong> ボタンをクリック<br>
+    テンプレート（指示内容）＋ 既存プロジェクト一覧がクリップボードにコピーされます
+  </li>
+  <li>
+    ChatGPT / Claude などの AI チャットを開き、コピーした内容を貼り付けて送信<br>
+    <em>その後に整理してほしいメール・指示文なども合わせて貼り付けてください</em>
+  </li>
+  <li>
+    AI の返答をコピーして、AI取込タブのテキストエリアに貼り付ける<br>
+    <code>```items ... ```</code> の形式を含む回答を認識します
+  </li>
+  <li>
+    <strong>📥 取り込み</strong> ボタンをクリック<br>
+    内容を解析して確認ダイアログが表示されます。「OK」で DB に登録されます
+  </li>
+  <li>
+    自動的に Edit タブに切り替わり、取り込まれたアイテムが選択表示されます<br>
+    <strong>次へ →</strong> ボタンで取り込まれた各アイテムを順番に確認できます
+  </li>
+</ol>
+
+<div class="card info">
+  <strong>💡 AI返答のフォーマット</strong><br>
+  AI にはあらかじめフォーマットが指定されています。以下の形式で返答してもらいます：
+<pre>```items
+title: タスクタイトル
+parent_idx: 親アイテムのIDX（0=ルート）
+node_type: task または ticket
+assigned_to: 担当者のユーザー名
+deadline: YYYY-MM-DD
+memo: メモ
+---
+title: 2つ目のアイテム
+...
+```</pre>
+</div>
+
+<div class="card warn">
+  <strong>⚠ 注意</strong>: 取り込み後は内容を Edit タブで確認し、担当者・納期・優先順位を適切に調整してください。
+  取り込んだ内容は必ず <kbd>Ctrl+S</kbd> で保存してください。
+</div>
 
 <hr>
 
@@ -620,8 +799,8 @@
 <table>
   <tr><th>セクション</th><th>主な設定</th></tr>
   <tr><td>[Database]</td><td>DB 保存フォルダのパス</td></tr>
-  <tr><td>[User]</td><td>自分のメールアドレス、チームメンバー一覧</td></tr>
-  <tr><td>[DisplayNames]</td><td>メールアドレス → 画面表示名のマッピング</td></tr>
+  <tr><td>[User]</td><td>自分のユーザー名、チームメンバー一覧</td></tr>
+  <tr><td>[DisplayNames]</td><td>ユーザー名 → 画面表示名のマッピング</td></tr>
   <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ</td></tr>
   <tr><td>[Schedule]</td><td>営業時間（始業・終業）、1日の標準作業時間、休日</td></tr>
   <tr><td>[DailyInfoCombo]</td><td>健・場・安・残 の選択肢リスト</td></tr>
@@ -643,8 +822,8 @@
 <h3>グローバル（どのタブでも使用可）</h3>
 <table>
   <tr><th>ショートカット</th><th>動作</th></tr>
-  <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>保存</td></tr>
-  <tr><td><kbd>Ctrl</kbd>+<kbd>R</kbd></td><td>最新データを読み込み</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>保存（Edit タブの変更を DB に書き込む）</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>R</kbd></td><td>最新データを読み込み（未保存変更は破棄）</td></tr>
 </table>
 
 <h3>Edit タブ（テーブル操作）</h3>
@@ -667,12 +846,18 @@
   <tr><td><kbd>Ctrl</kbd>+クリック</td><td>個別に複数選択</td></tr>
 </table>
 
+<h3>Plan タブ</h3>
+<table>
+  <tr><th>操作</th><th>動作</th></tr>
+  <tr><td><kbd>Ctrl</kbd>+クリック（左ツリー）</td><td>複数の親ノードを同時選択して絞り込み</td></tr>
+</table>
+
 <hr>
 
 <!-- ===================== ノード種別 ===================== -->
 <h2 id="node-types">階層構造（ノード種別）</h2>
 
-<p>アプリでは以下の5階層でデータを管理します。</p>
+<p>アプリでは以下の6階層でデータを管理します。</p>
 
 <div class="card">
 <pre style="font-family: monospace; font-size: 13px; line-height: 1.8; color: #37474F;">
@@ -689,6 +874,7 @@
   <li><strong>Ticket が最小単位</strong>: 日次スケジュールへの割り当て・見積工数・実績工数は Ticket に紐付きます</li>
   <li><strong>Task より上の階層</strong>: 主に分類・グルーピングのために使用。Ticket の工数は上位に積み上げられます</li>
   <li>使わない階層は省略できます（例: P1 直下に Task を置くことも可能）</li>
+  <li>Request は Ticket に限らず <strong>P1〜Ticket のすべての階層</strong>に対して送れます</li>
 </ul>
 
 <hr>
@@ -705,7 +891,7 @@
 </table>
 
 <div class="card info">
-  <strong>💡 Done/Cancel のチケット</strong>: ガントには表示されません（「All」フィルターで表示可）。
+  <strong>💡 Done/Cancel のチケット</strong>: ガントには表示されません（「全て」フィルターで表示可）。
   実績工数は保持されるため、分析に使用できます。
 </div>
 
@@ -717,6 +903,7 @@
 <h3>Q. データの保存はいつ行われますか？</h3>
 <p>
   常時メモ以外の変更は自動保存されません。<kbd>Ctrl+S</kbd> または「💾 保存」ボタンで明示的に保存してください。
+  Edit タブで変更があると「⚠ 未保存の変更があります」と表示されます。
   保存せずにアプリを閉じると変更が失われます。
 </p>
 
@@ -732,10 +919,10 @@
 
 <h3>Q. ガントに自分のチケットが表示されません</h3>
 <ol>
-  <li>ステータスフィルターを確認（「Todo」以外のステータスは非表示になります。「All」を選択してみてください）</li>
+  <li>ステータスフィルターを確認（「Todo」以外のステータスは非表示になります。「全て」を選択してみてください）</li>
   <li>期間フィルターの範囲にチケットの作業予定日が含まれているか確認</li>
   <li>担当者フィルターが正しく設定されているか確認</li>
-  <li>チケットの <code>assigned_to</code>（担当者）が自分のメールアドレスになっているか Edit タブで確認</li>
+  <li>チケットの担当者（assigned_to）が自分のユーザー名になっているか Edit タブで確認</li>
 </ol>
 
 <h3>Q. 作業予定日（🔨）が表示されません</h3>
@@ -758,16 +945,32 @@
   ガントのスケジュールバーは表示されませんが、項目名は一覧に残ります。
 </p>
 
-<h3>Q. 依頼（Request）を承諾したらどうなりますか？</h3>
+<h3>Q. Request を承諾したらどうなりますか？</h3>
 <p>
-  そのチケットの担当者（assigned_to）が<strong>あなたのメールアドレスに変更</strong>されます。
-  以降は自分のチケットとしてガントに表示され、日次スケジュールへの割り当てが可能になります。
+  対象アイテムの担当者（assigned_to）が<strong>あなたのユーザー名に変更</strong>されます。
+  Ticket の場合は以降、自分のチケットとしてガントに表示され、日次スケジュールへの割り当てが可能になります。
+</p>
+
+<h3>Q. AI取込でうまく取り込めません</h3>
+<p>以下を確認してください。</p>
+<ul>
+  <li>AI の返答に <code>```items</code> と <code>```</code> のコードブロックが含まれているか</li>
+  <li><code>title:</code> と <code>parent_idx:</code> が必須項目として含まれているか</li>
+  <li><code>parent_idx</code> に指定した IDX が既存アイテム一覧に存在するか</li>
+  <li>「指示メッセージ取得」で取得したメッセージを AI に渡してから依頼しているか</li>
+</ul>
+
+<h3>Q. Edit で編集した内容が消えました</h3>
+<p>
+  <kbd>Ctrl+R</kbd>（読込）を実行すると、保存前の変更は破棄されます。
+  また、他のメンバーが同じデータを上書き保存した場合も、次回の読込時に上書きされます。
+  重要な変更をしたらすぐに <kbd>Ctrl+S</kbd> で保存する習慣をつけてください。
 </p>
 
 <hr>
 
 <p style="text-align:center; color:#78909C; font-size:12px; margin-top:32px; padding-bottom:40px;">
-  Schedule Manager v3 操作マニュアル &nbsp;|&nbsp; 最終更新: 2026年3月
+  Schedule Manager v3 操作マニュアル &nbsp;|&nbsp; 最終更新: 2026年4月
 </p>
 
 </main>

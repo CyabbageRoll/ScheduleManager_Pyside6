@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QFrame, QStackedWidget, QSizePolicy, QToolBar, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QSpinBox, QCheckBox,
     QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu,
+    QApplication,
 )
 from pathlib import Path
 
@@ -1361,6 +1362,7 @@ class TablePane(QWidget):
         self.state = state
         self._parent_idx: Optional[str] = None
         self._rebuilding: bool = False
+        self._pending_digit: Optional[str] = None  # 数字キー上書き用バッファ
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -1433,9 +1435,6 @@ class TablePane(QWidget):
         self.table.setItemDelegateForColumn(2, _StatusDelegate(self.table))
         self.table.setItemDelegateForColumn(5, _DateDelegate(self.table))
         self.table.setItemDelegateForColumn(6, _DateDelegate(self.table))
-
-        # Ctrl+Enter で末尾に即時行追加（ダイアログなし）
-        QShortcut(QKeySequence("Ctrl+Return"), self.table).activated.connect(self._on_add_quick)
 
         # Alt+↑↓ でステータス列の値をサイクル
         self.table.installEventFilter(self)
@@ -1524,54 +1523,86 @@ class TablePane(QWidget):
             children = df[
                 (df["parent_id"] == self._parent_idx) & (df["status"] != "deleted")
             ].copy()
-            if children.empty:
-                return
-            children = children.sort_values("priority")
-            for idx, row in children.iterrows():
+            if not children.empty:
+                children = children.sort_values("priority")
+                for idx, row in children.iterrows():
+                    r = self.table.rowCount()
+                    self.table.insertRow(r)
+                    vals = [
+                        row.get("title", ""),
+                        row.get("priority", ""),
+                        row.get("status", ""),
+                        row.get("estimated_hours", ""),
+                        row.get("actual_hours", ""),
+                        row.get("start_available", ""),
+                        row.get("deadline", ""),
+                        self.state.display_name(str(row.get("assigned_to", ""))),
+                        row.get("memo", ""),
+                    ]
+                    hex_c = COLOR_OPTIONS.get(row.get("color", "Cyan"), "#00BCD4")
+                    bg = QColor(hex_c)
+                    bg.setAlpha(60)
+                    is_own = str(row.get("assigned_to", "")) == self.state.user
+                    # 実績(h) col=4, 担当者 col=7 は常に読み取り専用
+                    _READONLY_COLS = {4, 7}
+                    for c, val in enumerate(vals):
+                        item = QTableWidgetItem(str(val) if val is not None else "")
+                        if not is_own or c in _READONLY_COLS:
+                            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                        item.setData(Qt.ItemDataRole.UserRole, idx)
+                        if row.get("status") in ("done",):
+                            item.setForeground(QColor("#9E9E9E"))
+                        else:
+                            item.setBackground(bg)
+                        self.table.setItem(r, c, item)
+            # 新規入力用の空白行を常に末尾に追加（子ノードを持てる親の場合のみ）
+            can_add_child = self._get_child_type() is not None
+            if can_add_child:
                 r = self.table.rowCount()
                 self.table.insertRow(r)
-                vals = [
-                    row.get("title", ""),
-                    row.get("priority", ""),
-                    row.get("status", ""),
-                    row.get("estimated_hours", ""),
-                    row.get("actual_hours", ""),
-                    row.get("start_available", ""),
-                    row.get("deadline", ""),
-                    self.state.display_name(str(row.get("assigned_to", ""))),
-                    row.get("memo", ""),
-                ]
-                hex_c = COLOR_OPTIONS.get(row.get("color", "Cyan"), "#00BCD4")
-                bg = QColor(hex_c)
-                bg.setAlpha(60)
-                is_own = str(row.get("assigned_to", "")) == self.state.user
-                # 実績(h) col=4, 担当者 col=7 は常に読み取り専用
-                _READONLY_COLS = {4, 7}
-                for c, val in enumerate(vals):
-                    item = QTableWidgetItem(str(val) if val is not None else "")
-                    if not is_own or c in _READONLY_COLS:
+                for c in range(self.table.columnCount()):
+                    item = QTableWidgetItem("")
+                    # タイトル列(0)のみ編集可、その他は読み取り専用
+                    if c != 0:
                         item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    item.setData(Qt.ItemDataRole.UserRole, idx)
-                    if row.get("status") in ("done",):
-                        item.setForeground(QColor("#9E9E9E"))
-                    else:
-                        item.setBackground(bg)
+                    item.setData(Qt.ItemDataRole.UserRole, "__new__")
                     self.table.setItem(r, c, item)
         finally:
             self.table.blockSignals(False)
             self._rebuilding = False
             self._update_dirty_indicator()
+            # 行が何も選択されていない場合は先頭の実データ行を選択（矢印キー操作のため）
+            if self.table.rowCount() > 0 and self.table.currentRow() < 0:
+                self.table.setCurrentCell(0, 0)
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         """セル編集時にデータを即時更新する"""
         if self._rebuilding:
             return
         idx = item.data(Qt.ItemDataRole.UserRole)
+        col = item.column()
+        value = item.text().strip()
+
+        # 空白行へのタイトル入力 → 新ノード作成
+        if idx == "__new__":
+            if col == 0 and value:
+                self._add_from_blank_row(value)
+            return
+
         if not idx or idx not in self.state.df_nodes.index:
             return
         # 自分のノードのみ編集可
         if self.state.df_nodes.loc[idx, "assigned_to"] != self.state.user:
             return
+
+        # タイトルを空白に変更した場合は無視（元の値に戻す）
+        if col == 0 and not value:
+            orig = str(self.state.df_nodes.loc[idx, "title"] or "")
+            self.table.blockSignals(True)
+            item.setText(orig)
+            self.table.blockSignals(False)
+            return
+
         col_map = {
             0: "title",
             1: "priority",
@@ -1581,37 +1612,75 @@ class TablePane(QWidget):
             6: "deadline",
             8: "memo",
         }
-        col = item.column()
         if col not in col_map:
             return
         field = col_map[col]
-        value = item.text().strip()
         try:
             if field == "priority":
                 value = int(value)
             elif field == "estimated_hours":
                 value = float(value)
+                if value < 0:
+                    raise ValueError("負の値不可")
             elif field == "status":
                 if value not in DB.STATUS_LIST:
                     return
         except (ValueError, TypeError):
+            # 数値変換不可の場合はセルを元の値に戻す
+            if field in ("estimated_hours", "priority"):
+                orig = self.state.df_nodes.loc[idx, field] \
+                    if idx in self.state.df_nodes.index else ""
+                self.table.blockSignals(True)
+                item.setText(str(orig) if orig != "" else "")
+                self.table.blockSignals(False)
             return
         self.state.df_nodes.loc[idx, field] = value
         self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
         self._mark_dirty()
-        # スケジュールに影響するフィールドが変更された場合はUI再描画（ツリー再構築なし）
-        if field in ("status", "estimated_hours", "actual_hours",
-                     "start_available", "deadline"):
-            self._rebuild_table()          # テーブル外観（done=グレー等）を更新
-            self.schedule_refresh.emit()   # スケジュールパネルのみリフレッシュ
+        # status 変更のみテーブル外観（done=グレー等）を再描画
+        if field == "status":
+            current_row = self.table.currentRow()
+            self._rebuild_table()
+            if 0 <= current_row < self.table.rowCount():
+                self.table.setCurrentCell(current_row, col)
+            self.schedule_refresh.emit()
+        elif field in ("actual_hours", "start_available", "deadline"):
+            self.schedule_refresh.emit()
         self.info.set_info(f"更新: {field} = {value}")
+        # タイトル列の編集後、次の行のタイトルセルに移動して編集開始する
+        if field == "title":
+            QTimer.singleShot(0, self._move_to_next_title_cell)
+        # 見積もり工数の編集後、一つ下の行（同列）を選択する
+        elif field == "estimated_hours":
+            QTimer.singleShot(0, self._move_to_next_est_cell)
+
+    def _move_to_next_title_cell(self) -> None:
+        """タイトル編集後に次の行のタイトルセルへ移動して編集開始する"""
+        row = self.table.currentRow()
+        next_row = row + 1
+        if 0 <= next_row < self.table.rowCount():
+            next_item = self.table.item(next_row, 0)
+            if next_item and (next_item.flags() & Qt.ItemFlag.ItemIsEditable):
+                self.table.setCurrentCell(next_row, 0)
+                self.table.editItem(next_item)
+
+    def _move_to_next_est_cell(self) -> None:
+        """見積もり工数編集後に一つ下の行の同列を選択状態にする"""
+        row = self.table.currentRow()
+        next_row = row + 1
+        if 0 <= next_row < self.table.rowCount():
+            self.table.setCurrentCell(next_row, 3)
 
     def _current_idx(self) -> Optional[str]:
         row = self.table.currentRow()
         if row < 0:
             return None
         item = self.table.item(row, 0)
-        return item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not item:
+            return None
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        # 空白行（新規入力行）は実ノードではないので None を返す
+        return None if idx == "__new__" else idx
 
     def _on_row_changed(self, row: int) -> None:
         item = self.table.item(row, 0)
@@ -1749,56 +1818,64 @@ class TablePane(QWidget):
             if item and (item.flags() & Qt.ItemFlag.ItemIsEditable):
                 self.table.edit(index)
 
-    def _on_add_quick(self) -> None:
-        """Ctrl+Enter: ダイアログなしで末尾に新しい行を即時追加する"""
+    def _focus_blank_row(self) -> None:
+        """末尾の空白行（新規入力行）にフォーカスして編集開始する"""
+        last_row = self.table.rowCount() - 1
+        if last_row >= 0:
+            item = self.table.item(last_row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == "__new__":
+                self.table.setCurrentCell(last_row, 0)
+                self.table.editItem(item)
+
+    def _get_child_type(self) -> Optional[str]:
+        """現在選択中の親ノードに対する子ノードタイプを返す。作成不可なら None。"""
         if not self._parent_idx:
-            return
-        if self._parent_idx not in self.state.df_nodes.index and self._parent_idx != "0":
-            return
-        parent_type = (
-            self.state.df_nodes.loc[self._parent_idx, "node_type"]
-            if self._parent_idx in self.state.df_nodes.index
-            else "project1"
-        )
-        child_type = DB.CHILD_TYPE.get(parent_type)
+            return None
+        if self._parent_idx == "0":
+            return "project1"
+        if self._parent_idx not in self.state.df_nodes.index:
+            return None
+        parent_type = self.state.df_nodes.loc[self._parent_idx, "node_type"]
+        return DB.CHILD_TYPE.get(parent_type)
+
+    def _add_from_blank_row(self, title: str) -> None:
+        """空白行にタイトルを入力した際、新ノードを作成してテーブルを再描画する。"""
+        child_type = self._get_child_type()
         if not child_type:
-            self.info.set_info("Ticket には子ノードを作成できません")
             return
         # 既存アイテムの priority を連番化してから末尾の優先度を求める
-        # （priority=99 のまま放置されているアイテムがある場合に正しい末尾番号を得るため）
         self._normalize_priorities(self._parent_idx)
         df = self.state.df_nodes
-        siblings = df[df["parent_id"] == self._parent_idx]
+        siblings = df[
+            (df["parent_id"] == self._parent_idx) & (df["status"] != "deleted")
+        ]
         max_priority = int(siblings["priority"].max()) + 1 if not siblings.empty else 1
         ds = DB.create_initial_node(
             owner=self.state.user,
             node_type=child_type,
-            title="",
+            title=title,
             parent_id=self._parent_idx,
             priority=max_priority,
         )
         ds["estimated_hours"] = 1.0
         ds["status"] = "todo"
-        new_idx = ds.name
         self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
         self._mark_dirty()
         self._rebuild_table()
-        # 追加した行のタイトル列に自動フォーカス
-        for r in range(self.table.rowCount()):
-            it = self.table.item(r, 0)
-            if it and it.data(Qt.ItemDataRole.UserRole) == new_idx:
-                self.table.setCurrentCell(r, 0)
-                self.table.editItem(it)
-                break
+        self.info.set_info(f"追加: {title}")
+        # 再描画後に末尾の空白行へ移動して連続入力できるようにする
+        QTimer.singleShot(0, self._focus_blank_row)
 
     def eventFilter(self, obj, event) -> bool:
-        """Alt+↑↓ でステータス列の値をサイクル / Delete で日付列をクリア"""
+        """キーボード操作のハンドリング"""
         if obj is self.table and event.type() == QEvent.Type.KeyPress:
             key = event.key()
             mod = event.modifiers()
+            row = self.table.currentRow()
+            col = self.table.currentColumn()
+
+            # Alt+↑↓ でステータス列の値をサイクル
             if mod & Qt.KeyboardModifier.AltModifier and key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
-                row = self.table.currentRow()
-                col = self.table.currentColumn()
                 if col == 2:  # Status 列
                     item = self.table.item(row, col)
                     if item and (item.flags() & Qt.ItemFlag.ItemIsEditable):
@@ -1811,16 +1888,89 @@ class TablePane(QWidget):
                             i = (i + 1) % len(status_list)
                         item.setText(status_list[i])
                         return True
-            elif key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and not mod:
-                row = self.table.currentRow()
-                col = self.table.currentColumn()
-                if col in {5, 6}:  # 開始可能日(5)・納期(6)列
+
+            # Tab: 次の編集可能セルへ移動
+            elif key == Qt.Key.Key_Tab and not mod:
+                self._navigate_editable_col(row, col, 1)
+                return True
+
+            # Shift+Tab (Backtab): 前の編集可能セルへ移動
+            elif key == Qt.Key.Key_Backtab:
+                self._navigate_editable_col(row, col, -1)
+                return True
+
+            elif not mod:
+                # Escape: 編集キャンセル後にテーブルのフォーカス・選択を維持
+                if key == Qt.Key.Key_Escape:
+                    self.table.setFocus()
+                    return True
+
+                # Delete/Backspace: 日付列をクリア
+                elif key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                    if col in {5, 6}:  # 開始可能日(5)・納期(6)列
+                        item = self.table.item(row, col)
+                        if item and (item.flags() & Qt.ItemFlag.ItemIsEditable):
+                            item.setText("")
+                            self._mark_dirty()
+                            return True
+
+                # Enter/Return: 選択セルの編集開始
+                elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                     item = self.table.item(row, col)
                     if item and (item.flags() & Qt.ItemFlag.ItemIsEditable):
-                        item.setText("")
-                        self._mark_dirty()
+                        self.table.editItem(item)
                         return True
+
+                # タイトル列(0): 印刷可能文字キー → 編集開始してキーをエディタに転送
+                elif col == 0 and Qt.Key.Key_Space <= key <= Qt.Key.Key_AsciiTilde:
+                    item = self.table.item(row, 0)
+                    if item and (item.flags() & Qt.ItemFlag.ItemIsEditable):
+                        self.table.editItem(item)
+                        focused = QApplication.focusWidget()
+                        if focused and focused is not self.table:
+                            QApplication.sendEvent(focused, event)
+                        return True
+
+                # 見積もり工数列(3): 数字キー → 上書き編集
+                elif col == 3 and Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+                    item = self.table.item(row, 3)
+                    if item and (item.flags() & Qt.ItemFlag.ItemIsEditable):
+                        self._pending_digit = chr(key)
+                        self.table.editItem(item)
+                        QTimer.singleShot(0, self._apply_digit_overwrite)
+                        return True
+
         return super().eventFilter(obj, event)
+
+    def _navigate_editable_col(self, row: int, col: int, direction: int) -> None:
+        """Tab / Shift+Tab で編集可能な次／前のセルに移動する。
+        行末（行頭）を超えた場合は次（前）の行の先頭（末尾）編集可能セルへ移動する。"""
+        total_rows = self.table.rowCount()
+        total_cols = self.table.columnCount()
+        r, c = row, col
+        for _ in range(total_rows * total_cols):
+            c += direction
+            if c >= total_cols:
+                c = 0
+                r += 1
+            elif c < 0:
+                c = total_cols - 1
+                r -= 1
+            if r < 0 or r >= total_rows:
+                return
+            item = self.table.item(r, c)
+            if item and (item.flags() & Qt.ItemFlag.ItemIsEditable):
+                self.table.setCurrentCell(r, c)
+                return
+
+    def _apply_digit_overwrite(self) -> None:
+        """見積もり工数列の数字キー入力を上書きでエディタに反映する"""
+        if not self._pending_digit:
+            return
+        focused = QApplication.focusWidget()
+        if focused and focused is not self.table and hasattr(focused, "setText"):
+            focused.setText(self._pending_digit)
+        self._pending_digit = None
 
 
 # ---------- 右ペイン：詳細フォームのみ ----------
