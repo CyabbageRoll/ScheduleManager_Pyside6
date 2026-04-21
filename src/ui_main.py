@@ -13,11 +13,11 @@ from PySide6.QtWidgets import (
     QFrame, QStackedWidget, QSizePolicy, QToolBar, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QSpinBox, QCheckBox,
     QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu,
-    QApplication,
+    QApplication, QStyle,
 )
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QDate, Signal, QEvent, QTimer, QUrl
+from PySide6.QtCore import Qt, QDate, Signal, QEvent, QTimer, QUrl, QRect
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QAction, QPen, QDesktopServices
 
 import db as DB
@@ -44,45 +44,111 @@ IDX_AIIMPORT = 10
 # ---------- 日次スケジュール用カスタムデリゲート ----------
 
 class _HourLineDelegate(QStyledItemDelegate):
-    """毎時00分の行の上に区切り線を描画し、同一チケットを囲むデリゲート"""
+    """案Bモダンカードスタイル: 毎時区切り・空スロット区切り・チケットカード描画"""
+
+    # チケット行はテキストを手動描画するため、initStyleOption でクリア
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        if index.column() == 1 and index.data(Qt.ItemDataRole.UserRole + 1):
+            option.text = ""   # super().paint() での描画を抑制
 
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
-        # 毎時区切り線
-        if index.data(Qt.ItemDataRole.UserRole) == "hour":
+
+        r = option.rect
+        col = index.column()
+
+        # ── 毎時区切り線（row % 4 == 0 = 00分の行）──
+        if index.row() % 4 == 0:
+            # 同一チケットが時間境界をまたいでいる場合は区切り線を非表示
+            skip_hour_line = False
+            if col == 1 and index.row() > 0:
+                cur_t = index.data(Qt.ItemDataRole.UserRole)
+                prev_t = index.sibling(index.row() - 1, 1).data(Qt.ItemDataRole.UserRole)
+                if cur_t and cur_t == prev_t:
+                    skip_hour_line = True
+            if not skip_hour_line:
+                painter.save()
+                pen = QPen(QColor("#90A4AE"))
+                pen.setWidth(1)
+                painter.setPen(pen)
+                painter.drawLine(r.topLeft(), r.topRight())
+                painter.restore()
+
+        # ── 時刻列: 行ごとの区切り線を常時描画 ──
+        if col == 0:
             painter.save()
-            pen = QPen(QColor("#5C6BC0"))
-            pen.setWidth(2)
-            painter.setPen(pen)
-            r = option.rect
-            painter.drawLine(r.topLeft(), r.topRight())
+            painter.setPen(QPen(QColor("#E8E8E8")))
+            painter.drawLine(r.bottomLeft(), r.bottomRight())
             painter.restore()
-        # 項目6: 同一チケットの囲み線（task列のみ: col==1）
-        if index.column() == 1:
-            pos = index.data(Qt.ItemDataRole.UserRole + 1)
-            if pos in ("first", "single", "last"):
-                painter.save()
-                pen = QPen(QColor("#5C6BC0"))
-                pen.setWidth(1)
-                painter.setPen(pen)
-                r = option.rect
-                # 左右の縦線（常時）
-                painter.drawLine(r.topLeft(), r.bottomLeft())
-                painter.drawLine(r.topRight(), r.bottomRight())
-                if pos in ("first", "single"):
-                    painter.drawLine(r.topLeft(), r.topRight())
-                if pos in ("last", "single"):
-                    painter.drawLine(r.bottomLeft(), r.bottomRight())
-                painter.restore()
-            elif pos == "middle":
-                painter.save()
-                pen = QPen(QColor("#5C6BC0"))
-                pen.setWidth(1)
-                painter.setPen(pen)
-                r = option.rect
-                painter.drawLine(r.topLeft(), r.bottomLeft())
-                painter.drawLine(r.topRight(), r.bottomRight())
-                painter.restore()
+            return
+
+        # ── タスク列のみ以下を処理 ──
+        pos = index.data(Qt.ItemDataRole.UserRole + 1)
+
+        if not pos:
+            # 空スロット: 下端に薄い区切り線（15分刻みが見えるように）
+            painter.save()
+            painter.setPen(QPen(QColor("#E8E8E8")))
+            painter.drawLine(r.bottomLeft(), r.bottomRight())
+            painter.restore()
+            return
+
+        # ── チケットカード描画 ──
+        bg_data = index.data(Qt.ItemDataRole.BackgroundRole)
+        if bg_data is not None:
+            c = bg_data.color() if hasattr(bg_data, "color") else QColor(bg_data)
+            stripe = QColor(c.red(), c.green(), c.blue(), 255)   # ソリッド
+            border = QColor(c.red(), c.green(), c.blue(), 180)
+        else:
+            stripe = QColor(77, 182, 172, 255)
+            border = QColor(77, 182, 172, 180)
+
+        painter.save()
+
+        # ① 連続行の境界隙間を 1px 拡張して埋める
+        gap_top    = 1 if pos in ("middle", "last")  else 0
+        gap_bottom = 1 if pos in ("first",  "middle") else 0
+        y_top  = r.top()    - gap_top
+        y_high = r.height() + gap_top + gap_bottom
+
+        # ② 左端のカラーストライプ（5px・シームレス）
+        painter.fillRect(QRect(r.left(), y_top, 5, y_high), stripe)
+
+        # ③ カード外枠
+        pen = QPen(border)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        x0 = r.left() + 5    # ストライプ右端
+        x1 = r.right() - 1   # 右端
+        y_b = y_top + y_high - 1
+        painter.drawLine(x0, y_top, x0, y_b)   # ストライプ右縦線（常時）
+        painter.drawLine(x1, y_top, x1, y_b)   # 右縦線（常時）
+        if pos in ("first", "single"):
+            painter.drawLine(r.left(), r.top(), x1, r.top())           # 上横線
+        if pos in ("last", "single"):
+            painter.drawLine(r.left(), r.bottom() - 1, x1, r.bottom() - 1)  # 下横線
+
+        # ④ テキストをストライプの右（7px オフセット）で再描画
+        text = index.data(Qt.ItemDataRole.DisplayRole)
+        if text:
+            is_sel = bool(option.state & QStyle.StateFlag.State_Selected)
+            text_color = (option.palette.highlightedText().color() if is_sel
+                          else option.palette.text().color())
+            # 親パス行はフォントを1pt小さくする
+            font = QFont(option.font)
+            if index.data(Qt.ItemDataRole.UserRole + 2) == "path":
+                font.setPointSize(max(font.pointSize() - 1, 6))
+            painter.setPen(text_color)
+            painter.setFont(font)
+            text_rect = r.adjusted(7, 1, -2, -1)
+            fm = painter.fontMetrics()
+            elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, text_rect.width())
+            painter.drawText(text_rect,
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                             elided)
+
+        painter.restore()
 
 
 # ---------- 日次スケジュールウィジェット ----------
@@ -164,7 +230,9 @@ class DailyScheduleWidget(QWidget):
         self.free_btn.setStyleSheet(STYLE_BUTTON)
         self.free_btn.clicked.connect(self._on_free)
         btn_row.addWidget(self.free_btn)
-        btn_row.addStretch()
+        self.wh_label = QLabel("─")
+        self.wh_label.setStyleSheet("font-size:7pt; color:#546E7A; padding-left:4px;")
+        btn_row.addWidget(self.wh_label, stretch=1)
         layout.addLayout(btn_row)
 
         # スケジュールテーブル（96行: 00:00〜23:45 の 15分刻み）
@@ -183,11 +251,12 @@ class DailyScheduleWidget(QWidget):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.schedule_table.setAlternatingRowColors(False)
-        self.schedule_table.verticalHeader().setDefaultSectionSize(14)
+        self.schedule_table.setShowGrid(False)  # グリッド線を非表示（カードのシームレス描画のため）
+        self.schedule_table.verticalHeader().setDefaultSectionSize(16)
         self.schedule_table.setStyleSheet(
-            "QTableWidget { gridline-color: #E8EAF6; border: 1px solid #9FA8DA;"
-            " font-size: 7pt; background: #FAFAFA; }"
-            "QTableWidget::item:selected { background: #7986CB; color: white; }"
+            "QTableWidget { border: 1px solid #CFD8DC;"
+            " font-size: 8pt; background: #FFFFFF; }"
+            "QTableWidget::item:selected { background: #B2DFDB; color: #004D40; }"
         )
         # デリゲートを設定（毎時00分に区切り線、同一チケットに囲み線を描画）
         self.schedule_table.setItemDelegate(_HourLineDelegate(self.schedule_table))
@@ -195,9 +264,10 @@ class DailyScheduleWidget(QWidget):
         # 時刻ラベルを設定（全行フル表示、毎時にスタイルを付与）
         hour_font = QFont()
         hour_font.setBold(True)
-        hour_font.setPointSize(7)
+        hour_font.setPointSize(8)
         sub_font = QFont()
-        sub_font.setPointSize(6)
+        sub_font.setPointSize(7)
+        _HOUR_BG = QColor("#ECEFF1")   # 毎時00分行の背景色（青灰系）
         for i in range(96):
             hh, mm = i // 4, (i % 4) * 15
             hh_next, mm_next = (i + 1) // 4, ((i + 1) % 4) * 15
@@ -207,17 +277,17 @@ class DailyScheduleWidget(QWidget):
             task_item = QTableWidgetItem("")
             task_item.setFlags(task_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             if mm == 0:
-                # 毎時00分: 太字・濃い青・薄い背景
+                # 毎時00分: 太字・スレートブルー・薄い青灰背景
                 item.setData(Qt.ItemDataRole.UserRole, "hour")
                 item.setFont(hour_font)
-                item.setForeground(QColor("#283593"))
-                item.setBackground(QColor("#EDE7F6"))
+                item.setForeground(QColor("#37474F"))
+                item.setBackground(_HOUR_BG)
                 task_item.setData(Qt.ItemDataRole.UserRole, "hour")
-                task_item.setBackground(QColor("#EDE7F6"))
+                task_item.setBackground(_HOUR_BG)
             else:
-                # サブ行: 小さめ・グレー
+                # サブ行: 少し小さめ・グレー
                 item.setFont(sub_font)
-                item.setForeground(QColor("#78909C"))
+                item.setForeground(QColor("#90A4AE"))
             self.schedule_table.setItem(i, 0, item)
             self.schedule_table.setItem(i, 1, task_item)
 
@@ -356,56 +426,26 @@ class DailyScheduleWidget(QWidget):
         df_nodes = self.state.df_nodes
 
         # 全スロットをクリア（前回の表示を消す）
+        _HOUR_BG = QColor("#ECEFF1")
         for i in range(96):
             item = self.schedule_table.item(i, 1)
             if item:
                 item.setText("")
-                item.setBackground(QColor("white"))
+                # 毎時00分行（i % 4 == 0）の背景は保持し、それ以外は白に戻す
+                item.setBackground(_HOUR_BG if i % 4 == 0 else QColor("white"))
                 item.setData(Qt.ItemDataRole.UserRole, None)
                 # 囲み線の位置マークもクリア（枠線が残らないようにする）
                 item.setData(Qt.ItemDataRole.UserRole + 1, "")
+                # パス行フラグもクリア
+                item.setData(Qt.ItemDataRole.UserRole + 2, "")
 
         if df.empty or sch_idx not in df.index:
+            self.wh_label.setText("─")
             return
 
         ds = df.loc[sch_idx]
-        current_ticket = ""
-        same_count = 0
-        display = [""] * 96
-        _ticket_title = ""  # 現在のチケットタイトル（キャッシュ）
 
-        for i, col in enumerate(DB.DAILY_TIME_COLS):
-            t_idx = ds[col] if col in ds.index else ""
-            if not t_idx:
-                # 空スロットで連続カウントをリセット
-                current_ticket = ""
-                same_count = 0
-                _ticket_title = ""
-                continue
-            if t_idx != current_ticket:
-                # 新しいチケットに切り替わった
-                current_ticket = t_idx
-                same_count = 0
-                _ticket_title = df_nodes.loc[t_idx, "title"] if t_idx in df_nodes.index else t_idx
-
-            if same_count == 0:
-                # 項目5: 1行目: P1~Taskのフルパスを / 区切りで表示
-                path_parts = []
-                if t_idx in df_nodes.index:
-                    pid = str(df_nodes.loc[t_idx, "parent_id"])
-                    while pid and pid != "0" and pid in df_nodes.index:
-                        path_parts.insert(0, str(df_nodes.loc[pid, "title"]))
-                        pid = str(df_nodes.loc[pid, "parent_id"])
-                display[i] = " / ".join(path_parts) if path_parts else f"[{_ticket_title}]"
-            elif same_count == 1:
-                # 2行目: チケットのタイトルを表示
-                display[i] = _ticket_title
-            else:
-                # 3行目以降: 継続マークを表示
-                display[i] = "↑"
-            same_count += 1
-
-        # 項目6: 各スロットのチケットグループ内位置を計算（デリゲートでの囲み線描画に使用）
+        # ── Step1: position_marks を先に計算 ──
         position_marks = [""] * 96
         for i, col in enumerate(DB.DAILY_TIME_COLS):
             t_idx_i = ds[col] if col in ds.index else ""
@@ -424,6 +464,42 @@ class DailyScheduleWidget(QWidget):
             else:
                 position_marks[i] = "middle"
 
+        # ── Step2: display を position_marks を使って計算 ──
+        # single   : チケット名のみ（親パス不要）
+        # first (row=0): チケット名（最重要情報を先頭へ）
+        # second (row=1): 親パス（コンテキスト情報）
+        # row 3+   : 空白（カードで視覚的に判断）
+        display = [""] * 96
+        is_path = [False] * 96   # 親パス行フラグ（フォントサイズを1pt小さくする）
+        current_ticket = ""
+        group_row = 0
+        for i, col in enumerate(DB.DAILY_TIME_COLS):
+            t_idx = ds[col] if col in ds.index else ""
+            if not t_idx:
+                current_ticket = ""
+                group_row = 0
+                continue
+            if t_idx != current_ticket:
+                current_ticket = t_idx
+                group_row = 0
+            title = df_nodes.loc[t_idx, "title"] if t_idx in df_nodes.index else t_idx
+            pos = position_marks[i]
+            if pos == "single":
+                display[i] = title
+            elif group_row == 0:
+                display[i] = title
+            elif group_row == 1:
+                path_parts: list = []
+                if t_idx in df_nodes.index:
+                    pid = str(df_nodes.loc[t_idx, "parent_id"])
+                    while pid and pid != "0" and pid in df_nodes.index:
+                        path_parts.insert(0, str(df_nodes.loc[pid, "title"]))
+                        pid = str(df_nodes.loc[pid, "parent_id"])
+                display[i] = " / ".join(path_parts) if path_parts else ""
+                is_path[i] = True   # 親パス行としてマーク
+            # row 3+ は "" のまま
+            group_row += 1
+
         for i in range(96):
             col = DB.DAILY_TIME_COLS[i]
             t_idx = ds[col] if col in ds.index else ""
@@ -433,13 +509,25 @@ class DailyScheduleWidget(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole, t_idx)
                 # 項目6: グループ内位置をアイテムに保存
                 item.setData(Qt.ItemDataRole.UserRole + 1, position_marks[i])
+                # 項目7: 親パス行フラグ（デリゲートでフォントサイズを縮小する）
+                item.setData(Qt.ItemDataRole.UserRole + 2, "path" if is_path[i] else "")
                 if t_idx and t_idx in df_nodes.index:
                     hex_c = COLOR_OPTIONS.get(
                         df_nodes.loc[t_idx, "color"], "#00BCD4"
                     )
                     bg = QColor(hex_c)
-                    bg.setAlpha(80)
+                    bg.setAlpha(110)   # カードの視認性向上
                     item.setBackground(bg)
+
+        # 勤務時間ラベルを更新
+        wh = LG.calc_working_hours(df, sch_idx)
+        if wh["total"] > 0:
+            wh_str = (f"{LG.col_to_hhmm(wh['from'])} 〜 "
+                      f"{LG.col_to_hhmm(wh['to'])} "
+                      f"[{wh['total']:.2f}h]")
+        else:
+            wh_str = "─"
+        self.wh_label.setText(wh_str)
 
     def _update_schedule_slots(self, rows: list, ticket_idx: str) -> None:
         """指定スロットにチケットを割り当て（または空欄に）する"""

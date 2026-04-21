@@ -2106,7 +2106,7 @@ class TeamLogView(QWidget):
             if wh["total"] > 0:
                 wh_str = (f"{LG.col_to_hhmm(wh['from'])} 〜 "
                           f"{LG.col_to_hhmm(wh['to'])} "
-                          f"[{wh['total']:.1f}h] (休{wh['break']:.1f}h)")
+                          f"[{wh['total']:.2f}h] (休{wh['break']:.2f}h)")
             else:
                 wh_str = "-"
             place = overwork = health = safety = notes = ""
