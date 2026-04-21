@@ -364,7 +364,7 @@ def _get_os_login() -> str:
 
 
 # デバッグモードで「自分」として扱うテスト用 ID（id001 = 山田）
-DEBUG_YAMADA_ID = "id003"
+DEBUG_YAMADA_ID = "id001"
 
 
 def main() -> None:

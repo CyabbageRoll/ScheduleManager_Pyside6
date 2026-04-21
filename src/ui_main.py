@@ -148,6 +148,12 @@ class DailyScheduleWidget(QWidget):
         # 常時メモは編集完了時（フォーカス移動・Enterキー）に自動保存
         self.f_notes_ever.editingFinished.connect(self._on_save_permanent)
 
+        # 日次ログは選択変更・入力確定のたびに自動保存
+        for combo in (self.f_health, self.f_work_place, self.f_safety, self.f_overwork):
+            combo.activated.connect(lambda _: self._on_save_log())
+            combo.lineEdit().editingFinished.connect(self._on_save_log)
+        self.f_notes.editingFinished.connect(self._on_save_log)
+
         layout.addWidget(input_frame)
 
         layout.addWidget(QLabel("📅 日次スケジュール"))
@@ -356,6 +362,8 @@ class DailyScheduleWidget(QWidget):
                 item.setText("")
                 item.setBackground(QColor("white"))
                 item.setData(Qt.ItemDataRole.UserRole, None)
+                # 囲み線の位置マークもクリア（枠線が残らないようにする）
+                item.setData(Qt.ItemDataRole.UserRole + 1, "")
 
         if df.empty or sch_idx not in df.index:
             return
@@ -702,8 +710,7 @@ class MainWindow(QMainWindow):
                   self.config_view, self.ai_import_view]:
             self.stack.addWidget(w)
 
-        # シグナル接続：チケット選択 → スケジュールパネルへ
-        self.main_pane.table_pane.node_selected.connect(self.schedule_panel.assign_ticket)
+        # シグナル接続：チケット選択 → スケジュールパネルへ（ガントチャートからのみ）
         # インライン編集後の軽量リフレッシュ（ツリー再構築なし）
         self.main_pane.table_pane.schedule_refresh.connect(self.schedule_panel.refresh)
         self.gantt_view.ticket_clicked.connect(self.schedule_panel.assign_ticket)

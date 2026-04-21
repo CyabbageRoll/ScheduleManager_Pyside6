@@ -2081,12 +2081,12 @@ class TeamLogView(QWidget):
         # 勤務時間表
         layout.addWidget(QLabel("本日の勤務状況"))
         WORK_COLS = ["メンバー", "勤務時間", "勤務場所", "残業", "健康状態"]
-        self.work_table = ScrollableTable(WORK_COLS, [120, 200, 90, 60, 80])
+        self.work_table = ScrollableTable(WORK_COLS, [120, 200, 110, 80, 110])
         layout.addWidget(self.work_table, stretch=1)
 
         layout.addWidget(QLabel("連絡事項 / 備考"))
-        INFO_COLS = ["メンバー", "安全確認", "今日", "常時"]
-        self.info_table = ScrollableTable(INFO_COLS, [120, 80, 200, 200])
+        INFO_COLS = ["メンバー", "安全宣言", "連絡事項(本日)", "連絡事項(常時)"]
+        self.info_table = ScrollableTable(INFO_COLS, [120, 90, 250, 300])
         layout.addWidget(self.info_table, stretch=1)
 
         self.info_lbl = InfoLabel()
