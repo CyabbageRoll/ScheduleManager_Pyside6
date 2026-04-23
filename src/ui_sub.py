@@ -1178,9 +1178,9 @@ class RoadmapView(QWidget):
             return result
         slot_cols = [c for c in df_daily.columns
                      if c.startswith("C") and len(c) == 5 and c[1:].isdigit()]
-        for _, row in df_daily.iterrows():
-            idx_str = str(row.get("IDX", ""))
-            # IDX 形式: "2026-03-16-UserName"
+        for idx_str, row in df_daily.iterrows():
+            # IDX はインデックス（列ではない）: "2026-03-16-UserName" 形式
+            idx_str = str(idx_str)
             parts = idx_str.split("-")
             if len(parts) < 3:
                 continue
@@ -1491,15 +1491,18 @@ class RoadmapView(QWidget):
 
                 if ps.weekday() >= 5 and self._cell_unit == "日":
                     cell.setBackground(QColor("#F0F0F0"))
-                elif status not in ("done", "cancel"):
+                else:
+                    # 計画バー: done/cancel は描画しない
                     plan_ov = False
-                    if start_avail and deadline:
-                        plan_ov = start_avail <= pe and deadline >= ps
-                    elif start_avail:
-                        plan_ov = start_avail <= pe
-                    elif deadline:
-                        plan_ov = deadline >= ps
+                    if status not in ("done", "cancel"):
+                        if start_avail and deadline:
+                            plan_ov = start_avail <= pe and deadline >= ps
+                        elif start_avail:
+                            plan_ov = start_avail <= pe
+                        elif deadline:
+                            plan_ov = deadline >= ps
 
+                    # 実績バー: ステータスに関係なく描画
                     act_ov = any(ps <= ad <= pe for ad in item_actual_dates)
 
                     if plan_ov and act_ov:
@@ -1516,8 +1519,10 @@ class RoadmapView(QWidget):
                                 cell.setText("🏁")
                     else:
                         cell.setBackground(bg)
-                else:
-                    cell.setForeground(QColor("#BDBDBD"))
+
+                    # done/cancel は文字を灰色にして完了済みであることを示す
+                    if status in ("done", "cancel"):
+                        cell.setForeground(QColor("#9E9E9E"))
 
                 self.table.setItem(r, self._FIXED_COLS + ci, cell)
 
