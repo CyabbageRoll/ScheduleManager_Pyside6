@@ -1543,6 +1543,29 @@ class _StatusDelegate(QStyledItemDelegate):
         editor.setGeometry(option.rect)
 
 
+class _ColorDelegate(QStyledItemDelegate):
+    """色列用デリゲート：セルクリック時にカラーコンボボックスを表示する"""
+
+    def createEditor(self, parent, option, index):
+        combo = QComboBox(parent)
+        for name, hex_val in COLOR_OPTIONS.items():
+            combo.addItem(name)
+            combo.setItemData(combo.count() - 1, QColor(hex_val), Qt.ItemDataRole.DecorationRole)
+        return combo
+
+    def setEditorData(self, editor, index):
+        val = index.data(Qt.ItemDataRole.EditRole) or "Cyan"
+        i = editor.findText(val)
+        if i >= 0:
+            editor.setCurrentIndex(i)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText(), Qt.ItemDataRole.EditRole)
+
+    def updateEditorGeometry(self, editor, option, index):
+        editor.setGeometry(option.rect)
+
+
 class _DateClearWidget(QWidget):
     """QDateEdit（カレンダーポップアップ付き）と × クリアボタンを一体化したデリゲート用ウィジェット"""
 
@@ -1645,6 +1668,7 @@ class TablePane(QWidget):
             ("🗑 削除",   self._on_delete),
             ("▲ 上へ",   self._on_move_up),
             ("▼ 下へ",   self._on_move_down),
+            ("色伝播",    self._on_propagate_color),
         ]:
             _btn = QPushButton(_lbl)
             _btn.setStyleSheet(STYLE_BUTTON)
@@ -1655,7 +1679,7 @@ class TablePane(QWidget):
 
         # テーブル（直接編集可）
         COLS = ["タイトル", "順序", "ステータス", "見積(h)", "実績(h)",
-                "開始可能日", "納期", "担当者", "メモ"]
+                "開始可能日", "納期", "担当者", "色", "メモ"]
         self.table = QTableWidget(0, len(COLS))
         self.table.setHorizontalHeaderLabels(COLS)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1680,14 +1704,15 @@ class TablePane(QWidget):
             "QTableWidget::item:selected { background: #B3E5FC; color: black; }"
         )
         self.table.itemChanged.connect(self._on_item_changed)
-        widths = [180, 60, 80, 65, 65, 100, 100, 90, 120]
+        widths = [180, 60, 80, 65, 65, 100, 100, 90, 70, 120]
         for i, w in enumerate(widths):
             self.table.setColumnWidth(i, w)
 
-        # デリゲート設定（Status列=2、日付列=5,6）
+        # デリゲート設定（Status列=2、日付列=5,6、色列=8）
         self.table.setItemDelegateForColumn(2, _StatusDelegate(self.table))
         self.table.setItemDelegateForColumn(5, _DateDelegate(self.table))
         self.table.setItemDelegateForColumn(6, _DateDelegate(self.table))
+        self.table.setItemDelegateForColumn(8, _ColorDelegate(self.table))
 
         # Alt+↑↓ でステータス列の値をサイクル
         self.table.installEventFilter(self)
@@ -1779,6 +1804,7 @@ class TablePane(QWidget):
                 for idx, row in children.iterrows():
                     r = self.table.rowCount()
                     self.table.insertRow(r)
+                    color_name = str(row.get("color", "Cyan") or "Cyan")
                     vals = [
                         row.get("title", ""),
                         row.get("priority", ""),
@@ -1788,9 +1814,10 @@ class TablePane(QWidget):
                         row.get("start_available", ""),
                         row.get("deadline", ""),
                         self.state.display_name(str(row.get("assigned_to", ""))),
+                        color_name,
                         row.get("memo", ""),
                     ]
-                    hex_c = COLOR_OPTIONS.get(row.get("color", "Cyan"), "#00BCD4")
+                    hex_c = COLOR_OPTIONS.get(color_name, "#00BCD4")
                     bg = QColor(hex_c)
                     bg.setAlpha(60)
                     is_own = str(row.get("assigned_to", "")) == self.state.user
@@ -1861,7 +1888,8 @@ class TablePane(QWidget):
             3: "estimated_hours",
             5: "start_available",
             6: "deadline",
-            8: "memo",
+            8: "color",
+            9: "memo",
         }
         if col not in col_map:
             return
@@ -1876,6 +1904,9 @@ class TablePane(QWidget):
             elif field == "status":
                 if value not in DB.STATUS_LIST:
                     return
+            elif field == "color":
+                if value not in COLOR_OPTIONS:
+                    return
         except (ValueError, TypeError):
             # 数値変換不可の場合はセルを元の値に戻す
             if field in ("estimated_hours", "priority"):
@@ -1888,13 +1919,14 @@ class TablePane(QWidget):
         self.state.df_nodes.loc[idx, field] = value
         self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
         self._mark_dirty()
-        # status 変更のみテーブル外観（done=グレー等）を再描画
-        if field == "status":
+        # status/color 変更はテーブル外観（背景色等）を再描画
+        if field in ("status", "color"):
             current_row = self.table.currentRow()
             self._rebuild_table()
             if 0 <= current_row < self.table.rowCount():
                 self.table.setCurrentCell(current_row, col)
-            self.schedule_refresh.emit()
+            if field == "status":
+                self.schedule_refresh.emit()
         elif field in ("actual_hours", "start_available", "deadline"):
             self.schedule_refresh.emit()
         self.info.set_info(f"更新: {field} = {value}")
@@ -1960,11 +1992,17 @@ class TablePane(QWidget):
             return
         # テーブルの現在の行数 + 1 をデフォルト priority にする（連番化済みのテーブルと一致）
         default_priority = self.table.rowCount() + 1
+        # 親の色をデフォルト色として取得
+        df = self.state.df_nodes
+        default_color = "Cyan"
+        if self._parent_idx and self._parent_idx in df.index:
+            default_color = str(df.loc[self._parent_idx, "color"] or "Cyan")
         dlg = _NodeEditDialog(
             parent_idx=self._parent_idx,
             node_type=child_type,
             state=self.state,
             default_priority=default_priority,
+            default_color=default_color,
             parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -2022,6 +2060,51 @@ class TablePane(QWidget):
     def _on_move_up(self)   -> None: self._swap_adjacent(-1)
     def _on_move_down(self) -> None: self._swap_adjacent(+1)
 
+    def _on_propagate_color(self) -> None:
+        """選択アイテムの色を子孫に伝播する（Task以上のノードのみ）"""
+        idx = self._current_idx()
+        if not idx or idx not in self.state.df_nodes.index:
+            QMessageBox.information(self, "情報", "ノードをテーブルから選択してください")
+            return
+        row = self.state.df_nodes.loc[idx]
+        node_type = str(row.get("node_type", ""))
+        if node_type == "ticket":
+            QMessageBox.information(self, "情報", "Ticketには子ノードがないため伝播できません")
+            return
+        color = str(row.get("color", "Cyan") or "Cyan")
+        title = str(row.get("title", ""))
+
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("色伝播")
+        dlg.setText(f"「{title}」の色（{color}）を子孫に伝播します")
+        btn_children = dlg.addButton("子のみ", QMessageBox.ButtonRole.AcceptRole)
+        btn_all = dlg.addButton("全子孫（再帰）", QMessageBox.ButtonRole.ActionRole)
+        dlg.addButton(QMessageBox.StandardButton.Cancel)
+        dlg.exec()
+
+        clicked = dlg.clickedButton()
+        if clicked not in (btn_children, btn_all):
+            return
+        recursive = (clicked == btn_all)
+        self._apply_color_propagation(idx, color, recursive)
+        self._mark_dirty()
+        self._rebuild_table()
+
+    def _apply_color_propagation(self, parent_id: str, color: str, recursive: bool) -> None:
+        """parent_id の直下子（自分担当）の色を color に変更する。recursive なら再帰的に子孫全員に適用。"""
+        df = self.state.df_nodes
+        today = datetime.date.today().isoformat()
+        children = df[
+            (df["parent_id"] == parent_id) &
+            (df["status"] != "deleted") &
+            (df["assigned_to"] == self.state.user)
+        ]
+        for child_idx in children.index:
+            df.loc[child_idx, "color"] = color
+            df.loc[child_idx, "updated_at"] = today
+            if recursive:
+                self._apply_color_propagation(child_idx, color, True)
+
     def _swap_adjacent(self, direction: int) -> None:
         """現在行と隣接行の priority を入れ替えて配列の順序を変更し、DB に即時保存する。"""
         row = self.table.currentRow()
@@ -2065,8 +2148,8 @@ class TablePane(QWidget):
         self.table.blockSignals(False)
 
     def _on_cell_clicked_for_edit(self, index) -> None:
-        """ステータス(2)・開始可能日(5)・納期(6) 列はシングルクリックでエディタを開く"""
-        if index.column() in {2, 5, 6}:
+        """ステータス(2)・開始可能日(5)・納期(6)・色(8) 列はシングルクリックでエディタを開く"""
+        if index.column() in {2, 5, 6, 8}:
             item = self.table.item(index.row(), index.column())
             if item and (item.flags() & Qt.ItemFlag.ItemIsEditable):
                 self.table.edit(index)
@@ -2119,6 +2202,10 @@ class TablePane(QWidget):
             (df["parent_id"] == self._parent_idx) & (df["status"] != "deleted")
         ]
         max_priority = int(siblings["priority"].max()) + 1 if not siblings.empty else 1
+        # 親の色を引き継ぐ
+        parent_color = "Cyan"
+        if self._parent_idx and self._parent_idx in df.index:
+            parent_color = str(df.loc[self._parent_idx, "color"] or "Cyan")
         ds = DB.create_initial_node(
             owner=self.state.user,
             node_type=child_type,
@@ -2128,6 +2215,7 @@ class TablePane(QWidget):
         )
         ds["estimated_hours"] = 1.0
         ds["status"] = "todo"
+        ds["color"] = parent_color
         self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
         self._mark_dirty()
         self.info.set_info(f"追加: {title}")
@@ -2313,7 +2401,7 @@ class DetailPane(QWidget):
 class _NodeEditDialog(QDialog):
     def __init__(self, parent_idx: Optional[str], node_type: Optional[str],
                  state, edit_idx: Optional[str] = None,
-                 default_priority: int = 99, parent=None):
+                 default_priority: int = 99, default_color: str = "Cyan", parent=None):
         super().__init__(parent)
         self.state = state
         self._parent_idx = parent_idx
@@ -2387,7 +2475,7 @@ class _NodeEditDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-        # 編集時は既存値を読み込む
+        # 編集時は既存値、新規作成時は default_color を適用
         if is_edit:
             row = state.df_nodes.loc[edit_idx]
             self.f_title.setText(str(row.get("title", "")))
@@ -2400,6 +2488,8 @@ class _NodeEditDialog(QDialog):
             self.f_deadline.set_date(str(row.get("deadline", "") or ""))
             self.f_color.set_color(str(row.get("color", "Cyan")))
             self.f_memo.setPlainText(str(row.get("memo", "")))
+        else:
+            self.f_color.set_color(default_color)
 
     def _on_accept(self) -> None:
         if not self.f_title.text().strip():

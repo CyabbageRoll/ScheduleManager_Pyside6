@@ -3065,17 +3065,21 @@ class ConfigView(QWidget):
 
 class AIImportView(QWidget):
     """
-    AI取込タブ：LLMにクリップボード経由で指示を渡し、
-    返答を取り込んでノードを自動作成する。
+    AI取込タブ：LLMにクリップボード経由で指示を渡し、返答を取り込む。
 
-    ① 指示メッセージ取得: テンプレート + 既存プロジェクト一覧をクリップボードにコピー
-    ② 取り込み: LLM返答をパースして確認ダイアログ → DB登録 → Edit タブへ移動
+    【チケット取り込み】
+    ① チケット作成プロンプト: テンプレート + Task一覧をクリップボードにコピー
+    ② チケット取り込み: ```items ブロックをパース → 確認ダイアログ → DB登録
+
+    【日次スケジュール取り込み】
+    ③ 日次スケジュール作成プロンプト: テンプレート + チケット一覧をクリップボードにコピー
+    ④ 日次スケジュール取り込み: ```schedule ブロックをパース → 競合確認 → df_daily 更新
     """
 
     import_done = Signal(list)  # 取り込んだ IDX のリスト
 
-    # llm_msg.md のパス（docs/ 以下）
-    _TEMPLATE_PATH = Path(__file__).parent / "documents" / "llm_msg.md"
+    _TEMPLATE_PATH          = Path(__file__).parent / "documents" / "llm_msg.md"
+    _SCHEDULE_TEMPLATE_PATH = Path(__file__).parent / "documents" / "llm_schedule.md"
 
     def __init__(self, state):
         """AI取込ビューを初期化する"""
@@ -3086,28 +3090,44 @@ class AIImportView(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # ── ボタン行 ──
-        btn_row = QHBoxLayout()
-        btn_get = QPushButton("📋 指示メッセージ取得")
-        btn_get.setStyleSheet(STYLE_BUTTON)
-        btn_get.setToolTip("テンプレート + 既存プロジェクト一覧をクリップボードにコピー")
-        btn_get.clicked.connect(self._on_get_prompt)
-        btn_row.addWidget(btn_get)
+        # ── チケット取り込みボタン行 ──
+        ticket_row = QHBoxLayout()
+        btn_ticket_prompt = QPushButton("📋 チケット作成プロンプト")
+        btn_ticket_prompt.setStyleSheet(STYLE_BUTTON)
+        btn_ticket_prompt.setToolTip("テンプレート + Task一覧をクリップボードにコピー")
+        btn_ticket_prompt.clicked.connect(self._on_get_ticket_prompt)
+        ticket_row.addWidget(btn_ticket_prompt)
 
-        btn_import = QPushButton("📥 取り込み")
-        btn_import.setStyleSheet(STYLE_BUTTON)
-        btn_import.setToolTip("テキストエリアの内容を解析してアイテムを登録")
-        btn_import.clicked.connect(self._on_import)
-        btn_row.addWidget(btn_import)
+        btn_ticket_import = QPushButton("📥 チケット取り込み")
+        btn_ticket_import.setStyleSheet(STYLE_BUTTON)
+        btn_ticket_import.setToolTip("テキストエリアの ```items ブロックを解析してチケットを登録")
+        btn_ticket_import.clicked.connect(self._on_import_tickets)
+        ticket_row.addWidget(btn_ticket_import)
+        ticket_row.addStretch()
+        layout.addLayout(ticket_row)
 
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
+        # ── 日次スケジュールボタン行 ──
+        schedule_row = QHBoxLayout()
+        btn_sch_prompt = QPushButton("📅 日次スケジュール作成プロンプト")
+        btn_sch_prompt.setStyleSheet(STYLE_BUTTON)
+        btn_sch_prompt.setToolTip("テンプレート + チケット一覧をクリップボードにコピー")
+        btn_sch_prompt.clicked.connect(self._on_get_schedule_prompt)
+        schedule_row.addWidget(btn_sch_prompt)
+
+        btn_sch_import = QPushButton("📥 日次スケジュール取り込み")
+        btn_sch_import.setStyleSheet(STYLE_BUTTON)
+        btn_sch_import.setToolTip("テキストエリアの ```schedule ブロックを解析してスケジュールを登録")
+        btn_sch_import.clicked.connect(self._on_import_schedule)
+        schedule_row.addWidget(btn_sch_import)
+        schedule_row.addStretch()
+        layout.addLayout(schedule_row)
 
         # ── テキストエリア ──
         self.text_edit = QPlainTextEdit()
         self.text_edit.setPlaceholderText(
             "LLM の返答をここに貼り付けてください。\n"
-            "```items ブロックを含む返答を認識します。"
+            "チケット取り込み: ```items ブロックを認識します。\n"
+            "日次スケジュール取り込み: ```schedule ブロックを認識します。"
         )
         self.text_edit.setStyleSheet(
             "QPlainTextEdit { font-family: monospace; font-size: 9pt; }"
@@ -3117,30 +3137,33 @@ class AIImportView(QWidget):
         self.info = InfoLabel()
         layout.addWidget(self.info)
 
-    # ── 指示メッセージ生成 ──
+    # ── チケット作成プロンプト ──
 
-    def _on_get_prompt(self) -> None:
-        """テンプレートに既存プロジェクト一覧を付加してクリップボードにコピーする"""
+    def _on_get_ticket_prompt(self) -> None:
+        """テンプレートに Task 一覧を付加してクリップボードにコピーする"""
         try:
             template = self._TEMPLATE_PATH.read_text(encoding="utf-8")
         except Exception as e:
             self.info.set_error(f"テンプレート読み込みエラー: {e}")
             return
-
-        project_list = self._build_project_list()
-        msg = template + "\n\n" + project_list
+        task_list = self._build_task_list()
+        msg = template + "\n\n" + task_list
         QApplication.clipboard().setText(msg)
-        self.info.set_info("指示メッセージをクリップボードにコピーしました")
+        self.info.set_info("チケット作成プロンプトをクリップボードにコピーしました")
 
-    def _build_project_list(self) -> str:
-        """既存アイテム一覧を IDX・種別・タイトル・階層パスの形式で文字列化する"""
+    def _build_task_list(self) -> str:
+        """Task一覧（IDX | タイトル | 階層パス）を文字列化する"""
         df = self.state.df_nodes
         if df.empty:
-            return "【既存アイテム一覧】\n（アイテムなし）"
+            return "【Task一覧】\n（Taskなし）"
 
-        lines = ["【既存アイテム一覧（IDX | 種別 | タイトル | 階層パス）】"]
-        # deleted を除外し priority 順に表示
-        visible = df[~df["status"].isin(["deleted"])].copy()
+        tasks = df[
+            (df["node_type"] == "task") & (~df["status"].isin(["deleted"]))
+        ].copy()
+        if tasks.empty:
+            return "【Task一覧】\n（Taskなし）"
+
+        lines = ["【Task一覧（IDX | タイトル | 階層パス）】"]
 
         def _path(idx: str) -> str:
             parts = []
@@ -3150,18 +3173,17 @@ class AIImportView(QWidget):
                 pid = str(df.loc[pid, "parent_id"])
             return " > ".join(parts) if parts else "(ルート)"
 
-        for idx, row in visible.iterrows():
-            ntype = str(row.get("node_type", ""))
+        for idx, row in tasks.iterrows():
             title = str(row.get("title", ""))
-            path  = _path(str(idx))
-            lines.append(f"  {idx} | {ntype} | {title} | {path}")
+            path = _path(str(idx))
+            lines.append(f"  {idx} | {title} | {path}")
 
         return "\n".join(lines)
 
-    # ── 取り込み ──
+    # ── チケット取り込み ──
 
-    def _on_import(self) -> None:
-        """テキストエリアの LLM 返答をパースし、確認後に DB へ登録する"""
+    def _on_import_tickets(self) -> None:
+        """テキストエリアの LLM 返答をパースし、チケットを DB へ登録する"""
         text = self.text_edit.toPlainText().strip()
         if not text:
             self.info.set_error("テキストが空です")
@@ -3175,40 +3197,26 @@ class AIImportView(QWidget):
             self.info.set_error("取り込める内容が見つかりませんでした")
             return
 
-        # 確認ダイアログ（プレビュー）
         preview = "\n".join(
-            f"{i}. [{it['node_type']}] {it['title']}  (parent: {it['parent_idx']})"
+            f"{i}. {it['title']}  (Task: {it['parent_idx']})"
             for i, it in enumerate(items, 1)
         )
         reply = QMessageBox.question(
-            self, "取り込み確認",
-            f"{len(items)} 件を取り込みます。よろしいですか？\n\n{preview}",
+            self, "チケット取り込み確認",
+            f"{len(items)} 件のチケットを取り込みます。よろしいですか？\n\n{preview}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # DB 登録
         imported_idxs = []
         for it in items:
-            parent_idx = it["parent_idx"]
-            node_type  = it["node_type"]
-            # 親種別に合わせて子種別を自動補正
-            df = self.state.df_nodes
-            if parent_idx != "0" and parent_idx in df.index:
-                parent_type    = str(df.loc[parent_idx, "node_type"])
-                expected_child = DB.CHILD_TYPE.get(parent_type)
-                if expected_child and expected_child != node_type:
-                    node_type = expected_child
-
             ds = DB.create_initial_node(
                 owner=self.state.user,
-                node_type=node_type,
+                node_type="ticket",
                 title=it["title"],
-                parent_id=parent_idx,
+                parent_id=it["parent_idx"],
             )
-            if it.get("assigned_to"):
-                ds["assigned_to"] = it["assigned_to"]
             if it.get("deadline"):
                 ds["deadline"] = it["deadline"]
             if it.get("memo"):
@@ -3225,31 +3233,28 @@ class AIImportView(QWidget):
 
     def _parse_llm_response(self, text: str) -> tuple:
         """
-        LLM 返答から ```items ブロックを抽出し、アイテムリストとエラーリストを返す。
+        LLM 返答から ```items ブロックを抽出してチケットリストを返す。
 
         フォーマット:
             ```items
-            title: タイトル
-            parent_idx: <IDX>
-            node_type: task|ticket|...
-            assigned_to: ユーザー名（省略可）
+            title: タイトル（必須）
+            parent_idx: 親Task の IDX（必須）
             deadline: YYYY-MM-DD（省略可）
             memo: メモ（省略可）
+            comment: LLM の説明（読み飛ばす）
             ---
-            （複数アイテムは --- で区切る）
             ```
         """
         items: list = []
         errors: list = []
         df = self.state.df_nodes
 
-        # ```items ... ``` ブロックを抽出
         match = re.search(r"```items\s*(.*?)```", text, re.DOTALL)
         if not match:
             errors.append("```items ... ``` ブロックが見つかりません")
             return items, errors
 
-        block   = match.group(1).strip()
+        block = match.group(1).strip()
         entries = [e.strip() for e in block.split("---") if e.strip()]
 
         for entry in entries:
@@ -3259,31 +3264,280 @@ class AIImportView(QWidget):
                     key, _, val = line.partition(":")
                     item[key.strip()] = val.strip()
 
-            # 必須フィールド検証
             if not item.get("title"):
                 errors.append("title が空のエントリがあります")
                 continue
             if not item.get("parent_idx"):
                 errors.append(f"parent_idx が空: {item.get('title', '?')}")
                 continue
-            if not item.get("node_type"):
-                errors.append(f"node_type が空: {item.get('title', '?')}")
-                continue
 
-            # parent_idx の存在確認
             parent_idx = item["parent_idx"]
-            if parent_idx != "0" and parent_idx not in df.index:
+            if parent_idx not in df.index:
                 errors.append(f"parent_idx が存在しません: {parent_idx} (title: {item.get('title')})")
                 continue
-
-            # node_type の確認
-            if item["node_type"] not in DB.NODE_TYPES:
-                errors.append(f"不正な node_type: {item['node_type']} (title: {item.get('title')})")
+            if str(df.loc[parent_idx, "node_type"]) != "task":
+                errors.append(f"parent_idx の種別が task ではありません: {parent_idx} (title: {item.get('title')})")
                 continue
 
             items.append(item)
 
         return items, errors
+
+    # ── 日次スケジュール作成プロンプト ──
+
+    def _on_get_schedule_prompt(self) -> None:
+        """テンプレートにチケット一覧を付加してクリップボードにコピーする"""
+        try:
+            template = self._SCHEDULE_TEMPLATE_PATH.read_text(encoding="utf-8")
+        except Exception as e:
+            self.info.set_error(f"テンプレート読み込みエラー: {e}")
+            return
+        today = datetime.date.today().isoformat()
+        ticket_list = self._build_ticket_list()
+        msg = template.replace("{TODAY}", today) + "\n\n" + ticket_list
+        QApplication.clipboard().setText(msg)
+        self.info.set_info("日次スケジュール作成プロンプトをクリップボードにコピーしました")
+
+    def _build_ticket_list(self) -> str:
+        """自分の未完了チケット一覧（IDX | タイトル | 親Task名）を文字列化する"""
+        df = self.state.df_nodes
+        if df.empty:
+            return "【チケット一覧】\n（チケットなし）"
+
+        tickets = df[
+            (df["node_type"] == "ticket") &
+            (~df["status"].isin(["deleted", "done", "cancel"])) &
+            (df["assigned_to"] == self.state.user)
+        ].copy()
+
+        if tickets.empty:
+            return "【チケット一覧】\n（未完了チケットなし）"
+
+        lines = ["【チケット一覧（IDX | タイトル | 親Task）】"]
+        for idx, row in tickets.iterrows():
+            title = str(row.get("title", ""))
+            parent_id = str(row.get("parent_id", ""))
+            task_name = str(df.loc[parent_id, "title"]) if parent_id in df.index else ""
+            lines.append(f"  {idx} | {title} | {task_name}")
+
+        return "\n".join(lines)
+
+    # ── 日次スケジュール取り込み ──
+
+    def _on_import_schedule(self) -> None:
+        """テキストエリアの ```schedule ブロックをパースして日次スケジュールを更新する"""
+        text = self.text_edit.toPlainText().strip()
+        if not text:
+            self.info.set_error("テキストが空です")
+            return
+
+        date_str, items, errors = self._parse_schedule_response(text)
+        if errors:
+            self.info.set_error("パースエラー: " + " / ".join(errors))
+            return
+        if not date_str or not items:
+            self.info.set_error("取り込める内容が見つかりませんでした")
+            return
+
+        df_nodes = self.state.df_nodes
+        sch_idx = DB.daily_sch_idx(date_str, self.state.user)
+
+        # 日付行が存在しなければ作成
+        if self.state.df_daily.empty or sch_idx not in self.state.df_daily.index:
+            new_row = {c: "" for c in DB.DAILY_SCH_COLS[1:]}
+            new_row["Owner"] = self.state.user
+            new_row["Last_Update"] = datetime.date.today().isoformat()
+            self.state.df_daily.loc[sch_idx] = new_row
+
+        imported_count = 0
+        for it in items:
+            ticket_idx = it["ticket_idx"]
+            from_col = it["from_col"]
+            to_col = it["to_col"]
+
+            if ticket_idx not in df_nodes.index:
+                self.info.set_error(f"ticket_idx が見つかりません: {ticket_idx}")
+                continue
+
+            from_i = DB.DAILY_TIME_COLS.index(from_col)
+            to_i = DB.DAILY_TIME_COLS.index(to_col)
+            slot_range = list(range(from_i, to_i))
+
+            # 競合チェック（既存割り当てが自分と異なるスロット）
+            conflicts = []
+            for slot_i in slot_range:
+                col = DB.DAILY_TIME_COLS[slot_i]
+                existing = str(self.state.df_daily.loc[sch_idx, col] or "")
+                if existing and existing != ticket_idx and existing in df_nodes.index:
+                    conf_title = str(df_nodes.loc[existing, "title"])
+                    conflicts.append(f"  {LG.col_to_hhmm(col)}: {conf_title}")
+
+            if conflicts:
+                ticket_title = str(df_nodes.loc[ticket_idx, "title"])
+                dlg = QMessageBox(self)
+                dlg.setWindowTitle("スケジュール競合")
+                dlg.setText(
+                    f"「{ticket_title}」({it['from']}〜{it['to']}) に競合があります:\n\n"
+                    + "\n".join(conflicts)
+                )
+                btn_overwrite = dlg.addButton("上書き", QMessageBox.ButtonRole.AcceptRole)
+                btn_skip      = dlg.addButton("スキップ", QMessageBox.ButtonRole.RejectRole)
+                dlg.addButton("取り込み中止", QMessageBox.ButtonRole.DestructiveRole)
+                dlg.exec()
+                clicked = dlg.clickedButton()
+
+                if clicked not in (btn_overwrite, btn_skip):
+                    # 取り込み中止
+                    if imported_count > 0:
+                        self._finish_schedule_import(sch_idx, imported_count, date_str)
+                    else:
+                        self.info.set_info("取り込みを中止しました")
+                    return
+                if clicked == btn_skip:
+                    continue
+
+            # スロットに書き込む
+            today = datetime.date.today().isoformat()
+            for slot_i in slot_range:
+                col = DB.DAILY_TIME_COLS[slot_i]
+                old_t = str(self.state.df_daily.loc[sch_idx, col] or "")
+                if old_t and old_t in df_nodes.index:
+                    df_nodes.loc[old_t, "actual_hours"] = max(
+                        0.0,
+                        float(df_nodes.loc[old_t, "actual_hours"] or 0) - 0.25,
+                    )
+                    self._propagate_actual_hours(old_t)
+                self.state.df_daily.loc[sch_idx, col] = ticket_idx
+                df_nodes.loc[ticket_idx, "actual_hours"] = (
+                    float(df_nodes.loc[ticket_idx, "actual_hours"] or 0) + 0.25
+                )
+                df_nodes.loc[ticket_idx, "updated_at"] = today
+                self._propagate_actual_hours(ticket_idx)
+
+            imported_count += 1
+
+        self._finish_schedule_import(sch_idx, imported_count, date_str)
+
+    def _finish_schedule_import(self, sch_idx: str, count: int, date_str: str) -> None:
+        """スケジュール取り込み後の共通後処理（フラグ更新・UI更新）"""
+        self.state.df_daily.loc[sch_idx, "Last_Update"] = datetime.date.today().isoformat()
+        self.state.schedule_modified = True
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
+        self.state.refresh()
+        self.info.set_info(f"{count} 件のスケジュールを取り込みました（{date_str}）")
+
+    def _propagate_actual_hours(self, node_idx: str) -> None:
+        """ノードの actual_hours 変更を祖先ノードに伝播する"""
+        df = self.state.df_nodes
+        current_idx = node_idx
+        while True:
+            if current_idx not in df.index:
+                break
+            parent_id = str(df.loc[current_idx, "parent_id"] or "")
+            if not parent_id or parent_id == "0" or parent_id not in df.index:
+                break
+            children = df[
+                (df["parent_id"] == parent_id) &
+                (~df["status"].isin(["cancel", "deleted"]))
+            ]
+            df.loc[parent_id, "actual_hours"] = float(children["actual_hours"].sum())
+            current_idx = parent_id
+
+    def _parse_schedule_response(self, text: str) -> tuple:
+        """
+        LLM 返答から ```schedule ブロックを抽出する。
+        戻り値: (date_str, items_list, errors_list)
+
+        フォーマット:
+            ```schedule
+            date: 2026-05-06
+            ---
+            ticket_idx: <IDX>
+            from: 09:00
+            to: 11:00
+            comment: 説明（省略可、読み飛ばす）
+            ---
+            ```
+        """
+        date_str: str = ""
+        items: list = []
+        errors: list = []
+
+        match = re.search(r"```schedule\s*(.*?)```", text, re.DOTALL)
+        if not match:
+            errors.append("```schedule ... ``` ブロックが見つかりません")
+            return date_str, items, errors
+
+        block = match.group(1).strip()
+        sections = [s.strip() for s in block.split("---") if s.strip()]
+
+        if not sections:
+            errors.append("スケジュールブロックが空です")
+            return date_str, items, errors
+
+        # 最初のセクションから date を取得
+        first_fields: dict = {}
+        for line in sections[0].splitlines():
+            if ":" in line:
+                key, _, val = line.partition(":")
+                first_fields[key.strip()] = val.strip()
+
+        date_str = first_fields.get("date", "")
+        if not date_str:
+            errors.append("date が見つかりません（先頭に date: YYYY-MM-DD を記載してください）")
+            return date_str, items, errors
+
+        # 以降のセクションをスケジュールアイテムとして解析
+        for section in sections[1:]:
+            item: dict = {}
+            for line in section.splitlines():
+                if ":" in line:
+                    key, _, val = line.partition(":")
+                    item[key.strip()] = val.strip()
+
+            if not item.get("ticket_idx"):
+                errors.append("ticket_idx が空のエントリがあります")
+                continue
+
+            from_hhmm = item.get("from", "")
+            to_hhmm   = item.get("to", "")
+            if not from_hhmm or not to_hhmm:
+                errors.append(f"from/to が不正: {item.get('ticket_idx', '?')}")
+                continue
+
+            from_col = self._hhmm_to_col(from_hhmm)
+            to_col   = self._hhmm_to_col(to_hhmm)
+            if from_col not in DB.DAILY_TIME_COLS:
+                errors.append(f"from の時刻が不正: {from_hhmm}")
+                continue
+            if to_col not in DB.DAILY_TIME_COLS:
+                errors.append(f"to の時刻が不正: {to_hhmm}")
+                continue
+
+            from_i = DB.DAILY_TIME_COLS.index(from_col)
+            to_i   = DB.DAILY_TIME_COLS.index(to_col)
+            if from_i >= to_i:
+                errors.append(f"from >= to の時刻指定: {from_hhmm} 〜 {to_hhmm}")
+                continue
+
+            items.append({
+                "ticket_idx": item["ticket_idx"],
+                "from":       from_hhmm,
+                "to":         to_hhmm,
+                "from_col":   from_col,
+                "to_col":     to_col,
+            })
+
+        return date_str, items, errors
+
+    def _hhmm_to_col(self, hhmm: str) -> str:
+        """'09:30' → 'C0930' に変換。不正な場合は空文字を返す。"""
+        try:
+            h, m = hhmm.strip().split(":")
+            return f"C{int(h):02d}{int(m):02d}"
+        except (ValueError, AttributeError):
+            return ""
 
     def refresh(self) -> None:
         """リフレッシュ（AI取込タブは状態保持のため何もしない）"""
