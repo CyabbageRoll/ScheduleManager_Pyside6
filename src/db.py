@@ -5,6 +5,7 @@ import sqlite3
 import hashlib
 import random
 import datetime
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -236,9 +237,10 @@ def _to_sql_value(v):
 class Database:
     """SQLite 接続・CRUD・工数集計を担当するクラス"""
 
-    def __init__(self, db_dir: str, logger=None):
+    def __init__(self, db_dir: str, logger=None, timeout: int = 60):
         self.db_dir = Path(db_dir)
         self.logger = logger
+        self.timeout = timeout  # SQLite ロック待機秒数（config.ini の db_timeout）
         self.db_path = self.db_dir / "schedule.sqlite"
         self._ensure_db()
 
@@ -248,12 +250,58 @@ class Database:
         if self.logger:
             self.logger.debug(msg)
 
+    def _logi(self, msg: str) -> None:
+        if self.logger:
+            self.logger.info(msg)
+
+    def _logw(self, msg: str) -> None:
+        if self.logger:
+            self.logger.warning(msg)
+
+    # ロックファイルの有効期限（秒）
+    _LOCK_EXPIRE_SEC = 300
+
     def _connect(self) -> sqlite3.Connection:
-        """WAL モードで SQLite 接続を開く（並列書き込みに強い設定）"""
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
+        """ファイルサーバー向け設定で SQLite 接続を開く"""
+        conn = sqlite3.connect(str(self.db_path), timeout=float(self.timeout))
+        # WAL はファイルサーバー非推奨のため DELETE モードで運用
+        conn.execute("PRAGMA journal_mode=DELETE")
+        # ビジー待機（ミリ秒）: Python の timeout と二重で保護
+        conn.execute(f"PRAGMA busy_timeout={self.timeout * 1000}")
+        # ファイルサーバーではOSキャッシュが信頼できないため FULL に設定
+        conn.execute("PRAGMA synchronous=FULL")
         conn.row_factory = sqlite3.Row
         return conn
+
+    def acquire_lock(self) -> bool:
+        """保存用ロックファイルを取得する。5分以上古いロックは無効とみなす。"""
+        lock_path = self.db_dir / "schedule.lock"
+        now = time.time()
+        if lock_path.exists():
+            try:
+                lock_time = float(lock_path.read_text().strip())
+                elapsed = now - lock_time
+                if elapsed < self._LOCK_EXPIRE_SEC:
+                    self._logw(f"[DB] ロック取得失敗 - 他ユーザーが保存中 (ロック作成から{elapsed:.0f}秒)")
+                    return False
+                # 有効期限切れは強制解除して取得
+                self._logw(f"[DB] 期限切れロックを強制解除して取得 (経過={elapsed:.0f}秒)")
+            except Exception:
+                self._logw("[DB] ロックファイル読み取り失敗 - 強制上書き")
+        try:
+            lock_path.write_text(str(now))
+        except Exception as e:
+            self._log(f"ロックファイル作成失敗: {e}")
+            return False
+        return True
+
+    def release_lock(self) -> None:
+        """保存用ロックファイルを解放する"""
+        lock_path = self.db_dir / "schedule.lock"
+        try:
+            lock_path.unlink(missing_ok=True)
+        except Exception as e:
+            self._log(f"ロックファイル削除失敗: {e}")
 
     def _ensure_db(self) -> None:
         """DB ファイルとテーブルが存在しない場合に初期化する"""
@@ -389,7 +437,7 @@ class Database:
                     vals,
                 )
             conn.commit()
-            self._log(f"save_nodes: {len(target)} 件保存")
+            self._logi(f"[DB] save_nodes: {len(target)} 件保存 user={user}")
         except Exception as e:
             self._log(f"save_nodes エラー: {e}")
         finally:
@@ -431,7 +479,7 @@ class Database:
                     vals,
                 )
             conn.commit()
-            self._log(f"save_daily_schedule: {len(target)} 件保存")
+            self._logi(f"[DB] save_daily_schedule: {len(target)} 件保存 user={user}")
         except Exception as e:
             self._log(f"save_daily_schedule エラー: {e}")
         finally:
@@ -468,7 +516,7 @@ class Database:
                     vals,
                 )
             conn.commit()
-            self._log(f"save_daily_log: {len(target)} 件保存")
+            self._logi(f"[DB] save_daily_log: {len(target)} 件保存 user={user}")
         except Exception as e:
             self._log(f"save_daily_log エラー: {e}")
         finally:

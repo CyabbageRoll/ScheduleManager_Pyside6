@@ -35,10 +35,10 @@ IDX_ANALYSIS= 3
 IDX_SEARCH  = 4
 IDX_TEAM    = 5
 IDX_ASSIGN  = 6
-IDX_MEMO    = 7
-IDX_VERSION  = 8
-IDX_CONFIG   = 9
-IDX_AIIMPORT = 10
+IDX_AIIMPORT = 7
+IDX_MEMO    = 8
+IDX_VERSION  = 9
+IDX_CONFIG   = 10
 
 
 # ---------- 日次スケジュール用カスタムデリゲート ----------
@@ -693,11 +693,11 @@ class MainWindow(QMainWindow):
             ("👥 Team",    IDX_TEAM),
             ("🔍 Search",  IDX_SEARCH),
             ("📨 Request", IDX_ASSIGN),
+            ("🤖 AI取込",  IDX_AIIMPORT),
             ("📝 Memo",    IDX_MEMO),
             ("📈 Analyze", IDX_ANALYSIS),
             ("ℹ Version", IDX_VERSION),
             ("⚙ Config",  IDX_CONFIG),
-            ("🤖 AI取込",  IDX_AIIMPORT),
         ]
         self._tab_style = _TAB_STYLE  # バッジリセット時に使用
         self._tab_btns: dict = {}
@@ -794,8 +794,8 @@ class MainWindow(QMainWindow):
 
         for w in [self.main_pane, self.gantt_view, self.road_view,
                   self.anal_view, self.search_view, self.team_view,
-                  self.assign_view, self.memo_view, self.ver_view,
-                  self.config_view, self.ai_import_view]:
+                  self.assign_view, self.ai_import_view, self.memo_view,
+                  self.ver_view, self.config_view]:
             self.stack.addWidget(w)
 
         # シグナル接続：チケット選択 → スケジュールパネルへ（ガントチャートからのみ）
@@ -900,15 +900,28 @@ class MainWindow(QMainWindow):
             self._save_btn.setStyleSheet("")  # デフォルトに戻す
 
     def _on_save(self) -> None:
+        self.statusBar().showMessage("保存中...")
+        QApplication.processEvents()
         try:
-            self.state.save()  # nodes_modified を False にリセットする
+            self.state.save()
             self.main_pane.table_pane._update_dirty_indicator()
             self._update_save_btn_style()
-            # 保存後にノード階層（TreePane）を更新する
             self.main_pane.tree_pane.refresh()
-            self.statusBar().showMessage("保存しました", 3000)
+            self.statusBar().showMessage("保存しました")
+            QTimer.singleShot(500, lambda: self.statusBar().clearMessage())
         except Exception as e:
-            QMessageBox.critical(self, "保存エラー", str(e))
+            self.statusBar().clearMessage()
+            err_msg = str(e)
+            if "dbが利用中" in err_msg or "database is locked" in err_msg:
+                QMessageBox.warning(
+                    self, "保存できません",
+                    "dbが利用中です。しばらく時間をおいて実行してください",
+                )
+            else:
+                QMessageBox.critical(self, "保存エラー", err_msg)
+            # 保存失敗時は保存ボタンの赤色を維持するため nodes_modified を True に戻す
+            self.state.nodes_modified = True
+            self._update_save_btn_style()
 
     def _on_load(self) -> None:
         try:

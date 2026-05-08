@@ -2008,6 +2008,9 @@ class SearchView(QWidget):
         period_hours = self._calc_period_hours_batch(
             list(result.index), date_from, date_to
         )
+        # 期間指定時は期間内工数が 0 のアイテムを除外する
+        if date_from or date_to:
+            result = result[result.index.map(lambda i: period_hours.get(i, 0) > 0)]
         rows = []
         for idx, r in result.iterrows():
             anc = self._get_ancestors(idx)
@@ -2635,6 +2638,8 @@ class AssignmentView(QWidget):
         if nodes_to_upsert:
             self.state.db.upsert_nodes_bulk(nodes_to_upsert)
         self.state.db.respond_assignments_bulk(asgn_ids, "accepted")
+        if self.state.logger:
+            self.state.logger.info(f"[Request] 承諾 user={self.state.user} 件数={len(asgn_ids)} ids={asgn_ids}")
 
         self.state.df_assignments = self.state.db.read_assignments()
         self.refresh()
@@ -2655,6 +2660,8 @@ class AssignmentView(QWidget):
             return
         for asgn_idx in asgn_ids:
             self.state.db.respond_assignment(asgn_idx, "rejected")
+        if self.state.logger:
+            self.state.logger.info(f"[Request] 拒否 user={self.state.user} 件数={len(asgn_ids)} ids={asgn_ids}")
         self.state.df_assignments = self.state.db.read_assignments()
         self.refresh()
 
@@ -2811,7 +2818,8 @@ class _NoWheelDoubleSpinBox(QDoubleSpinBox):
 class ConfigView(QWidget):
     """config.ini の閲覧・編集ビュー"""
 
-    _CONFIG_PATH = Path(__file__).parent / "config.ini"
+    _CONFIG_PATH      = Path(__file__).parent / "config.ini"
+    _USER_CONFIG_PATH = Path(__file__).parent.parent / "user_config.ini"
 
     def __init__(self, state):
         super().__init__()
@@ -2916,6 +2924,7 @@ class ConfigView(QWidget):
         cfg = self.state.config
         fl = self._group("[Database]")
         self._text("db_server_dir", cfg.server_dir, fl, "server_dir:")
+        self._spin("db_timeout", cfg.db_timeout, fl, "db_timeout (秒):", 5, 300)
 
     def _build_section_user(self) -> None:
         cfg = self.state.config
@@ -2980,6 +2989,7 @@ class ConfigView(QWidget):
 
         cfg = self.state.config
         _set("db_server_dir",    cfg.server_dir)
+        _set("db_timeout",       cfg.db_timeout)
         _set("user_username",    cfg.username)
         _set("user_members",     ", ".join(cfg.members))
         _set("gui_window_width", cfg.window_width)
@@ -3005,10 +3015,12 @@ class ConfigView(QWidget):
         return w.text().strip()
 
     def _on_save(self) -> None:
-        """フォーム値を config.ini に書き込む"""
+        """フォーム値を user_config.ini に書き込む（config.ini は上書きしない）"""
         parser = configparser.ConfigParser()
-        # 既存ファイルを読んで保持
-        if self._CONFIG_PATH.exists():
+        # 既存の user_config.ini を読んで保持（なければ config.ini をベースにする）
+        if self._USER_CONFIG_PATH.exists():
+            parser.read(str(self._USER_CONFIG_PATH), encoding="utf-8")
+        elif self._CONFIG_PATH.exists():
             parser.read(str(self._CONFIG_PATH), encoding="utf-8")
 
         def _ensure(section: str):
@@ -3017,6 +3029,7 @@ class ConfigView(QWidget):
 
         _ensure("Database")
         parser.set("Database", "server_dir", self._get("db_server_dir"))
+        parser.set("Database", "db_timeout", self._get("db_timeout"))
 
         _ensure("User")
         parser.set("User", "username", self._get("user_username"))
@@ -3054,9 +3067,9 @@ class ConfigView(QWidget):
             parser.set("Commands", f"command_{i:02d}_script", new_script)
 
         try:
-            with open(str(self._CONFIG_PATH), "w", encoding="utf-8") as f:
+            with open(str(self._USER_CONFIG_PATH), "w", encoding="utf-8") as f:
                 parser.write(f)
-            self.info.set_info("config.ini を保存しました（一部設定は再起動後に反映）")
+            self.info.set_info("user_config.ini を保存しました（一部設定は再起動後に反映）")
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
 
@@ -3069,11 +3082,11 @@ class AIImportView(QWidget):
 
     【チケット取り込み】
     ① チケット作成プロンプト: テンプレート + Task一覧をクリップボードにコピー
-    ② チケット取り込み: ```items ブロックをパース → 確認ダイアログ → DB登録
+    ② チケット取り込み: $$$items ブロックをパース → 確認ダイアログ → DB登録
 
     【日次スケジュール取り込み】
     ③ 日次スケジュール作成プロンプト: テンプレート + チケット一覧をクリップボードにコピー
-    ④ 日次スケジュール取り込み: ```schedule ブロックをパース → 競合確認 → df_daily 更新
+    ④ 日次スケジュール取り込み: $$$schedule ブロックをパース → 競合確認 → df_daily 更新
     """
 
     import_done = Signal(list)  # 取り込んだ IDX のリスト
@@ -3090,37 +3103,39 @@ class AIImportView(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # ── チケット取り込みボタン行 ──
-        ticket_row = QHBoxLayout()
-        btn_ticket_prompt = QPushButton("📋 チケット作成プロンプト")
+        # ── ボタングリッド（ラベル | プロンプトコピー | 取り込み） ──
+        from PySide6.QtWidgets import QGridLayout
+        btn_grid = QGridLayout()
+        btn_grid.setSpacing(6)
+
+        btn_grid.addWidget(QLabel("チケット作成："), 0, 0)
+        btn_ticket_prompt = QPushButton("📋 プロンプトをコピー")
         btn_ticket_prompt.setStyleSheet(STYLE_BUTTON)
         btn_ticket_prompt.setToolTip("テンプレート + Task一覧をクリップボードにコピー")
         btn_ticket_prompt.clicked.connect(self._on_get_ticket_prompt)
-        ticket_row.addWidget(btn_ticket_prompt)
+        btn_grid.addWidget(btn_ticket_prompt, 0, 1)
 
-        btn_ticket_import = QPushButton("📥 チケット取り込み")
+        btn_ticket_import = QPushButton("📥 取り込み")
         btn_ticket_import.setStyleSheet(STYLE_BUTTON)
-        btn_ticket_import.setToolTip("テキストエリアの ```items ブロックを解析してチケットを登録")
+        btn_ticket_import.setToolTip("テキストエリアの $$$items ... $$$ ブロックを解析してチケットを登録")
         btn_ticket_import.clicked.connect(self._on_import_tickets)
-        ticket_row.addWidget(btn_ticket_import)
-        ticket_row.addStretch()
-        layout.addLayout(ticket_row)
+        btn_grid.addWidget(btn_ticket_import, 0, 2)
 
-        # ── 日次スケジュールボタン行 ──
-        schedule_row = QHBoxLayout()
-        btn_sch_prompt = QPushButton("📅 日次スケジュール作成プロンプト")
+        btn_grid.addWidget(QLabel("スケジュール設定："), 1, 0)
+        btn_sch_prompt = QPushButton("📋 プロンプトをコピー")
         btn_sch_prompt.setStyleSheet(STYLE_BUTTON)
         btn_sch_prompt.setToolTip("テンプレート + チケット一覧をクリップボードにコピー")
         btn_sch_prompt.clicked.connect(self._on_get_schedule_prompt)
-        schedule_row.addWidget(btn_sch_prompt)
+        btn_grid.addWidget(btn_sch_prompt, 1, 1)
 
-        btn_sch_import = QPushButton("📥 日次スケジュール取り込み")
+        btn_sch_import = QPushButton("📥 取り込み")
         btn_sch_import.setStyleSheet(STYLE_BUTTON)
-        btn_sch_import.setToolTip("テキストエリアの ```schedule ブロックを解析してスケジュールを登録")
+        btn_sch_import.setToolTip("テキストエリアの $$$schedule ... $$$ ブロックを解析してスケジュールを登録")
         btn_sch_import.clicked.connect(self._on_import_schedule)
-        schedule_row.addWidget(btn_sch_import)
-        schedule_row.addStretch()
-        layout.addLayout(schedule_row)
+        btn_grid.addWidget(btn_sch_import, 1, 2)
+
+        btn_grid.setColumnStretch(3, 1)
+        layout.addLayout(btn_grid)
 
         # ── テキストエリア ──
         self.text_edit = QPlainTextEdit()
@@ -3163,7 +3178,7 @@ class AIImportView(QWidget):
         if tasks.empty:
             return "【Task一覧】\n（Taskなし）"
 
-        lines = ["【Task一覧（IDX | タイトル | 階層パス）】"]
+        lines = ["【Task一覧（IDX | タイトル | 階層パス | memo）】"]
 
         def _path(idx: str) -> str:
             parts = []
@@ -3176,7 +3191,9 @@ class AIImportView(QWidget):
         for idx, row in tasks.iterrows():
             title = str(row.get("title", ""))
             path = _path(str(idx))
-            lines.append(f"  {idx} | {title} | {path}")
+            memo = str(row.get("memo", "") or "").strip()
+            memo_str = f" | {memo}" if memo else ""
+            lines.append(f"  {idx} | {title} | {path}{memo_str}")
 
         return "\n".join(lines)
 
@@ -3228,30 +3245,32 @@ class AIImportView(QWidget):
         self.state.df_nodes = self.state.db.read_nodes()
         self.state.refresh()
 
+        if self.state.logger:
+            self.state.logger.info(f"[AI取込] チケット {len(imported_idxs)} 件登録 user={self.state.user} ids={imported_idxs}")
         self.info.set_info(f"{len(imported_idxs)} 件を取り込みました")
         self.import_done.emit(imported_idxs)
 
     def _parse_llm_response(self, text: str) -> tuple:
         """
-        LLM 返答から ```items ブロックを抽出してチケットリストを返す。
+        LLM 返答から $$$items ブロックを抽出してチケットリストを返す。
 
         フォーマット:
-            ```items
+            $$$items
             title: タイトル（必須）
             parent_idx: 親Task の IDX（必須）
             deadline: YYYY-MM-DD（省略可）
             memo: メモ（省略可）
             comment: LLM の説明（読み飛ばす）
             ---
-            ```
+            $$$
         """
         items: list = []
         errors: list = []
         df = self.state.df_nodes
 
-        match = re.search(r"```items\s*(.*?)```", text, re.DOTALL)
+        match = re.search(r"\$\$\$items\s*(.*?)\$\$\$", text, re.DOTALL)
         if not match:
-            errors.append("```items ... ``` ブロックが見つかりません")
+            errors.append("$$$items ... $$$ ブロックが見つかりません")
             return items, errors
 
         block = match.group(1).strip()
@@ -3299,10 +3318,10 @@ class AIImportView(QWidget):
         self.info.set_info("日次スケジュール作成プロンプトをクリップボードにコピーしました")
 
     def _build_ticket_list(self) -> str:
-        """自分の未完了チケット一覧（IDX | タイトル | 親Task名）を文字列化する"""
+        """自分の未完了チケット一覧（IDX | タイトル | 階層パス | memo）を文字列化する"""
         df = self.state.df_nodes
         if df.empty:
-            return "【チケット一覧】\n（チケットなし）"
+            return "【Ticket一覧】\n（チケットなし）"
 
         tickets = df[
             (df["node_type"] == "ticket") &
@@ -3311,21 +3330,30 @@ class AIImportView(QWidget):
         ].copy()
 
         if tickets.empty:
-            return "【チケット一覧】\n（未完了チケットなし）"
+            return "【Ticket一覧】\n（未完了チケットなし）"
 
-        lines = ["【チケット一覧（IDX | タイトル | 親Task）】"]
+        def _path(idx: str) -> str:
+            parts = []
+            pid = str(df.loc[idx, "parent_id"]) if idx in df.index else ""
+            while pid and pid != "0" and pid in df.index:
+                parts.insert(0, str(df.loc[pid, "title"]))
+                pid = str(df.loc[pid, "parent_id"])
+            return " > ".join(parts) if parts else "(ルート)"
+
+        lines = ["【Ticket一覧（IDX | タイトル | 階層パス | memo）】"]
         for idx, row in tickets.iterrows():
             title = str(row.get("title", ""))
-            parent_id = str(row.get("parent_id", ""))
-            task_name = str(df.loc[parent_id, "title"]) if parent_id in df.index else ""
-            lines.append(f"  {idx} | {title} | {task_name}")
+            path = _path(str(idx))
+            memo = str(row.get("memo", "") or "").strip()
+            memo_str = f" | {memo}" if memo else ""
+            lines.append(f"  {idx} | {title} | {path}{memo_str}")
 
         return "\n".join(lines)
 
     # ── 日次スケジュール取り込み ──
 
     def _on_import_schedule(self) -> None:
-        """テキストエリアの ```schedule ブロックをパースして日次スケジュールを更新する"""
+        """テキストエリアの $$$schedule ブロックをパースして日次スケジュールを更新する"""
         text = self.text_edit.toPlainText().strip()
         if not text:
             self.info.set_error("テキストが空です")
@@ -3425,6 +3453,8 @@ class AIImportView(QWidget):
         self.state.nodes_modified = True
         self.state.notify_dirty()
         self.state.refresh()
+        if self.state.logger:
+            self.state.logger.info(f"[AI取込] 日次スケジュール {count} 件登録 date={date_str} user={self.state.user}")
         self.info.set_info(f"{count} 件のスケジュールを取り込みました（{date_str}）")
 
     def _propagate_actual_hours(self, node_idx: str) -> None:
@@ -3446,11 +3476,11 @@ class AIImportView(QWidget):
 
     def _parse_schedule_response(self, text: str) -> tuple:
         """
-        LLM 返答から ```schedule ブロックを抽出する。
+        LLM 返答から $$$schedule ブロックを抽出する。
         戻り値: (date_str, items_list, errors_list)
 
         フォーマット:
-            ```schedule
+            $$$schedule
             date: 2026-05-06
             ---
             ticket_idx: <IDX>
@@ -3458,15 +3488,15 @@ class AIImportView(QWidget):
             to: 11:00
             comment: 説明（省略可、読み飛ばす）
             ---
-            ```
+            $$$
         """
         date_str: str = ""
         items: list = []
         errors: list = []
 
-        match = re.search(r"```schedule\s*(.*?)```", text, re.DOTALL)
+        match = re.search(r"\$\$\$schedule\s*(.*?)\$\$\$", text, re.DOTALL)
         if not match:
-            errors.append("```schedule ... ``` ブロックが見つかりません")
+            errors.append("$$$schedule ... $$$ ブロックが見つかりません")
             return date_str, items, errors
 
         block = match.group(1).strip()

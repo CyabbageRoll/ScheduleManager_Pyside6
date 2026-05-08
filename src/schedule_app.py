@@ -32,8 +32,9 @@ import pandas as pd
 # -------------------------------------------------------
 APP_NAME    = "Schedule Manager v3"
 APP_VERSION = "3.0.0"
-CONFIG_FILE = Path(__file__).parent / "config.ini"
-LOG_DIR     = Path(__file__).parent / "logs"
+CONFIG_FILE      = Path(__file__).parent / "config.ini"
+USER_CONFIG_FILE = Path(__file__).parent.parent / "user_config.ini"
+LOG_DIR          = Path(__file__).parent / "logs"
 
 
 # -------------------------------------------------------
@@ -43,6 +44,7 @@ LOG_DIR     = Path(__file__).parent / "logs"
 class AppConfig:
     # [Database]
     server_dir: str = "./db"
+    db_timeout: int = 60  # SQLite ロック待機秒数（timeout / busy_timeout 共通）
 
     # [User]
     # username は config.ini ではなく OS のログイン名から自動取得する
@@ -88,17 +90,22 @@ class AppConfig:
 
 
 def load_config(path: Path = CONFIG_FILE) -> AppConfig:
-    """config.ini を読み込んで AppConfig を返す。ファイルがなければデフォルト値を使用。"""
+    """
+    config.ini と user_config.ini を読み込んで AppConfig を返す。
+    user_config.ini が存在する場合は config.ini のデフォルト値を上書きする。
+    """
     cfg = AppConfig()
-    if not path.exists():
-        return cfg
-
+    # 読み込み優先順: config.ini（デフォルト）→ user_config.ini（ユーザー設定で上書き）
+    files = [str(path), str(USER_CONFIG_FILE)]
     parser = configparser.ConfigParser()
-    parser.read(str(path), encoding="utf-8")
+    parser.read(files, encoding="utf-8")
+    if not parser.sections():
+        return cfg
 
     # [Database]
     if parser.has_section("Database"):
         cfg.server_dir = parser.get("Database", "server_dir", fallback=cfg.server_dir)
+        cfg.db_timeout = parser.getint("Database", "db_timeout", fallback=cfg.db_timeout)
 
     # [User]
     # username は OS ログイン名から取得するため config.ini には記載しない
@@ -169,8 +176,9 @@ class AppState:
     current_user: str = ""
     current_date: str = ""
 
-    # DB インスタンス（起動後にセット）
-    db: object = None  # type: db.Database
+    # DB インスタンス・ロガー（起動後にセット）
+    db: object = None      # type: db.Database
+    logger: object = None  # type: logging.Logger
 
     # インメモリデータ
     df_nodes: pd.DataFrame       = field(default_factory=pd.DataFrame)
@@ -238,28 +246,46 @@ class AppState:
         if callable(func):
             func()
 
+    def _log(self, level: str, msg: str) -> None:
+        """ロガーがセットされていれば指定レベルで出力する"""
+        if self.logger:
+            getattr(self.logger, level)(msg)
+
     def save(self) -> None:
-        """変更データを DB に書き込む"""
+        """変更データを DB に書き込む。ロック取得失敗時は RuntimeError を送出する。"""
         if not self.db:
             return
-        # nodes_modified が True のときのみ save_nodes を呼ぶ（DB アクセス最小化）
-        if self.nodes_modified:
-            self.db.save_nodes(self.df_nodes, self.login_user)
-        self.db.save_daily_schedule(self.df_daily, self.login_user)
-        self.db.save_daily_log(self.df_daily_log, self.login_user)
-        self.db.save_memo(self.login_user, self.memo_text)
-        self.db.save_permanent_notice(self.login_user, self.permanent_notice)
-        self.nodes_modified = False     # 保存後にフラグをリセット
-        self.schedule_modified = False  # 保存後にフラグをリセット
+        self._log("info", f"[保存] 開始 user={self.login_user} nodes_modified={self.nodes_modified}")
+        if not self.db.acquire_lock():
+            self._log("warning", "[保存] ロック取得失敗 - 他ユーザーが保存中の可能性")
+            raise RuntimeError("dbが利用中です。しばらく時間をおいて実行してください")
+        try:
+            # nodes_modified が True のときのみ save_nodes を呼ぶ（DB アクセス最小化）
+            if self.nodes_modified:
+                self.db.save_nodes(self.df_nodes, self.login_user)
+            self.db.save_daily_schedule(self.df_daily, self.login_user)
+            self.db.save_daily_log(self.df_daily_log, self.login_user)
+            self.db.save_memo(self.login_user, self.memo_text)
+            self.db.save_permanent_notice(self.login_user, self.permanent_notice)
+            self.nodes_modified = False     # 保存後にフラグをリセット
+            self.schedule_modified = False  # 保存後にフラグをリセット
+            self._log("info", "[保存] 完了")
+        except Exception as e:
+            self._log("error", f"[保存] DBエラー: {e}")
+            raise
+        finally:
+            self.db.release_lock()
 
     def load(self) -> None:
         """DB から最新データを全件再読込する"""
+        self._log("info", "[読込] 開始")
         self.reload_nodes()
         self.reload_daily()
         self.reload_memo()
         # daily_schedule の割り当てから actual_hours を再集計
         if self.db and not self.df_nodes.empty:
             self.df_nodes = self.db.recalc_actual_hours(self.df_nodes, self.df_daily)
+        self._log("info", f"[読込] 完了 nodes={len(self.df_nodes)} daily={len(self.df_daily)}")
 
     def reload_memo(self) -> None:
         """DB からメモ・常時表示メモを再読込"""
@@ -417,7 +443,7 @@ def main() -> None:
         db_dir = Path(config.server_dir)
         if not db_dir.is_absolute():
             db_dir = Path(__file__).parent / config.server_dir
-        database = Database(str(db_dir), logger)
+        database = Database(str(db_dir), logger, timeout=config.db_timeout)
         logger.info(f"DB 接続成功: {db_dir}")
     except Exception as e:
         logger.exception("DB 初期化エラー")
@@ -427,6 +453,7 @@ def main() -> None:
     # AppState 初期化
     state = AppState(config=config)
     state.db = database
+    state.logger = logger
     state.reload_nodes()
     state.reload_daily()
     state.reload_memo()
