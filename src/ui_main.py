@@ -346,27 +346,43 @@ class DailyScheduleWidget(QWidget):
         self._load_log_values()
 
     def _load_log_values(self) -> None:
-        """本日の入力欄に保存済み値をセット"""
+        """選択中のメンバー・日付の入力欄に保存済み値をセット"""
         date = self.state.current_date
-        my_idx = DB.daily_sch_idx(date, self.state.user)
+        member = self.state.current_member or self.state.user
+        idx = DB.daily_sch_idx(date, member)
         df_log = getattr(self.state, "df_daily_log", None)
-        if df_log is not None and not df_log.empty and my_idx in df_log.index:
-            row = df_log.loc[my_idx]
+        if df_log is not None and not df_log.empty and idx in df_log.index:
+            row = df_log.loc[idx]
             self.f_health.set_value(str(row.get("health_status", "") or ""))
             self.f_work_place.set_value(str(row.get("work_place", "") or ""))
             self.f_safety.set_value(str(row.get("safety", "") or ""))
             self.f_overwork.set_value(str(row.get("overwork", "") or ""))
             self.f_notes.setText(str(row.get("notes", "") or ""))
-        # 常時メモ（state に保持）
-        self.f_notes_ever.setText(getattr(self.state, "permanent_notice", ""))
+        else:
+            self.f_health.set_value("")
+            self.f_work_place.set_value("")
+            self.f_safety.set_value("")
+            self.f_overwork.set_value("")
+            self.f_notes.setText("")
+        # 常時メモ（メンバーごと）
+        notices = getattr(self.state, "all_permanent_notices", {})
+        self.f_notes_ever.setText(notices.get(member, ""))
+        # 他人のデータは閲覧のみ
+        is_own = (member == self.state.user)
+        for w in [self.f_health, self.f_work_place, self.f_safety,
+                  self.f_overwork, self.f_notes, self.f_notes_ever]:
+            w.setEnabled(is_own)
 
     def _on_save_log(self) -> None:
-        """本日入力フォームと常時メモを保存する"""
+        """選択中メンバーの入力フォームを保存する（自分のデータのみ）"""
+        member = self.state.current_member or self.state.user
+        if member != self.state.user:
+            return
         date = self.state.current_date
-        idx = DB.daily_sch_idx(date, self.state.user)
+        idx = DB.daily_sch_idx(date, member)
         today = datetime.date.today().isoformat()
         row = {
-            "Owner":         self.state.user,
+            "Owner":         member,
             "health_status": self.f_health.get_value(),
             "work_place":    self.f_work_place.get_value(),
             "safety":        self.f_safety.get_value(),
