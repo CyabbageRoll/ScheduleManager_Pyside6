@@ -35,7 +35,7 @@ from ui_widgets import (
 # ---------- 項目4: ガントチャートセル用デリゲート ----------
 
 class _GanttCellDelegate(QStyledItemDelegate):
-    """開始可能日セルの左側に縦線を描画するデリゲート"""
+    """開始可能日の左縦線・納期の右罫線を描画するデリゲート"""
 
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
@@ -46,6 +46,14 @@ class _GanttCellDelegate(QStyledItemDelegate):
             painter.setPen(pen)
             r = option.rect
             painter.drawLine(r.topLeft(), r.bottomLeft())
+            painter.restore()
+        if index.data(Qt.ItemDataRole.UserRole + 11) == "deadline":
+            painter.save()
+            pen = QPen(QColor("#D32F2F"))
+            pen.setWidth(3)
+            painter.setPen(pen)
+            r = option.rect
+            painter.drawLine(r.topRight(), r.bottomRight())
             painter.restore()
 
 
@@ -272,6 +280,10 @@ class GanttView(QWidget):
                 est_h      = float(tr.get("estimated_hours", 0) or 0)
                 act_h      = float(tr.get("actual_hours", 0) or 0)
                 remaining_h = max(0.0, est_h - act_h)
+                # todoで残り工数が0以下の場合は0.5hとして作業日を算出
+                t_status = str(tr.get("status", ""))
+                if remaining_h < 0.001 and t_status == "todo":
+                    remaining_h = 0.5
 
                 work_days: set = set()
                 if remaining_h > 0.001:
@@ -599,27 +611,34 @@ class GanttView(QWidget):
                         else:
                             item.setBackground(t_bg)
                     elif t_status not in ("done", "cancel"):
-                        # セルのマーカー優先順: 納期🏁 > 開始可能日（左縦線）> 作業日🔨
-                        # 背景色は通常のチケット色と統一し、色の多用を避ける
+                        # 納期: 右罫線（デリゲート）で表示、作業日🔨を優先
                         if deadline and d == deadline:
-                            item.setText("🏁")
-                            item.setBackground(t_bg)
-                        elif start_avail and d == start_avail:
-                            # 開始可能日: テキストなし、左縦線デリゲートで表示
-                            item.setData(Qt.ItemDataRole.UserRole + 10, "start_avail")
-                            item.setBackground(t_bg)
-                        elif d in work_days:
-                            item.setText("🔨")
-                            if deadline and d > deadline:
-                                # 作業日が納期を超過 → 赤アラート
-                                item.setBackground(QColor("#EF5350"))
-                                item.setForeground(QColor("white"))
-                            else:
+                            item.setData(Qt.ItemDataRole.UserRole + 11, "deadline")
+                            if d in work_days:
+                                item.setText("🔨")
                                 item.setBackground(bar_color)
-                        elif d.weekday() >= 5:
-                            item.setBackground(QColor("#F0F0F0"))
-                        else:
-                            item.setBackground(t_bg)
+                            else:
+                                item.setText("🏁")
+                                item.setBackground(t_bg)
+                        if start_avail and d == start_avail:
+                            item.setData(Qt.ItemDataRole.UserRole + 10, "start_avail")
+                            if d in work_days and not item.text():
+                                item.setText("🔨")
+                                item.setBackground(bar_color)
+                            elif not item.text():
+                                item.setBackground(t_bg)
+                        if not item.text():
+                            if d in work_days:
+                                item.setText("🔨")
+                                if deadline and d > deadline:
+                                    item.setBackground(QColor("#EF5350"))
+                                    item.setForeground(QColor("white"))
+                                else:
+                                    item.setBackground(bar_color)
+                            elif d.weekday() >= 5:
+                                item.setBackground(QColor("#F0F0F0"))
+                            else:
+                                item.setBackground(t_bg)
                     else:
                         if d.weekday() >= 5:
                             item.setBackground(QColor("#F0F0F0"))
@@ -3141,8 +3160,8 @@ class AIImportView(QWidget):
         self.text_edit = QPlainTextEdit()
         self.text_edit.setPlaceholderText(
             "LLM の返答をここに貼り付けてください。\n"
-            "チケット取り込み: ```items ブロックを認識します。\n"
-            "日次スケジュール取り込み: ```schedule ブロックを認識します。"
+            "チケット取り込み: title: / parent_idx: を含むテキストを認識します。\n"
+            "日次スケジュール取り込み: date: / ticket_idx: を含むテキストを認識します。"
         )
         self.text_edit.setStyleSheet(
             "QPlainTextEdit { font-family: monospace; font-size: 9pt; }"
@@ -3250,30 +3269,40 @@ class AIImportView(QWidget):
         self.info.set_info(f"{len(imported_idxs)} 件を取り込みました")
         self.import_done.emit(imported_idxs)
 
+    @staticmethod
+    def _strip_code_fences(text: str) -> str:
+        """マークダウンのコードブロック(```)を除去する"""
+        return re.sub(r"```\w*\n?", "", text)
+
     def _parse_llm_response(self, text: str) -> tuple:
         """
-        LLM 返答から $$$items ブロックを抽出してチケットリストを返す。
+        LLM 返答からチケットリストをパースする。
 
         フォーマット:
-            $$$items
             title: タイトル（必須）
             parent_idx: 親Task の IDX（必須）
             deadline: YYYY-MM-DD（省略可）
             memo: メモ（省略可）
-            comment: LLM の説明（読み飛ばす）
             ---
-            $$$
+            （複数チケットは --- で区切る）
+
+        後方互換: $$$items ... $$$ ブロックがあればその中身を抽出する。
         """
         items: list = []
         errors: list = []
         df = self.state.df_nodes
 
+        text = self._strip_code_fences(text)
+
+        # 後方互換: $$$items ブロックがあればその中身を使用
         match = re.search(r"\$\$\$items\s*(.*?)\$\$\$", text, re.DOTALL)
-        if not match:
-            errors.append("$$$items ... $$$ ブロックが見つかりません")
+        block = match.group(1).strip() if match else text.strip()
+
+        # 構文チェック: title キーが1つも無ければエラー
+        if "title:" not in block:
+            errors.append("title: が見つかりません。フォーマットを確認してください")
             return items, errors
 
-        block = match.group(1).strip()
         entries = [e.strip() for e in block.split("---") if e.strip()]
 
         for entry in entries:
@@ -3476,30 +3505,35 @@ class AIImportView(QWidget):
 
     def _parse_schedule_response(self, text: str) -> tuple:
         """
-        LLM 返答から $$$schedule ブロックを抽出する。
+        LLM 返答からスケジュールをパースする。
         戻り値: (date_str, items_list, errors_list)
 
         フォーマット:
-            $$$schedule
             date: 2026-05-06
             ---
             ticket_idx: <IDX>
             from: 09:00
             to: 11:00
-            comment: 説明（省略可、読み飛ばす）
             ---
-            $$$
+            （複数エントリは --- で区切る）
+
+        後方互換: $$$schedule ... $$$ ブロックがあればその中身を抽出する。
         """
         date_str: str = ""
         items: list = []
         errors: list = []
 
+        text = self._strip_code_fences(text)
+
+        # 後方互換: $$$schedule ブロックがあればその中身を使用
         match = re.search(r"\$\$\$schedule\s*(.*?)\$\$\$", text, re.DOTALL)
-        if not match:
-            errors.append("$$$schedule ... $$$ ブロックが見つかりません")
+        block = match.group(1).strip() if match else text.strip()
+
+        # 構文チェック: date キーが無ければエラー
+        if "date:" not in block:
+            errors.append("date: が見つかりません。フォーマットを確認してください")
             return date_str, items, errors
 
-        block = match.group(1).strip()
         sections = [s.strip() for s in block.split("---") if s.strip()]
 
         if not sections:
