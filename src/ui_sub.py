@@ -241,6 +241,11 @@ class GanttView(QWidget):
         # ② 全チケットをマージしてEDFソート
         all_tickets = pd.concat(collected)
         all_tickets["_dl_sort"] = pd.to_datetime(all_tickets["deadline"], errors="coerce")
+        # 納期が過去（today以前）の場合、EDFソートキーをtodayに統一する
+        # → 全ての期限超過チケットを同等の緊急度として扱い、priorityフィールドで順序を決定
+        # ※ アラート表示（d > deadline）は元の納期で正しく評価されるため影響なし
+        pd_today = pd.Timestamp(today)
+        all_tickets["_dl_sort"] = all_tickets["_dl_sort"].clip(lower=pd_today)
         all_tickets = all_tickets.sort_values(["_dl_sort", "priority"], na_position="last")
         edf_order = list(all_tickets.index)
 
