@@ -1927,18 +1927,39 @@ class SearchView(QWidget):
         fl.addRow("ステータス:", status_widget)
 
         date_row = QHBoxLayout()
+        date_row.setSpacing(2)
+
+        btn_from_prev = QPushButton("◀")
+        btn_from_prev.setMaximumWidth(28)
         self.f_from = QLineEdit()
         self.f_from.setPlaceholderText("YYYY-MM-DD")
         self.f_from.setMaximumWidth(120)
+        btn_from_next = QPushButton("▶")
+        btn_from_next.setMaximumWidth(28)
+        btn_from_prev.clicked.connect(lambda: self._shift_date(self.f_from, -1))
+        btn_from_next.clicked.connect(lambda: self._shift_date(self.f_from, +1))
+
+        btn_to_prev = QPushButton("◀")
+        btn_to_prev.setMaximumWidth(28)
         self.f_to = QLineEdit()
         self.f_to.setPlaceholderText("YYYY-MM-DD")
         self.f_to.setMaximumWidth(120)
+        btn_to_next = QPushButton("▶")
+        btn_to_next.setMaximumWidth(28)
+        btn_to_prev.clicked.connect(lambda: self._shift_date(self.f_to, -1))
+        btn_to_next.clicked.connect(lambda: self._shift_date(self.f_to, +1))
+
+        date_row.addWidget(btn_from_prev)
         date_row.addWidget(self.f_from)
+        date_row.addWidget(btn_from_next)
         date_row.addWidget(QLabel("〜"))
+        date_row.addWidget(btn_to_prev)
         date_row.addWidget(self.f_to)
+        date_row.addWidget(btn_to_next)
+        date_row.addStretch()
         date_widget = QWidget()
         date_widget.setLayout(date_row)
-        fl.addRow("更新日付:", date_widget)
+        fl.addRow("期間:", date_widget)
 
         layout.addWidget(filter_box)
 
@@ -1966,6 +1987,15 @@ class SearchView(QWidget):
 
     def refresh(self) -> None:
         self._on_search()
+
+    def _shift_date(self, field: QLineEdit, delta: int) -> None:
+        """日付フィールドを delta 日分ずらす。空欄の場合は本日を基準にする。"""
+        text = field.text().strip()
+        try:
+            d = datetime.date.fromisoformat(text)
+        except ValueError:
+            d = datetime.date.today()
+        field.setText((d + datetime.timedelta(days=delta)).isoformat())
 
     def _calc_period_hours_batch(self, ticket_idxs: list,
                                   date_from: str, date_to: str) -> dict:
@@ -2023,8 +2053,8 @@ class SearchView(QWidget):
             keyword=self.f_kw.text(),
             statuses=statuses,
             member=member,
-            date_from=date_from,
-            date_to=date_to,
+            date_from="",   # updated_at ではなく period_hours でフィルタするため不使用
+            date_to="",
             node_types=["ticket"],
         )
         self._last_result = result
