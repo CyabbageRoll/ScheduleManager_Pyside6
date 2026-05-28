@@ -260,6 +260,15 @@ class AutoCombo(QComboBox):
             self.setEditText(v)
 
 
+class _NumericItem(QTableWidgetItem):
+    """数値列を正しく数値ソートするための QTableWidgetItem サブクラス。"""
+    def __lt__(self, other: "QTableWidgetItem") -> bool:
+        try:
+            return float(self.text()) < float(other.text())
+        except ValueError:
+            return super().__lt__(other)
+
+
 class ScrollableTable(QTableWidget):
     """
     汎用スクロール可能テーブル。
@@ -284,6 +293,7 @@ class ScrollableTable(QTableWidget):
             for i, w in enumerate(col_widths):
                 if i < len(columns):
                     self.setColumnWidth(i, w)
+        self.setSortingEnabled(True)  # ヘッダークリックでソート有効化
 
     def set_rows(self, rows: List[List], row_ids: List[str] = None,
                  colors: List[str] = None) -> None:
@@ -292,11 +302,17 @@ class ScrollableTable(QTableWidget):
         row_ids: 各行に関連付ける IDX（UserRole で保持）
         colors: 各行の背景色 hex 文字列（None 行はデフォルト）
         """
+        self.setSortingEnabled(False)  # 挿入中はソートを一時停止（行順の破損を防ぐ）
         self.setRowCount(0)
         for r_idx, row in enumerate(rows):
             self.insertRow(r_idx)
             for c_idx, val in enumerate(row):
-                item = QTableWidgetItem(str(val) if val is not None else "")
+                text = str(val) if val is not None else ""
+                try:
+                    float(text)  # 数値かどうか判定
+                    item = _NumericItem(text)
+                except ValueError:
+                    item = QTableWidgetItem(text)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if row_ids and r_idx < len(row_ids):
                     item.setData(Qt.ItemDataRole.UserRole, row_ids[r_idx])
@@ -305,6 +321,7 @@ class ScrollableTable(QTableWidget):
                     bg.setAlpha(80)
                     item.setBackground(bg)
                 self.setItem(r_idx, c_idx, item)
+        self.setSortingEnabled(True)  # 挿入完了後にソート再有効化
 
     def selected_id(self) -> Optional[str]:
         """選択行の UserRole データ（IDX）を返す"""

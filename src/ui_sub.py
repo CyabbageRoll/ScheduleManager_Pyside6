@@ -1574,7 +1574,7 @@ class AnalysisView(QWidget):
     """
 
     # ノード階層の順序
-    _LEVEL_ORDER = ["project1", "project2", "project3", "project4", "task"]
+    _LEVEL_ORDER = ["project1", "project2", "project3", "project4", "task", "ticket"]
 
     def __init__(self, state):
         super().__init__()
@@ -1597,39 +1597,47 @@ class AnalysisView(QWidget):
         layout.addWidget(QLabel("📈 工数分析"))
         layout.addWidget(Separator())
 
-        # ── コントロールパネル ──────────────────────────────
+        # ── コントロールパネル（左右 2 ペイン構成）─────────
         ctrl_box = QGroupBox("集計設定")
-        ctrl_vlay = QVBoxLayout(ctrl_box)
+        ctrl_h = QHBoxLayout(ctrl_box)
 
-        # 集計レベル
+        # ── 左ペイン: フィルタツリー ─────────────────────
+        filter_box = QGroupBox("フィルター（未選択 = 全対象）")
+        filter_vlay = QVBoxLayout(filter_box)
+        self._filter_tree = QTreeWidget()
+        self._filter_tree.setColumnCount(1)
+        self._filter_tree.setHeaderLabels(["ノード階層"])
+        self._filter_tree.header().setStretchLastSection(True)
+        self._filter_tree.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._filter_tree.setIndentation(16)
+        self._filter_tree.setStyleSheet("""
+            QTreeWidget { border: 1px solid #CFD8DC; }
+            QTreeWidget::item { padding: 2px 2px; }
+            QTreeWidget::item:selected { background: #B3E5FC; color: black; }
+        """)
+        filter_vlay.addWidget(self._filter_tree)
+        ctrl_h.addWidget(filter_box, stretch=1)
+
+        # ── 右ペイン: 集計設定コントロール ───────────────
+        right_vlay = QVBoxLayout()
+        right_vlay.setSpacing(8)
+
+        # 集計レベル（P1〜Ticket の 6 択）
         level_row = QHBoxLayout()
         level_row.addWidget(QLabel("集計レベル:"))
         self._level_btns: dict[str, QRadioButton] = {}
         self._level_grp = QButtonGroup(self)
         for lbl, typ in [("P1", "project1"), ("P2", "project2"),
-                          ("P3", "project3"), ("P4", "project4"), ("Task", "task")]:
+                          ("P3", "project3"), ("P4", "project4"),
+                          ("Task", "task"), ("Ticket", "ticket")]:
             rb = QRadioButton(lbl)
             self._level_btns[typ] = rb
             self._level_grp.addButton(rb)
             level_row.addWidget(rb)
         self._level_btns["project1"].setChecked(True)
         level_row.addStretch()
-        ctrl_vlay.addLayout(level_row)
-
-        # 親ノード選択（P2 以下のとき表示）
-        self._parent_box = QGroupBox("対象ノード（親選択）")
-        parent_inner = QVBoxLayout(self._parent_box)
-        self._parent_scroll = QScrollArea()
-        self._parent_scroll.setWidgetResizable(True)
-        self._parent_scroll.setMaximumHeight(80)
-        self._parent_widget = QWidget()
-        self._parent_layout = QHBoxLayout(self._parent_widget)
-        self._parent_layout.setContentsMargins(4, 4, 4, 4)
-        self._parent_scroll.setWidget(self._parent_widget)
-        parent_inner.addWidget(self._parent_scroll)
-        self._parent_checks: dict[str, QCheckBox] = {}
-        ctrl_vlay.addWidget(self._parent_box)
-        self._parent_box.setVisible(False)
+        right_vlay.addLayout(level_row)
 
         # ユーザー選択
         user_row = QHBoxLayout()
@@ -1646,19 +1654,17 @@ class AnalysisView(QWidget):
             user_row.addWidget(cb)
             self._user_checks[m] = cb
         user_row.addStretch()
-        ctrl_vlay.addLayout(user_row)
+        right_vlay.addLayout(user_row)
 
         # 集計ボタン
         calc_btn = QPushButton("集計")
         calc_btn.setStyleSheet(STYLE_BUTTON)
         calc_btn.clicked.connect(self._calc)
-        ctrl_vlay.addWidget(calc_btn)
+        right_vlay.addWidget(calc_btn)
+        right_vlay.addStretch()
 
+        ctrl_h.addLayout(right_vlay, stretch=1)
         layout.addWidget(ctrl_box)
-
-        # レベル変更時に親ノード選択を更新
-        for rb in self._level_btns.values():
-            rb.toggled.connect(self._on_level_changed)
 
         # ── 棒グラフ ───────────────────────────────────────
         self._fig = Figure(tight_layout=True)
@@ -1708,34 +1714,62 @@ class AnalysisView(QWidget):
                 return typ
         return "project1"
 
-    def _parent_type_of(self, node_type: str) -> Optional[str]:
-        """node_type の一つ上の親タイプを返す（project1 は None）"""
-        i = self._LEVEL_ORDER.index(node_type) if node_type in self._LEVEL_ORDER else -1
-        return self._LEVEL_ORDER[i - 1] if i > 0 else None
+    # ── フィルタツリー ───────────────────────────────────
 
-    def _on_level_changed(self) -> None:
-        """集計レベル変更 → 親ノード選択パネルを更新"""
-        level = self._current_level_type()
-        parent_type = self._parent_type_of(level)
-        if parent_type is None:
-            self._parent_box.setVisible(False)
-            return
-        # 既存チェックボックスを全削除
-        for i in reversed(range(self._parent_layout.count())):
-            item = self._parent_layout.itemAt(i)
-            if item and item.widget():
-                item.widget().deleteLater()
-        self._parent_checks.clear()
-        # 親レベルのノードをチェックボックスとして列挙
+    def _build_filter_tree(self) -> None:
+        """フィルタツリーを再構築する（P1→Task の階層、ticket は除外）"""
+        self._filter_tree.clear()
         df = self.state.df_nodes
-        parents = df[df["node_type"] == parent_type]
-        for idx, row in parents.iterrows():
-            cb = QCheckBox(str(row.get("title", idx)))
-            cb.setChecked(True)
-            self._parent_layout.addWidget(cb)
-            self._parent_checks[str(idx)] = cb
-        self._parent_layout.addStretch()
-        self._parent_box.setVisible(True)
+        df_active = df[df["status"] != "deleted"]
+        p1_nodes = df_active[df_active["node_type"] == "project1"].sort_values("priority")
+        for idx, row in p1_nodes.iterrows():
+            item = QTreeWidgetItem(self._filter_tree)
+            self._setup_filter_item(item, str(idx), row)
+            self._build_filter_subtree(item, df_active, str(idx))
+        self._filter_tree.expandAll()
+
+    def _build_filter_subtree(self, parent_item: QTreeWidgetItem,
+                               df: "pd.DataFrame", parent_id: str) -> None:
+        """再帰的に子ノードをツリーに追加する（ticket は除外）"""
+        children = df[df["parent_id"] == parent_id].sort_values("priority")
+        for idx, row in children.iterrows():
+            node_type = str(row.get("node_type", ""))
+            if node_type == "ticket":
+                continue  # ticket は粒度が細かすぎるためフィルタツリーに表示しない
+            item = QTreeWidgetItem(parent_item)
+            self._setup_filter_item(item, str(idx), row)
+            self._build_filter_subtree(item, df, str(idx))
+
+    def _setup_filter_item(self, item: QTreeWidgetItem, idx: str, row) -> None:
+        """ツリーアイテムのラベル・色・太字を設定する"""
+        # AssignmentView のスタイル定数を流用（同ファイル内で後続定義）
+        TYPE_SHORT = AssignmentView._TYPE_SHORT
+        TREE_BG    = AssignmentView._TREE_BG
+        TREE_FG    = AssignmentView._TREE_FG
+        node_type  = str(row.get("node_type", ""))
+        type_short = TYPE_SHORT.get(node_type, node_type)
+        label = f"[{type_short}] {row.get('title', '')}"
+        item.setText(0, label)
+        item.setData(0, Qt.ItemDataRole.UserRole, idx)
+        item.setBackground(0, QColor(TREE_BG.get(node_type, "#FFFFFF")))
+        item.setForeground(0, QColor(TREE_FG.get(node_type, "#000000")))
+        if node_type in ("project1", "project2", "task"):
+            f = QFont()
+            f.setBold(True)
+            item.setFont(0, f)
+
+    def _is_in_scope(self, idx: str, sel_set: set, df: "pd.DataFrame") -> bool:
+        """idx が sel_set のいずれかのノードと同じか、その子孫なら True"""
+        cur: Optional[str] = idx
+        visited: set[str] = set()
+        while cur and cur not in visited:
+            if cur in sel_set:
+                return True
+            if cur not in df.index:
+                break
+            visited.add(cur)
+            cur = str(df.loc[cur, "parent_id"] or "") or None
+        return False
 
     # ── 集計・描画 ───────────────────────────────────────
 
@@ -1757,7 +1791,7 @@ class AnalysisView(QWidget):
 
     def refresh(self) -> None:
         """タブ切替・データ更新時に呼ばれる"""
-        self._on_level_changed()
+        self._build_filter_tree()
         self._calc()
 
     def _calc(self) -> None:
@@ -1767,7 +1801,6 @@ class AnalysisView(QWidget):
             return
 
         level = self._current_level_type()
-        parent_type = self._parent_type_of(level)
 
         # 選択ユーザー（None = 全員）
         if self._all_user_cb.isChecked():
@@ -1775,16 +1808,19 @@ class AnalysisView(QWidget):
         else:
             user_set = {u for u, cb in self._user_checks.items() if cb.isChecked()}
 
-        # 選択親ノード（None = 全て）
-        parent_idxs: Optional[set[str]] = None
-        if parent_type is not None:
-            parent_idxs = {idx for idx, cb in self._parent_checks.items()
-                           if cb.isChecked()}
+        # ツリー選択からスコープを取得（未選択 = 全対象）
+        sel_items = self._filter_tree.selectedItems()
+        scope_idxs: Optional[set[str]] = (
+            {item.data(0, Qt.ItemDataRole.UserRole) for item in sel_items}
+            if sel_items else None
+        )
 
-        # 集計レベルのノードを取得
+        # 集計レベルのノードを取得し、スコープでフィルタ
         groups = df[df["node_type"] == level]
-        if parent_idxs is not None:
-            groups = groups[groups["parent_id"].isin(parent_idxs)]
+        if scope_idxs:
+            groups = groups[groups.index.map(
+                lambda i: self._is_in_scope(str(i), scope_idxs, df)
+            )]
 
         # 各グループの初期レコード
         agg: dict[str, dict] = {
@@ -1806,6 +1842,10 @@ class AnalysisView(QWidget):
             # 特定ユーザーのみ: チケットを走査して積み上げ
             tickets = df[(df["node_type"] == "ticket") &
                          (df["assigned_to"].isin(user_set))]
+            if scope_idxs:
+                tickets = tickets[tickets.index.map(
+                    lambda i: self._is_in_scope(str(i), scope_idxs, df)
+                )]
             for t_idx, t_row in tickets.iterrows():
                 anc = self._find_ancestor_at_type(str(t_idx), level)
                 if anc and anc in agg:
