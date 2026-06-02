@@ -277,8 +277,9 @@ class ScrollableTable(QTableWidget):
     """
 
     def __init__(self, columns: List[str], col_widths: List[int] = None,
-                 parent=None):
+                 parent=None, reset_sort_on_update: bool = False):
         super().__init__(0, len(columns), parent)
+        self._reset_sort_on_update = reset_sort_on_update
         self.setHorizontalHeaderLabels(columns)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setAlternatingRowColors(True)
@@ -322,6 +323,9 @@ class ScrollableTable(QTableWidget):
                     item.setBackground(bg)
                 self.setItem(r_idx, c_idx, item)
         self.setSortingEnabled(True)  # 挿入完了後にソート再有効化
+        if self._reset_sort_on_update:
+            # 挿入順（config.members 順）を保持するためソートインジケーターをリセット
+            self.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
 
     def selected_id(self) -> Optional[str]:
         """選択行の UserRole データ（IDX）を返す"""

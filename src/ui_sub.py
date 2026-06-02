@@ -821,6 +821,7 @@ class RoadmapView(QWidget):
         self._current_level = "Project4"
         self._cell_unit = "週"  # "日" / "週" / "月"
         self._date_col_extra: int = 0  # 日付列幅の追加ピクセル数
+        self._filter_own: bool = False  # True = 選択中メンバーのみ表示
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -914,12 +915,44 @@ class RoadmapView(QWidget):
         # ── スプリッター：左ツリー + 右テーブル ──
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # 左: 親絞り込みツリー（Edit スタイル）
+        # 左: 親絞り込みツリー（ボタンバー＋ツリーをラッパーウィジェットに収める）
+        _left_widget = QWidget()
+        _left_widget.setMinimumWidth(160)
+        _left_widget.setMaximumWidth(280)
+        _left_layout = QVBoxLayout(_left_widget)
+        _left_layout.setContentsMargins(0, 0, 0, 0)
+        _left_layout.setSpacing(2)
+
+        # ボタン行（全展開/全閉じ/選択中メンバーのみ）
+        _tree_btn_style = (
+            "QPushButton { background:#F5F5F5; border:1px solid #BDBDBD;"
+            " border-radius:4px; padding:2px 6px; font-size:7pt; }"
+            "QPushButton:hover { background:#E0E0E0; }"
+            "QPushButton:checked { background:#1565C0; color:white; border-color:#1565C0; }"
+        )
+        _tree_btn_row = QHBoxLayout()
+        _expand_all_btn = QPushButton("⊞ 全展開")
+        _expand_all_btn.setStyleSheet(_tree_btn_style)
+        _expand_all_btn.setToolTip("ツリーを全て展開")
+        _tree_btn_row.addWidget(_expand_all_btn)
+        _collapse_all_btn = QPushButton("⊟ 全閉じ")
+        _collapse_all_btn.setStyleSheet(_tree_btn_style)
+        _collapse_all_btn.setToolTip("ツリーを全て閉じる")
+        _tree_btn_row.addWidget(_collapse_all_btn)
+        _tree_btn_row.addStretch()
+        _left_layout.addLayout(_tree_btn_row)
+
+        # 選択中メンバーのみボタン
+        self._filter_own_btn = QPushButton("👤 選択中メンバーのみ")
+        self._filter_own_btn.setStyleSheet(_tree_btn_style)
+        self._filter_own_btn.setCheckable(True)
+        self._filter_own_btn.setChecked(False)
+        self._filter_own_btn.toggled.connect(self._on_filter_own_toggle)
+        _left_layout.addWidget(self._filter_own_btn)
+
         self.tree = QTreeWidget()
         self.tree.setColumnCount(1)
         self.tree.setHeaderLabel("親の絞り込み")
-        self.tree.setMinimumWidth(160)
-        self.tree.setMaximumWidth(280)
         self.tree.setIndentation(16)
         self.tree.setRootIsDecorated(True)
         self.tree.setStyleSheet("""
@@ -933,7 +966,13 @@ class RoadmapView(QWidget):
         # Ctrl+クリックで複数の親を選択できるよう拡張選択モードに変更
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
-        self._splitter.addWidget(self.tree)
+        _left_layout.addWidget(self.tree)
+
+        # ボタンをツリー生成後に接続
+        _expand_all_btn.clicked.connect(self.tree.expandAll)
+        _collapse_all_btn.clicked.connect(self.tree.collapseAll)
+
+        self._splitter.addWidget(_left_widget)
 
         # 右: スケジュールテーブル
         self.table = QTableWidget()
@@ -945,6 +984,8 @@ class RoadmapView(QWidget):
             "QTableWidget { gridline-color: #E8EAF6; font-size: 8pt; }"
             "QTableWidget::item:selected { background: #C5CAE9; color: black; }"
         )
+        self.table.setMouseTracking(True)
+        self.table.cellEntered.connect(self._on_cell_entered)
         # ダブルクリック・右クリックメニューの設定
         self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1048,6 +1089,73 @@ class RoadmapView(QWidget):
             if item.data(0, Qt.ItemDataRole.UserRole) is not None
         }
         self._rebuild_table()
+
+    def _on_filter_own_toggle(self, checked: bool) -> None:
+        self._filter_own = checked
+        self._filter_own_btn.setText(
+            "👤 選択中メンバーのみ ✓" if checked else "👤 選択中メンバーのみ"
+        )
+        self._rebuild_table()
+
+    def _own_subtree_idxs(self, df) -> set:
+        """自分のノード（および配下に自分のノードがある親）の IDX セットを返す"""
+        user = self.state.current_user
+        own = set(df[df["assigned_to"] == user].index)
+        result = set(own)
+        for idx in own:
+            pid = df.loc[idx, "parent_id"] if idx in df.index else None
+            while pid and pid != "0" and pid in df.index:
+                result.add(pid)
+                pid = df.loc[pid, "parent_id"]
+        return result
+
+    def _on_cell_entered(self, row: int, col: int) -> None:
+        """色分けエリアにマウスが入ったときツールチップを表示する"""
+        if col < self._FIXED_COLS:
+            QToolTip.hideText()
+            return
+        item = self.table.item(row, col)
+        if not item:
+            QToolTip.hideText()
+            return
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        if not idx:
+            QToolTip.hideText()
+            return
+        tip = self._build_tooltip(str(idx))
+        if tip:
+            QToolTip.showText(QCursor.pos(), tip, self.table)
+        else:
+            QToolTip.hideText()
+
+    def _build_tooltip(self, idx: str) -> str:
+        """idx ノードの配下チケットをツリー状に整形したツールチップ文字列を返す"""
+        df = self.state.df_nodes
+        if idx not in df.index:
+            return ""
+        lines: list = []
+        self._tooltip_lines(df, idx, lines, depth=0)
+        return "\n".join(lines)
+
+    def _tooltip_lines(self, df, idx: str, lines: list, depth: int) -> None:
+        """再帰的にノードとその子をツールチップ行に追加する"""
+        if idx not in df.index:
+            return
+        row = df.loc[idx]
+        ntype = str(row.get("node_type", ""))
+        label = self._TYPE_LABEL.get(ntype, ntype)
+        title = str(row.get("title", ""))
+        indent = "  " * depth
+        if ntype == "ticket":
+            assignee = self.state.display_name(str(row.get("assigned_to", "")))
+            est = float(row.get("estimated_hours") or 0)
+            act = float(row.get("actual_hours") or 0)
+            lines.append(f"{indent}[{label}] {title}  担当:{assignee}  実績:{act:.1f}h/見積:{est:.1f}h")
+        else:
+            lines.append(f"{indent}[{label}] {title}")
+            children = df[df["parent_id"] == idx]
+            for cid, _ in children.iterrows():
+                self._tooltip_lines(df, cid, lines, depth + 1)
 
     def _on_quick_period(self, name: str) -> None:
         """クイック期間ボタン押下時に from/to を設定してテーブルを再描画する"""
@@ -1337,6 +1445,10 @@ class RoadmapView(QWidget):
             (df["node_type"] == node_type)
             & (~df["status"].isin(["deleted"]))
         ].sort_values("priority")
+        # 選択中メンバーのみフィルタ
+        if self._filter_own:
+            own_idxs = self._own_subtree_idxs(df)
+            items = items[items.index.isin(own_idxs)]
         filter_idxs = self._selected_parent_idxs  # set[str]（空の場合は全件表示）
 
         # daily_schedule から ticket の実績作業日セットを収集（{ticket_idx: set[date]}）
@@ -2183,12 +2295,12 @@ class TeamLogView(QWidget):
         # 勤務時間表
         layout.addWidget(QLabel("本日の勤務状況"))
         WORK_COLS = ["メンバー", "勤務時間", "勤務場所", "残業", "健康状態"]
-        self.work_table = ScrollableTable(WORK_COLS, [120, 200, 110, 80, 110])
+        self.work_table = ScrollableTable(WORK_COLS, [120, 200, 110, 80, 110], reset_sort_on_update=True)
         layout.addWidget(self.work_table, stretch=1)
 
         layout.addWidget(QLabel("連絡事項 / 備考"))
         INFO_COLS = ["メンバー", "安全宣言", "連絡事項(本日)", "連絡事項(常時)"]
-        self.info_table = ScrollableTable(INFO_COLS, [120, 90, 250, 300])
+        self.info_table = ScrollableTable(INFO_COLS, [120, 90, 250, 300], reset_sort_on_update=True)
         layout.addWidget(self.info_table, stretch=1)
 
         self.info_lbl = InfoLabel()
