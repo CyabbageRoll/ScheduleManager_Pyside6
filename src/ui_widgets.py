@@ -322,10 +322,10 @@ class ScrollableTable(QTableWidget):
                     bg.setAlpha(80)
                     item.setBackground(bg)
                 self.setItem(r_idx, c_idx, item)
-        self.setSortingEnabled(True)  # 挿入完了後にソート再有効化
         if self._reset_sort_on_update:
-            # 挿入順（config.members 順）を保持するためソートインジケーターをリセット
+            # setSortingEnabled(True) 前にリセットしないと Qt が自動ソートを実行してしまう
             self.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        self.setSortingEnabled(True)  # 挿入完了後にソート再有効化
 
     def selected_id(self) -> Optional[str]:
         """選択行の UserRole データ（IDX）を返す"""

@@ -939,16 +939,14 @@ class RoadmapView(QWidget):
         _collapse_all_btn.setStyleSheet(_tree_btn_style)
         _collapse_all_btn.setToolTip("ツリーを全て閉じる")
         _tree_btn_row.addWidget(_collapse_all_btn)
-        _tree_btn_row.addStretch()
-        _left_layout.addLayout(_tree_btn_row)
-
-        # 選択中メンバーのみボタン
         self._filter_own_btn = QPushButton("👤 選択中メンバーのみ")
         self._filter_own_btn.setStyleSheet(_tree_btn_style)
         self._filter_own_btn.setCheckable(True)
         self._filter_own_btn.setChecked(False)
         self._filter_own_btn.toggled.connect(self._on_filter_own_toggle)
-        _left_layout.addWidget(self._filter_own_btn)
+        _tree_btn_row.addWidget(self._filter_own_btn)
+        _tree_btn_row.addStretch()
+        _left_layout.addLayout(_tree_btn_row)
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(1)
@@ -984,8 +982,6 @@ class RoadmapView(QWidget):
             "QTableWidget { gridline-color: #E8EAF6; font-size: 8pt; }"
             "QTableWidget::item:selected { background: #C5CAE9; color: black; }"
         )
-        self.table.setMouseTracking(True)
-        self.table.cellEntered.connect(self._on_cell_entered)
         # ダブルクリック・右クリックメニューの設定
         self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1035,11 +1031,12 @@ class RoadmapView(QWidget):
             all_item = QTreeWidgetItem(["（全て）"])
             all_item.setData(0, Qt.ItemDataRole.UserRole, None)
             self.tree.addTopLevelItem(all_item)
-            self._fill_tree(df, "0", None)
+            filter_set = self._own_subtree_idxs(df) if self._filter_own else None
+            self._fill_tree(df, "0", None, filter_set)
             self._expand_to_p4(self.tree.invisibleRootItem())
         self.tree.blockSignals(False)
 
-    def _fill_tree(self, df, parent_id, parent_item) -> None:
+    def _fill_tree(self, df, parent_id, parent_item, filter_set=None) -> None:
         node_types = ["project1", "project2", "project3", "project4", "task"]
         children = df[
             (df["parent_id"] == parent_id)
@@ -1047,6 +1044,8 @@ class RoadmapView(QWidget):
             & (~df["status"].isin(["deleted"]))
         ].sort_values("priority")
         for idx, row in children.iterrows():
+            if filter_set is not None and idx not in filter_set:
+                continue  # 選択中メンバーのサブツリー外はスキップ
             ntype = str(row.get("node_type", ""))
             type_short  = self._TYPE_LABEL.get(ntype, ntype)
             status_icon = {"done": "✓", "cancel": "✗", "regularly": "↻"}.get(
@@ -1061,7 +1060,7 @@ class RoadmapView(QWidget):
                 self.tree.addTopLevelItem(item)
             else:
                 parent_item.addChild(item)
-            self._fill_tree(df, idx, item)
+            self._fill_tree(df, idx, item, filter_set)
 
     def _expand_to_p4(self, parent_item) -> None:
         """P1〜P3 を展開、P4 は表示するが閉じたまま（Task 以下は見えない）"""
@@ -1095,7 +1094,7 @@ class RoadmapView(QWidget):
         self._filter_own_btn.setText(
             "👤 選択中メンバーのみ ✓" if checked else "👤 選択中メンバーのみ"
         )
-        self._rebuild_table()
+        self.refresh()  # ツリーも再構築が必要
 
     def _own_subtree_idxs(self, df) -> set:
         """自分のノード（および配下に自分のノードがある親）の IDX セットを返す"""
@@ -1108,25 +1107,6 @@ class RoadmapView(QWidget):
                 result.add(pid)
                 pid = df.loc[pid, "parent_id"]
         return result
-
-    def _on_cell_entered(self, row: int, col: int) -> None:
-        """色分けエリアにマウスが入ったときツールチップを表示する"""
-        if col < self._FIXED_COLS:
-            QToolTip.hideText()
-            return
-        item = self.table.item(row, col)
-        if not item:
-            QToolTip.hideText()
-            return
-        idx = item.data(Qt.ItemDataRole.UserRole)
-        if not idx:
-            QToolTip.hideText()
-            return
-        tip = self._build_tooltip(str(idx))
-        if tip:
-            QToolTip.showText(QCursor.pos(), tip, self.table)
-        else:
-            QToolTip.hideText()
 
     def _build_tooltip(self, idx: str) -> str:
         """idx ノードの配下チケットをツリー状に整形したツールチップ文字列を返す"""
@@ -1445,10 +1425,6 @@ class RoadmapView(QWidget):
             (df["node_type"] == node_type)
             & (~df["status"].isin(["deleted"]))
         ].sort_values("priority")
-        # 選択中メンバーのみフィルタ
-        if self._filter_own:
-            own_idxs = self._own_subtree_idxs(df)
-            items = items[items.index.isin(own_idxs)]
         filter_idxs = self._selected_parent_idxs  # set[str]（空の場合は全件表示）
 
         # daily_schedule から ticket の実績作業日セットを収集（{ticket_idx: set[date]}）
@@ -1620,10 +1596,12 @@ class RoadmapView(QWidget):
                 item_actual_dates |= actual_dates.get(t_idx, set())
 
             # 日付バー（計画 + 実績）
+            tooltip_text = self._build_tooltip(str(idx))
             for ci, (ps, pe, _pl) in enumerate(periods):
                 cell = QTableWidgetItem()
                 cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 cell.setData(Qt.ItemDataRole.UserRole, idx)
+                cell.setToolTip(tooltip_text)
 
                 if ps.weekday() >= 5 and self._cell_unit == "日":
                     cell.setBackground(QColor("#F0F0F0"))
