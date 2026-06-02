@@ -1158,12 +1158,23 @@ class TreePane(QWidget):
             ("🗑 削除",  self._on_delete),
         ])
         top_row.addWidget(self._btn_row)
-        self.filter_btn = QPushButton("👤 自分のみ ✓")
+        self.filter_btn = QPushButton("👤 選択中メンバーのみ ✓")
         self.filter_btn.setStyleSheet(STYLE_BUTTON)
         self.filter_btn.setCheckable(True)
         self.filter_btn.setChecked(True)
         self.filter_btn.toggled.connect(self._on_filter_toggle)
         top_row.addWidget(self.filter_btn)
+        # ツリー全展開 / 全閉じボタン
+        _expand_btn = QPushButton("⊞ 全展開")
+        _expand_btn.setStyleSheet(STYLE_BUTTON)
+        _expand_btn.setToolTip("ツリーを全て展開")
+        _expand_btn.clicked.connect(self.tree.expandAll)
+        top_row.addWidget(_expand_btn)
+        _collapse_btn = QPushButton("⊟ 全閉じ")
+        _collapse_btn.setStyleSheet(STYLE_BUTTON)
+        _collapse_btn.setToolTip("ツリーを全て閉じる")
+        _collapse_btn.clicked.connect(self.tree.collapseAll)
+        top_row.addWidget(_collapse_btn)
         # AI取込確認用「次へ」ボタン（取込時のみ有効）
         self._next_btn = QPushButton("次へ →")
         self._next_btn.setStyleSheet(STYLE_BUTTON)
@@ -1223,7 +1234,7 @@ class TreePane(QWidget):
 
     def _on_filter_toggle(self, checked: bool) -> None:
         self._filter_own = checked
-        self.filter_btn.setText("👤 自分のみ ✓" if checked else "👤 自分のみ")
+        self.filter_btn.setText("👤 選択中メンバーのみ ✓" if checked else "👤 選択中メンバーのみ")
         self.refresh()
 
     def _on_search(self, text: str) -> None:
