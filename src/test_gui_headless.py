@@ -728,6 +728,133 @@ def test_report_view(win):
         ng("output_dir 保存", e)
 
 
+def test_progress_snapshots(state):
+    """進捗スナップショットの計算・保存（重複防止）・読込のテスト"""
+    print("\n[14] 進捗スナップショットテスト")
+    import logic as LG
+
+    try:
+        rows = LG.build_progress_snapshot_rows(state.df_nodes)
+        assert len(rows) >= 1, f"スナップショット行が空: {rows}"
+        ok(f"スナップショット行計算: {len(rows)} 件")
+    except Exception as e:
+        ng("build_progress_snapshot_rows", e)
+        return
+
+    try:
+        n1 = state.db.save_progress_snapshots(rows)
+        n2 = state.db.save_progress_snapshots(rows)  # 同日 2 回目はスキップされる
+        assert n1 == len(rows), f"初回保存 {n1} 件 (期待 {len(rows)})"
+        assert n2 == 0, f"同日再実行 {n2} 件 (期待 0)"
+        ok(f"保存 {n1} 件 / 同日再実行 {n2} 件（重複防止 OK）")
+    except Exception as e:
+        ng("save_progress_snapshots", e)
+        return
+
+    try:
+        df = state.db.read_progress_snapshots(rows[0]["node_idx"])
+        assert len(df) == 1, f"読込件数 {len(df)}"
+        assert int(df.iloc[0]["total_count"]) == rows[0]["total_count"]
+        ok("read_progress_snapshots: 件数・内容一致 OK")
+    except Exception as e:
+        ng("read_progress_snapshots", e)
+
+
+def test_progress_report(state, win):
+    """月次進捗レポート（進捗計算・チャート・md・ReportView）のテスト"""
+    print("\n[15] 月次進捗レポートテスト")
+    import logic as LG
+
+    df = state.df_nodes
+    try:
+        p4_rows = df[(df["node_type"] == "project4") & (df["title"] == "テストP4")]
+        assert len(p4_rows) == 1, "テストP4 が見つからない"
+        p4_idx = p4_rows.index[0]
+        ok("テストP4 を取得")
+    except Exception as e:
+        ng("テストP4 取得", e)
+        return
+
+    try:
+        prog = LG.calc_progress(df, p4_idx)
+        # テストP4 配下: 完了チケット(done) + 進行中チケット(todo) の 2 件
+        assert prog["total_count"] == 2, f"total={prog['total_count']}"
+        assert prog["done_count"] == 1, f"done={prog['done_count']}"
+        assert abs(prog["count_rate"] - 50.0) < 1e-9, f"rate={prog['count_rate']}"
+        ok(f"calc_progress: {prog['count_rate']}% ({prog['done_count']}/{prog['total_count']})")
+    except Exception as e:
+        ng("calc_progress", e)
+        return
+
+    try:
+        tasks = LG.calc_task_summary(df, p4_idx)
+        assert len(tasks) == 1, f"tasks={len(tasks)}"
+        assert tasks[0]["title"] == "P4配下Task"
+        assert tasks[0]["total_count"] == 2
+        ok(f"calc_task_summary: {tasks[0]['title']} "
+           f"({tasks[0]['done_count']}/{tasks[0]['total_count']}, {tasks[0]['state']})")
+    except Exception as e:
+        ng("calc_task_summary", e)
+        return
+
+    try:
+        df_snap = state.db.read_progress_snapshots(p4_idx)
+        data = LG.collect_progress_data(df, df_snap, p4_idx)
+        md = LG.build_progress_markdown(data, ["charts/a.png", "charts/b.png"])
+        assert "# 月次進捗" in md and "テストP4" in md, md[:80]
+        assert "charts/a.png" in md and "スケジュール状況" in md
+        ok("build_progress_markdown OK")
+    except Exception as e:
+        ng("build_progress_markdown", e)
+        return
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            paths = LG.save_progress_charts(df_snap, data["tasks"], "test_base", td)
+            assert len(paths) == 2, f"paths={paths}"
+            for rel in paths:
+                f = Path(td) / rel
+                assert f.exists() and f.stat().st_size > 0, f"PNG 未生成: {rel}"
+            ok(f"チャート PNG 出力 OK: {len(paths)} 枚")
+    except Exception as e:
+        ng("save_progress_charts", e)
+
+    # ReportView の月次進捗モード
+    rv = win.report_view
+    try:
+        rv.refresh()
+        pos = rv.f_mode.findData("progress")
+        assert pos >= 0, "月次進捗モードがコンボにない"
+        rv.f_mode.setCurrentIndex(pos)
+        rv._on_generate()
+        text = rv.preview.toPlainText()
+        assert "# 月次進捗" in text, f"preview={text[:40]}"
+        ok("ReportView 月次進捗生成 OK")
+    except Exception as e:
+        ng("ReportView 月次進捗生成", e)
+        return
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            win.state.config.report_output_dir = td
+            rv._on_save()
+            mds = list(Path(td).glob("progress_*.md"))
+            pngs = list((Path(td) / "charts").glob("*.png"))
+            assert len(mds) == 1, f"md 数={len(mds)}"
+            assert len(pngs) == 2, f"PNG 数={len(pngs)}"
+            content = mds[0].read_text(encoding="utf-8")
+            # md 内のチャート参照名と実ファイル名が一致しているか
+            for p in pngs:
+                assert f"charts/{p.name}" in content, f"md 内に参照なし: {p.name}"
+            ok(f"月次進捗保存 OK: {mds[0].name} + PNG {len(pngs)} 枚（参照一致）")
+        win.state.config.report_output_dir = ""
+        rv.f_mode.setCurrentIndex(0)
+    except Exception as e:
+        win.state.config.report_output_dir = ""
+        rv.f_mode.setCurrentIndex(0)
+        ng("月次進捗保存", e)
+
+
 def test_save_load(state):
     """save() → load() のラウンドトリップ確認"""
     print("\n[8] save / load ラウンドトリップテスト")
@@ -774,6 +901,8 @@ def main():
             test_link_field(state, ticket_idx)
             test_report_logic(state)
             test_report_view(win)
+            test_progress_snapshots(state)
+            test_progress_report(state, win)
             test_save_load(state)
 
     print("\n" + "=" * 55)

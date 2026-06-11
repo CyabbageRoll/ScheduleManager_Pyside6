@@ -470,6 +470,16 @@ def main() -> None:
     if not state.df_nodes.empty:
         state.df_nodes = state.db.recalc_actual_hours(state.df_nodes, state.df_daily)
 
+    # 進捗スナップショットを当日分として記録（1日1回、最初に起動したユーザーが記録）
+    try:
+        from logic import build_progress_snapshot_rows
+        saved = database.save_progress_snapshots(
+            build_progress_snapshot_rows(state.df_nodes))
+        if saved:
+            logger.info(f"進捗スナップショット記録: {saved} 件")
+    except Exception:
+        logger.exception("進捗スナップショット記録エラー")
+
     # Qt アプリケーション起動
     app = QApplication.instance() or QApplication(sys.argv)
     # ライトモード強制（ダークモード環境でも常にライトで表示）

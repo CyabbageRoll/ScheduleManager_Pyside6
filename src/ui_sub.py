@@ -3261,6 +3261,8 @@ class ReportView(QWidget):
     def __init__(self, state):
         super().__init__()
         self.state = state
+        # 月次進捗の生成コンテキスト（保存時のチャート出力に使用）
+        self._progress_ctx = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -3275,6 +3277,7 @@ class ReportView(QWidget):
         self.f_mode = QComboBox()
         self.f_mode.addItem("週報", "weekly")
         self.f_mode.addItem("月報", "monthly")
+        self.f_mode.addItem("月次進捗", "progress")
         row1.addWidget(self.f_mode)
         row1.addSpacing(12)
         row1.addWidget(QLabel("Project4:"))
@@ -3410,6 +3413,10 @@ class ReportView(QWidget):
         if not p4_idx:
             QMessageBox.information(self, "情報", "Project4 を選択してください")
             return
+        if self.f_mode.currentData() == "progress":
+            self._generate_progress(p4_idx)
+            return
+        self._progress_ctx = None
         date_from = self.f_from.get_date()
         date_to = self.f_to.get_date()
         if not date_from or not date_to or date_from > date_to:
@@ -3423,6 +3430,26 @@ class ReportView(QWidget):
         self.info.set_info(
             f"生成しました（完了 {len(data['completed'])} 件 / "
             f"投入工数 {data['period_hours_total']:.2f}h）")
+
+    def _generate_progress(self, p4_idx: str) -> None:
+        """月次進捗レポートを生成する（期間指定は不要、基準日=今日）"""
+        df_snap = (self.state.db.read_progress_snapshots(p4_idx)
+                   if self.state.db else None)
+        data = LG.collect_progress_data(
+            self.state.df_nodes, df_snap, p4_idx,
+            display_name_func=self.state.display_name)
+        fname = LG.report_filename("progress", data["as_of"], data["root_title"])
+        basename = Path(fname).stem
+        chart_paths = [f"charts/{basename}_progress.png",
+                       f"charts/{basename}_evm.png"]
+        # チャート PNG はファイル保存時に md と同じ場所へ出力する
+        self._progress_ctx = (data, df_snap, basename)
+        md = LG.build_progress_markdown(data, chart_paths)
+        self.preview.setPlainText(md)
+        rate = data["progress"].get("count_rate", 0.0) if data["progress"] else 0.0
+        self.info.set_info(
+            f"生成しました（進捗率 {rate:.1f}% / "
+            "グラフ PNG はファイル保存時に出力されます）")
 
     def _on_copy(self) -> None:
         text = self.preview.toPlainText()
@@ -3448,10 +3475,8 @@ class ReportView(QWidget):
         out_dir = (self.state.config.report_output_dir or "").strip()
         if out_dir:
             try:
-                dir_path = Path(out_dir)
-                dir_path.mkdir(parents=True, exist_ok=True)
-                path = dir_path / fname
-                path.write_text(text, encoding="utf-8")
+                path = Path(out_dir) / fname
+                self._save_report_to(path, text)
                 self.info.set_info(f"保存しました: {path}")
                 return
             except Exception as e:
@@ -3464,10 +3489,20 @@ class ReportView(QWidget):
         if not path:
             return
         try:
-            Path(path).write_text(text, encoding="utf-8")
+            self._save_report_to(Path(path), text)
             self.info.set_info(f"保存しました: {path}")
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
+
+    def _save_report_to(self, md_path: Path, text: str) -> None:
+        """md を書き込む。月次進捗の場合はチャート PNG も同じ場所の charts/ へ出力する"""
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        if (self.f_mode.currentData() == "progress"
+                and self._progress_ctx is not None):
+            data, df_snap, basename = self._progress_ctx
+            LG.save_progress_charts(
+                df_snap, data["tasks"], basename, str(md_path.parent))
+        md_path.write_text(text, encoding="utf-8")
 
 
 # ---------- AI取込ビュー ----------
