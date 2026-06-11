@@ -206,6 +206,48 @@ def parse_template_text(text: str, p4_idx: str, owner: str,
 
 # ---------- デイリーワークログ Markdown 出力 ----------
 
+def collect_daily_segments(df_daily: pd.DataFrame, df_nodes: pd.DataFrame,
+                           date_str: str, user: str) -> List[dict]:
+    """
+    指定日の daily_schedule スロットを「同一チケットの連続区間」にまとめて返す。
+    戻り値: [{"from": "09:00", "to": "09:30", "ticket_idx", "title", "task",
+              "hours": 0.5}, ...]（時刻順）
+    """
+    idx = daily_sch_idx(date_str, user)
+    raw: List[tuple] = []  # (開始スロットi, 終了スロットi(排他), ticket_idx)
+    if not df_daily.empty and idx in df_daily.index:
+        ds = df_daily.loc[idx]
+        prev, start_i = "", 0
+        for i in range(len(DAILY_TIME_COLS) + 1):
+            col = DAILY_TIME_COLS[i] if i < len(DAILY_TIME_COLS) else None
+            val = ""
+            if col is not None and col in ds.index and ds[col]:
+                val = str(ds[col])
+            if val != prev:
+                if prev:
+                    raw.append((start_i, i, prev))
+                start_i = i
+                prev = val
+
+    segments: List[dict] = []
+    for s, e, t_idx in raw:
+        end_s = ("24:00" if e >= len(DAILY_TIME_COLS)
+                 else col_to_hhmm(DAILY_TIME_COLS[e]))
+        title, task_title = t_idx, ""
+        if df_nodes is not None and not df_nodes.empty \
+                and t_idx in df_nodes.index:
+            title = str(df_nodes.loc[t_idx, "title"])
+            pid = str(df_nodes.loc[t_idx, "parent_id"])
+            if pid in df_nodes.index:
+                task_title = str(df_nodes.loc[pid, "title"])
+        segments.append({
+            "from": col_to_hhmm(DAILY_TIME_COLS[s]), "to": end_s,
+            "ticket_idx": t_idx, "title": title, "task": task_title,
+            "hours": (e - s) * 0.25,
+        })
+    return segments
+
+
 def build_daily_log_markdown(df_daily: pd.DataFrame, df_nodes: pd.DataFrame,
                              df_log, date_str: str, user: str) -> str:
     """
@@ -235,38 +277,14 @@ def build_daily_log_markdown(df_daily: pd.DataFrame, df_nodes: pd.DataFrame,
         notes = str(lg.get("notes", "") or "")
     lines += ["", "## 作業内訳", ""]
 
-    # スロットを「同一チケットの連続区間」にまとめる
-    segments: List[tuple] = []  # (開始スロットi, 終了スロットi(排他), ticket_idx)
-    if not df_daily.empty and idx in df_daily.index:
-        ds = df_daily.loc[idx]
-        prev, start_i = "", 0
-        for i in range(len(DAILY_TIME_COLS) + 1):
-            col = DAILY_TIME_COLS[i] if i < len(DAILY_TIME_COLS) else None
-            val = ""
-            if col is not None and col in ds.index and ds[col]:
-                val = str(ds[col])
-            if val != prev:
-                if prev:
-                    segments.append((start_i, i, prev))
-                start_i = i
-                prev = val
-
+    segments = collect_daily_segments(df_daily, df_nodes, date_str, user)
     if segments:
         lines += ["| 時間帯 | チケット | タスク | 時間(h) |", "|---|---|---|---|"]
-        for s, e, t_idx in segments:
-            end_s = ("24:00" if e >= len(DAILY_TIME_COLS)
-                     else col_to_hhmm(DAILY_TIME_COLS[e]))
-            title, task_title = t_idx, ""
-            if df_nodes is not None and not df_nodes.empty \
-                    and t_idx in df_nodes.index:
-                title = str(df_nodes.loc[t_idx, "title"])
-                pid = str(df_nodes.loc[t_idx, "parent_id"])
-                if pid in df_nodes.index:
-                    task_title = str(df_nodes.loc[pid, "title"])
+        for seg in segments:
             lines.append(
-                f"| {col_to_hhmm(DAILY_TIME_COLS[s])}〜{end_s}"
-                f" | {_md_escape(title)} | {_md_escape(task_title)}"
-                f" | {(e - s) * 0.25:.2f} |")
+                f"| {seg['from']}〜{seg['to']}"
+                f" | {_md_escape(seg['title'])} | {_md_escape(seg['task'])}"
+                f" | {seg['hours']:.2f} |")
     else:
         lines.append("（記録なし）")
 
@@ -1059,3 +1077,117 @@ def build_progress_markdown(data: dict,
         ("納期",     lambda r: r["deadline"]),
     ])
     return "\n".join(lines) + "\n"
+
+
+# ---------- ダッシュボード・個人振り返り用集計 ----------
+
+def find_deadline_alerts(df_nodes: pd.DataFrame, user: str = "",
+                         within_days: int = 7) -> dict:
+    """
+    納期超過・接近（within_days 日以内）の未完了チケットを抽出する。
+    user 指定時はそのユーザー担当のチケットのみ。納期昇順でソートして返す。
+    戻り値: {"overdue": [行], "approaching": [行]}
+    """
+    res = {"overdue": [], "approaching": []}
+    if df_nodes.empty:
+        return res
+    today_s = datetime.date.today().isoformat()
+    limit_s = (datetime.date.today()
+               + datetime.timedelta(days=within_days)).isoformat()
+    tickets = df_nodes[(df_nodes["node_type"] == "ticket")
+                       & (~df_nodes["status"].isin(["done", "cancel", "deleted"]))]
+    if user:
+        tickets = tickets[tickets["assigned_to"] == user]
+    for idx, r in tickets.iterrows():
+        deadline = _date_str(r.get("deadline"))
+        if not deadline:
+            continue
+        pid = str(r.get("parent_id", ""))
+        row = {
+            "ticket_idx": idx,
+            "title":      str(r.get("title", "")),
+            "task":       str(df_nodes.loc[pid, "title"]) if pid in df_nodes.index else "",
+            "deadline":   deadline,
+        }
+        if deadline < today_s:
+            res["overdue"].append(row)
+        elif deadline <= limit_s:
+            res["approaching"].append(row)
+    res["overdue"].sort(key=lambda r: r["deadline"])
+    res["approaching"].sort(key=lambda r: r["deadline"])
+    return res
+
+
+def _ancestor_title(df_nodes: pd.DataFrame, idx: str, target_type: str) -> str:
+    """指定ノードの祖先のうち target_type のタイトルを返す（無ければ空文字）"""
+    cur = idx
+    while cur in df_nodes.index:
+        pid = str(df_nodes.loc[cur, "parent_id"] or "")
+        if not pid or pid == "0" or pid not in df_nodes.index:
+            return ""
+        if str(df_nodes.loc[pid, "node_type"]) == target_type:
+            return str(df_nodes.loc[pid, "title"])
+        cur = pid
+    return ""
+
+
+def calc_weekly_user_hours_by_p1(df_nodes: pd.DataFrame, df_daily: pd.DataFrame,
+                                 user: str, weeks: int = 4) -> dict:
+    """
+    直近 weeks 週（今週を含む、月曜起点）のユーザー投入工数を
+    週 × Project1 別に集計する。
+    戻り値: {"weeks": ["W23", ...], "by_p1": {P1タイトル: [h, ...]}}
+    """
+    today = datetime.date.today()
+    monday = today - datetime.timedelta(days=today.weekday())
+    week_ranges = [
+        (monday - datetime.timedelta(days=7 * w),
+         monday - datetime.timedelta(days=7 * w) + datetime.timedelta(days=6))
+        for w in range(weeks - 1, -1, -1)
+    ]
+    # 自分の daily_schedule 行のみ対象にする
+    if not df_daily.empty and "Owner" in df_daily.columns:
+        df_user = df_daily[df_daily["Owner"] == user]
+    else:
+        df_user = df_daily
+    tickets = (list(df_nodes[df_nodes["node_type"] == "ticket"].index)
+               if not df_nodes.empty else [])
+
+    labels: List[str] = []
+    by_p1: dict = {}
+    for w_i, (start, end) in enumerate(week_ranges):
+        iso = start.isocalendar()
+        labels.append(f"W{iso[1]:02d}")
+        hours = calc_period_hours(df_user, tickets,
+                                  start.isoformat(), end.isoformat())
+        for t_idx, h in hours.items():
+            if h <= 0:
+                continue
+            p1 = _ancestor_title(df_nodes, t_idx, "project1") or "(P1なし)"
+            by_p1.setdefault(p1, [0.0] * weeks)[w_i] += h
+    for k in by_p1:
+        by_p1[k] = [round(v, 2) for v in by_p1[k]]
+    return {"weeks": labels, "by_p1": by_p1}
+
+
+def calc_estimate_accuracy(df_nodes: pd.DataFrame, user: str) -> List[dict]:
+    """
+    自分が完了したチケットの見積 vs 実績ペアを返す（見積 0 は除外）。
+    ratio = 実績 ÷ 見積（1 超 = 見積より時間がかかった）
+    """
+    res: List[dict] = []
+    if df_nodes.empty:
+        return res
+    done = df_nodes[(df_nodes["node_type"] == "ticket")
+                    & (df_nodes["status"] == "done")
+                    & (df_nodes["assigned_to"] == user)]
+    for idx, r in done.iterrows():
+        est = float(r.get("estimated_hours", 0) or 0)
+        act = float(r.get("actual_hours", 0) or 0)
+        if est > 0:
+            res.append({
+                "title": str(r.get("title", "")),
+                "estimated": est, "actual": act,
+                "ratio": round(act / est, 2),
+            })
+    return res

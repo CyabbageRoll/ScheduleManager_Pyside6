@@ -55,6 +55,8 @@ class AppConfig:
     window_width: int = 1500
     window_height: int = 900
     font_size: int = 9
+    # 起動時に表示するタブ（today / main / edit / plan）
+    start_tab: str = "today"
 
     # [Schedule]
     daily_begin_time: int = 6
@@ -71,6 +73,10 @@ class AppConfig:
     # [Report]
     # 週報・月報などの Markdown 出力先フォルダ（空の場合は保存時にダイアログで選択）
     report_output_dir: str = ""
+
+    # [Pomodoro]
+    pomodoro_work_minutes: int = 25
+    pomodoro_break_minutes: int = 5
 
     # [DisplayNames] - メールアドレス → 表示名 のマッピング
     display_names: Dict[str, str] = field(default_factory=dict)
@@ -123,6 +129,7 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
         cfg.window_width  = parser.getint("GUI", "window_width",  fallback=cfg.window_width)
         cfg.window_height = parser.getint("GUI", "window_height", fallback=cfg.window_height)
         cfg.font_size     = parser.getint("GUI", "font_size",     fallback=cfg.font_size)
+        cfg.start_tab     = parser.get("GUI", "start_tab", fallback=cfg.start_tab).strip().lower()
 
     # [Schedule]
     if parser.has_section("Schedule"):
@@ -149,6 +156,13 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
     if parser.has_section("Report"):
         cfg.report_output_dir = parser.get("Report", "output_dir",
                                            fallback=cfg.report_output_dir)
+
+    # [Pomodoro]
+    if parser.has_section("Pomodoro"):
+        cfg.pomodoro_work_minutes = parser.getint(
+            "Pomodoro", "work_minutes", fallback=cfg.pomodoro_work_minutes)
+        cfg.pomodoro_break_minutes = parser.getint(
+            "Pomodoro", "break_minutes", fallback=cfg.pomodoro_break_minutes)
 
     # [DisplayNames]
     if parser.has_section("DisplayNames"):

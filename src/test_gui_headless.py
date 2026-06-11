@@ -1015,6 +1015,182 @@ def test_llm_copy_and_daily_export(win):
         ng("デイリーログ出力", e)
 
 
+def test_dashboard(win, ticket_idx):
+    """Today ダッシュボード（4カード・バッジ・タブ遷移シグナル）のテスト"""
+    print("\n[19] ダッシュボードテスト")
+    import logic as LG
+    dv = win.dashboard_view
+    state = win.state
+
+    try:
+        dv.refresh()
+        assert set(dv._cards.keys()) == {"schedule", "edit", "request", "team"}
+        ok("4カード構成 OK")
+    except Exception as e:
+        ng("ダッシュボード refresh", e)
+        return
+
+    try:
+        # 納期アラート: チケットA は納期5日後 → 接近に入る
+        alerts = LG.find_deadline_alerts(state.df_nodes, user=state.user,
+                                         within_days=7)
+        titles = [r["title"] for r in alerts["approaching"]]
+        assert "チケットA" in titles, f"approaching={titles}"
+        assert dv._cards["edit"]["list"].count() >= 1
+        ok(f"納期アラート検出 OK（接近 {len(titles)} 件）")
+    except Exception as e:
+        ng("納期アラート", e)
+
+    try:
+        # 過去納期のチケットは超過に入る
+        df = state.df_nodes
+        over_t = df[(df["node_type"] == "ticket")].index[0]
+        orig_deadline = df.loc[over_t, "deadline"]
+        df.loc[over_t, "deadline"] = "2000-01-01"
+        alerts2 = LG.find_deadline_alerts(df, user="", within_days=7)
+        assert any(r["ticket_idx"] == over_t for r in alerts2["overdue"])
+        df.loc[over_t, "deadline"] = orig_deadline
+        ok("納期超過検出 OK")
+    except Exception as e:
+        ng("納期超過検出", e)
+
+    try:
+        # タブ遷移シグナル
+        received = []
+        dv.navigate_requested.connect(lambda k: received.append(k))
+        dv.navigate_requested.emit("request")
+        assert received == ["request"]
+        ok("navigate_requested シグナル OK")
+    except Exception as e:
+        ng("navigate シグナル", e)
+
+    try:
+        # MainWindow 側のタブ遷移マッピング
+        win._on_dashboard_navigate("team")
+        from ui_main import IDX_TEAM
+        assert win.stack.currentIndex() == IDX_TEAM, \
+            f"currentIndex={win.stack.currentIndex()}"
+        ok("ダッシュボード → Team タブ遷移 OK")
+    except Exception as e:
+        ng("タブ遷移", e)
+
+
+def test_pomodoro(win, ticket_idx):
+    """ポモドーロタイマー（状態遷移・スロット記録・占有スキップ）のテスト"""
+    print("\n[20] ポモドーロテスト")
+    state = win.state
+    pomo = win.pomodoro
+
+    try:
+        assert pomo._mode == "idle"
+        title = str(state.df_nodes.loc[ticket_idx, "title"])
+        pomo.set_ticket(ticket_idx, title)
+        assert pomo.ticket_lbl.text() == title
+        ok("チケット設定 OK")
+    except Exception as e:
+        ng("チケット設定", e)
+        return
+
+    try:
+        pomo._start_work()
+        assert pomo._mode == "work" and pomo._timer.isActive()
+        pomo._timer.stop()  # テストでは tick を進めない
+        ok("作業開始 → work 状態 OK")
+        pomo._start_break()
+        assert pomo._mode == "break"
+        pomo._to_idle()
+        assert pomo._mode == "idle" and not pomo._timer.isActive()
+        ok("休憩 → idle の状態遷移 OK")
+    except Exception as e:
+        ng("状態遷移", e)
+
+    # スロット記録（確認ダイアログを通らない内部メソッドで検証）
+    try:
+        from db import daily_sch_idx, DAILY_TIME_COLS
+        today = datetime.date.today().isoformat()
+        sch_idx = daily_sch_idx(today, state.login_user)
+        before = float(state.df_nodes.loc[ticket_idx, "actual_hours"])
+        win._write_pomodoro_slots(sch_idx, [60, 61], ticket_idx)  # 15:00-15:30
+        col = DAILY_TIME_COLS[60]
+        assert state.df_daily.loc[sch_idx, col] == ticket_idx
+        after = float(state.df_nodes.loc[ticket_idx, "actual_hours"])
+        assert abs(after - (before + 0.5)) < 1e-9, f"{before} → {after}"
+        ok(f"スロット記録 + actual_hours 反映 OK ({before:.2f} → {after:.2f})")
+    except Exception as e:
+        ng("スロット記録", e)
+        return
+
+    try:
+        # 経過時間→スロット数の丸め確認（_on_pomodoro_finished の前段ロジック）
+        start = datetime.datetime(2026, 6, 11, 15, 0, 0)
+        end = start + datetime.timedelta(minutes=25)
+        n = int(round((end - start).total_seconds() / 60 / 15))
+        assert n == 2, f"25分 → {n} スロット"
+        end2 = start + datetime.timedelta(minutes=5)
+        n2 = int(round((end2 - start).total_seconds() / 60 / 15))
+        assert n2 == 0, f"5分 → {n2} スロット"
+        ok("15分丸め（25分→2スロット / 5分→0）OK")
+    except Exception as e:
+        ng("15分丸め", e)
+
+    try:
+        # 後始末: 記録したスロットを解除して工数を戻す
+        panel = win.schedule_panel
+        win.state.current_date = datetime.date.today().isoformat()
+        panel._update_schedule_slots([60, 61], "")
+        ok("テストスロットの後始末 OK")
+    except Exception as e:
+        ng("後始末", e)
+
+
+def test_personal_review(state, win):
+    """個人振り返り（週別P1工数・見積精度）のテスト"""
+    print("\n[21] 個人振り返りテスト")
+    import pandas as pd
+    import logic as LG
+    from db import DAILY_SCH_COLS, DAILY_TIME_COLS, daily_sch_idx
+
+    user = state.user
+    df = state.df_nodes
+    ticket_idx = df[df["title"] == "チケットA"].index[0]
+
+    try:
+        today = datetime.date.today().isoformat()
+        row = {c: "" for c in DAILY_SCH_COLS[1:]}
+        row["Owner"] = user
+        row[DAILY_TIME_COLS[36]] = ticket_idx
+        row[DAILY_TIME_COLS[37]] = ticket_idx
+        df_daily = pd.DataFrame([row], index=[daily_sch_idx(today, user)])
+        weekly = LG.calc_weekly_user_hours_by_p1(df, df_daily, user, weeks=4)
+        assert len(weekly["weeks"]) == 4, weekly["weeks"]
+        assert "テストPJ" in weekly["by_p1"], f"by_p1={weekly['by_p1']}"
+        assert abs(weekly["by_p1"]["テストPJ"][-1] - 0.5) < 1e-9
+        ok(f"週別P1工数: 今週 {weekly['by_p1']['テストPJ'][-1]}h（テストPJ）")
+    except Exception as e:
+        ng("calc_weekly_user_hours_by_p1", e)
+
+    try:
+        acc = LG.calc_estimate_accuracy(df, user)
+        # 「完了チケット」(est=2.0, done) が含まれる
+        titles = [a["title"] for a in acc]
+        assert "完了チケット" in titles, f"acc={titles}"
+        ok(f"見積精度ペア抽出 OK: {len(acc)} 件")
+    except Exception as e:
+        ng("calc_estimate_accuracy", e)
+
+    try:
+        anal = win.anal_view
+        anal._calc_personal()
+        assert len(anal._fig.axes) == 2, f"axes={len(anal._fig.axes)}"
+        ok("個人振り返り描画（2グラフ）OK")
+        # 通常の集計に戻しても描画できる（Figure 再生成の確認）
+        anal._calc()
+        assert len(anal._fig.axes) == 1
+        ok("振り返り後の通常集計 OK（リグレッションなし）")
+    except Exception as e:
+        ng("個人振り返り描画", e)
+
+
 def test_save_load(state):
     """save() → load() のラウンドトリップ確認"""
     print("\n[8] save / load ラウンドトリップテスト")
@@ -1066,6 +1242,9 @@ def main():
             test_template_parse(state)
             test_daily_log_markdown(state)
             test_llm_copy_and_daily_export(win)
+            test_dashboard(win, ticket_idx)
+            test_pomodoro(win, ticket_idx)
+            test_personal_review(state, win)
             test_save_load(state)
 
     print("\n" + "=" * 55)

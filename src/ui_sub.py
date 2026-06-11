@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QRadioButton, QButtonGroup, QCalendarWidget, QMenu,
     QDialog, QDialogButtonBox, QSpinBox, QDoubleSpinBox,
     QTreeWidget, QTreeWidgetItem, QStyledItemDelegate, QPlainTextEdit,
-    QApplication,
+    QApplication, QGridLayout,
 )
 from PySide6.QtCore import Qt, Signal, QDate
 from PySide6.QtGui import QColor, QFont, QAction, QCursor, QPen
@@ -1751,6 +1751,13 @@ class AnalysisView(QWidget):
         calc_btn.setStyleSheet(STYLE_BUTTON)
         calc_btn.clicked.connect(self._calc)
         right_vlay.addWidget(calc_btn)
+        # 個人振り返りボタン（自分の週別工数配分と見積精度）
+        personal_btn = QPushButton("🔍 個人振り返り")
+        personal_btn.setStyleSheet(STYLE_BUTTON)
+        personal_btn.setToolTip("自分の直近4週の投入工数（Project1 別）と\n"
+                                "完了チケットの見積精度を表示します")
+        personal_btn.clicked.connect(self._calc_personal)
+        right_vlay.addWidget(personal_btn)
         right_vlay.addStretch()
 
         ctrl_h.addLayout(right_vlay, stretch=1)
@@ -1943,7 +1950,9 @@ class AnalysisView(QWidget):
                     agg[anc]["est"]    += float(t_row.get("estimated_hours", 0) or 0)
 
         # ── 棒グラフ描画 ──────────────────────────────────
-        self._ax.clear()
+        # 個人振り返り（2分割描画）の後でも正しく描けるよう Figure ごと再生成する
+        self._fig.clear()
+        self._ax = self._fig.add_subplot(111)
         if agg:
             labels  = [v["title"] for v in agg.values()]
             ests    = [v["est"]    for v in agg.values()]
@@ -2004,6 +2013,56 @@ class AnalysisView(QWidget):
         self.info.set_info(
             f"集計: {len(agg)} ノード / 超過チケット: {len(al_rows)}"
         )
+
+    def _calc_personal(self) -> None:
+        """個人振り返り: 自分の週別投入工数（P1別）と見積精度を描画する"""
+        user = self.state.user
+        weekly = LG.calc_weekly_user_hours_by_p1(
+            self.state.df_nodes, self.state.df_daily, user, weeks=4)
+        acc = LG.calc_estimate_accuracy(self.state.df_nodes, user)
+
+        self._fig.clear()
+
+        # 左: 週別 × Project1 別の積み上げ棒
+        ax1 = self._fig.add_subplot(121)
+        bottoms = [0.0] * len(weekly["weeks"])
+        for p1, vals in sorted(weekly["by_p1"].items()):
+            ax1.bar(weekly["weeks"], vals, bottom=bottoms, label=p1)
+            bottoms = [b + v for b, v in zip(bottoms, vals)]
+        ax1.set_title(
+            f"週別投入工数（{self.state.display_name(user)}）", fontsize=10)
+        ax1.set_ylabel("工数 (h)", fontsize=9)
+        if weekly["by_p1"]:
+            ax1.legend(fontsize=8)
+        else:
+            ax1.text(0.5, 0.5, "直近4週の実績がありません",
+                     ha="center", va="center", transform=ax1.transAxes,
+                     fontsize=9, color="#888")
+
+        # 右: 見積 vs 実績の散布図（対角線より上 = 見積より時間がかかった）
+        ax2 = self._fig.add_subplot(122)
+        if acc:
+            xs = [a["estimated"] for a in acc]
+            ys = [a["actual"] for a in acc]
+            ax2.scatter(xs, ys, color="#1565C0", alpha=0.7)
+            m = max(max(xs), max(ys)) * 1.1
+            ax2.plot([0, m], [0, m], "--", color="#999", linewidth=1)
+        else:
+            ax2.text(0.5, 0.5, "見積付きの完了チケットがありません",
+                     ha="center", va="center", transform=ax2.transAxes,
+                     fontsize=9, color="#888")
+        ax2.set_title("見積 vs 実績（完了チケット）", fontsize=10)
+        ax2.set_xlabel("見積 (h)", fontsize=9)
+        ax2.set_ylabel("実績 (h)", fontsize=9)
+        self._canvas.draw()
+
+        if acc:
+            avg_ratio = sum(a["ratio"] for a in acc) / len(acc)
+            self.info.set_info(
+                f"個人振り返り: 完了 {len(acc)} 件 / 実績÷見積 平均 {avg_ratio:.2f}"
+                "（1 超 = 見積より時間がかかる傾向）")
+        else:
+            self.info.set_info("個人振り返り: 見積付きの完了チケットがありません")
 
     def _on_alert_memo_changed(self, item: QTableWidgetItem) -> None:
         """超過チケット一覧のメモ列が編集されたとき、df_nodes を更新する"""
@@ -3059,6 +3118,7 @@ class ConfigView(QWidget):
         self._build_section_schedule()
         self._build_section_daily_info()
         self._build_section_report()
+        self._build_section_pomodoro()
         self._build_section_commands()
 
         self._form_layout.addStretch()
@@ -3154,6 +3214,8 @@ class ConfigView(QWidget):
         self._spin("gui_window_width",  cfg.window_width,  fl, "window_width:",  800, 3840)
         self._spin("gui_window_height", cfg.window_height, fl, "window_height:", 400, 2160)
         self._spin("gui_font_size",     cfg.font_size,     fl, "font_size:",     6, 24)
+        self._text("gui_start_tab",     cfg.start_tab,     fl,
+                   "start_tab (today/main/edit/plan):")
 
     def _build_section_schedule(self) -> None:
         cfg = self.state.config
@@ -3177,6 +3239,14 @@ class ConfigView(QWidget):
         fl = self._group("[Report]")
         self._text("report_output_dir", cfg.report_output_dir, fl,
                    "output_dir (Markdown 出力先フォルダ):")
+
+    def _build_section_pomodoro(self) -> None:
+        cfg = self.state.config
+        fl = self._group("[Pomodoro]")
+        self._spin("pomo_work",  cfg.pomodoro_work_minutes,  fl,
+                   "work_minutes (作業時間/分):", 1, 120)
+        self._spin("pomo_break", cfg.pomodoro_break_minutes, fl,
+                   "break_minutes (休憩時間/分):", 1, 60)
 
     def _build_section_commands(self) -> None:
         cfg = self.state.config
@@ -3218,6 +3288,9 @@ class ConfigView(QWidget):
         _set("di_safety",        ", ".join(cfg.safety_options))
         _set("di_overwork",      ", ".join(cfg.overwork_options))
         _set("report_output_dir", cfg.report_output_dir)
+        _set("gui_start_tab",    cfg.start_tab)
+        _set("pomo_work",        cfg.pomodoro_work_minutes)
+        _set("pomo_break",       cfg.pomodoro_break_minutes)
 
     # ── 保存 ──
 
@@ -3259,6 +3332,7 @@ class ConfigView(QWidget):
         parser.set("GUI", "window_width",  self._get("gui_window_width"))
         parser.set("GUI", "window_height", self._get("gui_window_height"))
         parser.set("GUI", "font_size",     self._get("gui_font_size"))
+        parser.set("GUI", "start_tab",     self._get("gui_start_tab"))
 
         _ensure("Schedule")
         parser.set("Schedule", "daily_begin_time", self._get("sch_begin"))
@@ -3275,6 +3349,10 @@ class ConfigView(QWidget):
         _ensure("Report")
         parser.set("Report", "output_dir", self._get("report_output_dir"))
 
+        _ensure("Pomodoro")
+        parser.set("Pomodoro", "work_minutes",  self._get("pomo_work"))
+        parser.set("Pomodoro", "break_minutes", self._get("pomo_break"))
+
         # Commands は既存エントリをそのまま保持（フォームに表示した分のみ更新）
         _ensure("Commands")
         cfg = self.state.config
@@ -3290,6 +3368,164 @@ class ConfigView(QWidget):
             self.info.set_info("user_config.ini を保存しました（一部設定は再起動後に反映）")
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
+
+
+# ---------- 今日のダッシュボード ----------
+
+class DashboardView(QWidget):
+    """今日のダッシュボード（今日やること・気にすべきことを 1 画面に集約）"""
+
+    # カードの「開く」クリック → MainWindow がタブ遷移する
+    navigate_requested = Signal(str)  # "schedule" / "edit" / "request" / "team"
+
+    def __init__(self, state):
+        super().__init__()
+        self.state = state
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.header_lbl = QLabel("🏠 Today")
+        layout.addWidget(self.header_lbl)
+        layout.addWidget(Separator())
+
+        grid = QGridLayout()
+        grid.setSpacing(8)
+        self._cards: dict = {}
+        grid.addWidget(self._make_card(
+            "schedule", "📅 今日のスケジュール", "Main タブへ"), 0, 0)
+        grid.addWidget(self._make_card(
+            "edit", "⏰ 納期アラート（自分の担当）", "Edit タブへ"), 0, 1)
+        grid.addWidget(self._make_card(
+            "request", "📨 未処理の依頼", "Request タブへ"), 1, 0)
+        grid.addWidget(self._make_card(
+            "team", "👥 チームの今日", "Team タブへ"), 1, 1)
+        layout.addLayout(grid, stretch=1)
+
+        self.info = InfoLabel()
+        layout.addWidget(self.info)
+
+    def _make_card(self, key: str, title: str, btn_label: str) -> QGroupBox:
+        """ヘッダー（タイトル + 件数バッジ + 開くボタン）+ リストのカードを作る"""
+        gb = QGroupBox()
+        gb.setStyleSheet(
+            "QGroupBox { border: 1px solid #CFD8DC; border-radius: 6px;"
+            " margin-top: 4px; background: white; }")
+        vlay = QVBoxLayout(gb)
+        head = QHBoxLayout()
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet("QLabel { font-weight: bold; }")
+        badge = QLabel("")
+        head.addWidget(title_lbl)
+        head.addWidget(badge)
+        head.addStretch()
+        open_btn = QPushButton(f"→ {btn_label}")
+        open_btn.setStyleSheet(STYLE_BUTTON)
+        open_btn.clicked.connect(lambda _=False, k=key: self.navigate_requested.emit(k))
+        head.addWidget(open_btn)
+        vlay.addLayout(head)
+        lst = QListWidget()
+        lst.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        lst.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        vlay.addWidget(lst, stretch=1)
+        self._cards[key] = {"list": lst, "badge": badge}
+        return gb
+
+    def _set_badge(self, key: str, count: int, zero_text: str = "なし ✅") -> None:
+        badge = self._cards[key]["badge"]
+        if count > 0:
+            badge.setText(f"{count} 件")
+            badge.setStyleSheet(
+                "QLabel { background: #E65100; color: white; border-radius: 8px;"
+                " padding: 1px 8px; font-size: 10px; font-weight: bold; }")
+        else:
+            badge.setText(zero_text)
+            badge.setStyleSheet("QLabel { color: #2E7D32; font-size: 10px; }")
+
+    def refresh(self) -> None:
+        today = datetime.date.today().isoformat()
+        user = self.state.user
+        df_nodes = self.state.df_nodes
+        self.header_lbl.setText(
+            f"🏠 Today {today}  [{self.state.display_name(user)}]")
+
+        # 1. 今日のスケジュール（連続区間にまとめて表示）
+        lst = self._cards["schedule"]["list"]
+        lst.clear()
+        segments = LG.collect_daily_segments(
+            self.state.df_daily, df_nodes, today, user)
+        for seg in segments:
+            item = QListWidgetItem(
+                f"{seg['from']}〜{seg['to']}  {seg['title']}"
+                + (f"（{seg['task']}）" if seg["task"] else ""))
+            lst.addItem(item)
+        if not segments:
+            lst.addItem("（予定なし。Main タブで計画を立てましょう）")
+        total = sum(s["hours"] for s in segments)
+        self._set_badge("schedule", len(segments),
+                        zero_text="予定なし")
+        if segments:
+            self._cards["schedule"]["badge"].setText(f"{total:.2f}h")
+
+        # 2. 納期アラート（超過=赤・接近=橙）
+        lst = self._cards["edit"]["list"]
+        lst.clear()
+        alerts = LG.find_deadline_alerts(df_nodes, user=user, within_days=7)
+        for row in alerts["overdue"]:
+            item = QListWidgetItem(
+                f"⚠超過 {row['deadline']}  {row['title']}（{row['task']}）")
+            item.setForeground(QColor("#C62828"))
+            lst.addItem(item)
+        for row in alerts["approaching"]:
+            item = QListWidgetItem(
+                f"接近 {row['deadline']}  {row['title']}（{row['task']}）")
+            item.setForeground(QColor("#E65100"))
+            lst.addItem(item)
+        n_alerts = len(alerts["overdue"]) + len(alerts["approaching"])
+        if n_alerts == 0:
+            lst.addItem("納期リスクはありません ✅")
+        self._set_badge("edit", n_alerts)
+
+        # 3. 未処理の依頼（自分宛 pending）
+        lst = self._cards["request"]["list"]
+        lst.clear()
+        df_asg = self.state.df_assignments
+        n_req = 0
+        if df_asg is not None and not df_asg.empty:
+            pend = df_asg[(df_asg["status"] == "pending")
+                          & (df_asg["to_user"] == user)]
+            for _, r in pend.iterrows():
+                t_idx = str(r.get("ticket_id", ""))
+                title = (str(df_nodes.loc[t_idx, "title"])
+                         if t_idx in df_nodes.index else t_idx)
+                sender = self.state.display_name(str(r.get("from_user", "")))
+                lst.addItem(f"{sender} さんから: {title}")
+                n_req += 1
+        if n_req == 0:
+            lst.addItem("未処理の依頼はありません ✅")
+        self._set_badge("request", n_req)
+
+        # 4. チームの今日（出社状況・健康）
+        lst = self._cards["team"]["list"]
+        lst.clear()
+        df_log = self.state.df_daily_log
+        reported = 0
+        for member in self.state.members:
+            idx = DB.daily_sch_idx(today, member)
+            disp = self.state.display_name(member)
+            if df_log is not None and not df_log.empty and idx in df_log.index:
+                row = df_log.loc[idx]
+                health = str(row.get("health_status", "") or "-")
+                place = str(row.get("work_place", "") or "-")
+                lst.addItem(f"{disp}: {health} / {place}")
+                reported += 1
+            else:
+                item = QListWidgetItem(f"{disp}: （未入力）")
+                item.setForeground(QColor("#90A4AE"))
+                lst.addItem(item)
+        self._set_badge("team", 0,
+                        zero_text=f"{reported}/{len(self.state.members)} 人入力済")
 
 
 # ---------- レポート生成ビュー ----------

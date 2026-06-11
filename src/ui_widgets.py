@@ -8,9 +8,9 @@ from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
     QComboBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
     QHeaderView, QLineEdit, QFrame, QSizePolicy, QCalendarWidget,
-    QDialog, QDialogButtonBox,
+    QDialog, QDialogButtonBox, QMessageBox, QApplication,
 )
-from PySide6.QtCore import Qt, QDate, Signal
+from PySide6.QtCore import Qt, QDate, Signal, QTimer
 from PySide6.QtGui import QColor, QFont
 
 from db import COLOR_OPTIONS
@@ -353,3 +353,122 @@ class Separator(QFrame):
         super().__init__(parent)
         self.setFrameShape(QFrame.Shape.HLine)
         self.setFrameShadow(QFrame.Shadow.Sunken)
+
+
+class PomodoroWidget(QWidget):
+    """
+    ポモドーロタイマー（ツールバー常駐のコンパクト表示）。
+
+    状態遷移: idle → work（▶開始）→ break（作業終了で自動）→ idle
+    作業終了時（タイマー満了 / ■停止での中断）に work_finished を送出し、
+    実績記録（daily_schedule への書き込み）は受け手（MainWindow）が行う。
+    """
+
+    # (ticket_idx, 作業開始 datetime, 作業終了 datetime)
+    work_finished = Signal(str, object, object)
+
+    def __init__(self, work_minutes: int = 25, break_minutes: int = 5,
+                 parent=None):
+        super().__init__(parent)
+        self._work_sec = max(1, int(work_minutes)) * 60
+        self._break_sec = max(1, int(break_minutes)) * 60
+        self._mode = "idle"  # idle / work / break
+        self._remaining = 0
+        self._ticket_idx = ""
+        self._ticket_title = ""
+        self._session_ticket = ""   # 作業開始時に確定する対象チケット
+        self._work_start = None
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(4)
+        self.time_lbl = QLabel("🍅 --:--")
+        self.time_lbl.setStyleSheet("QLabel { font-weight: bold; }")
+        self.ticket_lbl = QLabel("(チケット未選択)")
+        self.ticket_lbl.setMaximumWidth(160)
+        self.ticket_lbl.setStyleSheet(STYLE_LABEL_INFO)
+        self.btn = QPushButton("▶ 集中開始")
+        self.btn.setStyleSheet(STYLE_BUTTON)
+        self.btn.setToolTip("選択中のチケットでポモドーロタイマーを開始します\n"
+                            "（終了時に実績をスケジュールへ記録できます）")
+        self.btn.clicked.connect(self._on_btn)
+        lay.addWidget(self.time_lbl)
+        lay.addWidget(self.ticket_lbl)
+        lay.addWidget(self.btn)
+
+    # ── 外部 API ──
+
+    def set_ticket(self, idx: str, title: str) -> None:
+        """Main/Edit タブで選択されたチケットを次セッションの対象にする"""
+        self._ticket_idx = idx
+        self._ticket_title = title
+        if self._mode == "idle":
+            self.ticket_lbl.setText(title or "(チケット未選択)")
+            self.ticket_lbl.setToolTip(title)
+
+    # ── 内部処理 ──
+
+    @staticmethod
+    def _fmt(sec: int) -> str:
+        return f"{sec // 60:02d}:{sec % 60:02d}"
+
+    def _on_btn(self) -> None:
+        if self._mode == "idle":
+            if not self._ticket_idx:
+                QMessageBox.information(
+                    self, "ポモドーロ",
+                    "Main / Edit タブでチケットを選択してから開始してください")
+                return
+            self._start_work()
+        elif self._mode == "work":
+            # 中断時も経過分の記録を確認する
+            self._finish_work()
+        else:  # break
+            self._to_idle()
+
+    def _start_work(self) -> None:
+        self._mode = "work"
+        self._session_ticket = self._ticket_idx
+        self._work_start = datetime.datetime.now()
+        self._remaining = self._work_sec
+        self.btn.setText("■ 停止")
+        self.time_lbl.setText(f"🍅 {self._fmt(self._remaining)}")
+        self.ticket_lbl.setText(self._ticket_title)
+        self._timer.start()
+
+    def _finish_work(self) -> None:
+        self._timer.stop()
+        QApplication.beep()
+        self.work_finished.emit(
+            self._session_ticket, self._work_start, datetime.datetime.now())
+        self._start_break()
+
+    def _start_break(self) -> None:
+        self._mode = "break"
+        self._remaining = self._break_sec
+        self.btn.setText("■ 休憩中止")
+        self.time_lbl.setText(f"☕ {self._fmt(self._remaining)}")
+        self._timer.start()
+
+    def _to_idle(self) -> None:
+        self._timer.stop()
+        self._mode = "idle"
+        self.btn.setText("▶ 集中開始")
+        self.time_lbl.setText("🍅 --:--")
+        self.ticket_lbl.setText(self._ticket_title or "(チケット未選択)")
+
+    def _tick(self) -> None:
+        self._remaining -= 1
+        if self._remaining <= 0:
+            if self._mode == "work":
+                self._finish_work()
+            else:
+                QApplication.beep()
+                self._to_idle()
+            return
+        icon = "🍅" if self._mode == "work" else "☕"
+        self.time_lbl.setText(f"{icon} {self._fmt(self._remaining)}")

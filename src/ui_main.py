@@ -24,7 +24,8 @@ import db as DB
 import logic as LG
 from ui_widgets import (
     DateButton, UserCombo, ColorCombo, ButtonRow, InfoLabel,
-    AutoCombo, ScrollableTable, Separator, COLOR_OPTIONS, STYLE_BUTTON,
+    AutoCombo, ScrollableTable, Separator, PomodoroWidget,
+    COLOR_OPTIONS, STYLE_BUTTON,
 )
 
 # 画面インデックス（QStackedWidget）
@@ -40,6 +41,7 @@ IDX_MEMO    = 8
 IDX_VERSION  = 9
 IDX_CONFIG   = 10
 IDX_REPORT   = 11
+IDX_TODAY    = 12
 
 
 # ---------- 日次スケジュール用カスタムデリゲート ----------
@@ -629,7 +631,10 @@ class MainWindow(QMainWindow):
         state.refresh_func = self.refresh
         state.dirty_changed_func = self._update_save_btn_style
 
-        self._switch_view(IDX_GANTT)
+        # 初期表示タブ（config の start_tab で変更可）
+        start_map = {"today": IDX_TODAY, "main": IDX_GANTT,
+                     "edit": IDX_MAIN, "plan": IDX_ROADMAP}
+        self._switch_view(start_map.get(state.config.start_tab, IDX_TODAY))
 
     # ---------- ツールバー ----------
 
@@ -704,6 +709,7 @@ class MainWindow(QMainWindow):
             " border-color: #64B5F6; color:#1565C0; }"
         )
         views = [
+            ("🏠 Today",   IDX_TODAY),
             ("📊 Main",    IDX_GANTT),
             ("🗺 Plan",    IDX_ROADMAP),
             ("✏ Edit",    IDX_MAIN),
@@ -735,6 +741,16 @@ class MainWindow(QMainWindow):
         manual_btn.setToolTip("マニュアルをブラウザで開く")
         manual_btn.clicked.connect(self._on_open_manual)
         tb.addWidget(manual_btn)
+
+        tb.addSeparator()
+
+        # ポモドーロタイマー（終了時に実績をスケジュールへ記録）
+        self.pomodoro = PomodoroWidget(
+            work_minutes=self.state.config.pomodoro_work_minutes,
+            break_minutes=self.state.config.pomodoro_break_minutes,
+        )
+        self.pomodoro.work_finished.connect(self._on_pomodoro_finished)
+        tb.addWidget(self.pomodoro)
 
         # 項目7: 2行目のツールバーにメンバーボタンを追加
         self.addToolBarBreak()
@@ -810,13 +826,21 @@ class MainWindow(QMainWindow):
         self.config_view     = ui_sub.ConfigView(self.state)
         self.ai_import_view  = ui_sub.AIImportView(self.state)
         self.report_view     = ui_sub.ReportView(self.state)
+        self.dashboard_view  = ui_sub.DashboardView(self.state)
 
         # 追加順は IDX_* 定数と一致させること（QStackedWidget のインデックス）
         for w in [self.main_pane, self.gantt_view, self.road_view,
                   self.anal_view, self.search_view, self.team_view,
                   self.assign_view, self.ai_import_view, self.memo_view,
-                  self.ver_view, self.config_view, self.report_view]:
+                  self.ver_view, self.config_view, self.report_view,
+                  self.dashboard_view]:
             self.stack.addWidget(w)
+
+        # ダッシュボードの「開く」 → 対応タブへ遷移
+        self.dashboard_view.navigate_requested.connect(self._on_dashboard_navigate)
+        # チケット選択をポモドーロタイマーの対象に反映
+        self.gantt_view.ticket_clicked.connect(self._on_pomodoro_ticket)
+        self.main_pane.tree_pane.node_selected.connect(self._on_pomodoro_ticket)
 
         # シグナル接続：チケット選択 → スケジュールパネルへ（ガントチャートからのみ）
         # インライン編集後の軽量リフレッシュ（ツリー再構築なし）
@@ -893,6 +917,82 @@ class MainWindow(QMainWindow):
         self.state.current_date = new_date
         self.date_btn.set_date(new_date)
         self.refresh()
+
+    # ---------- ポモドーロ ----------
+
+    def _on_pomodoro_ticket(self, idx: str) -> None:
+        """選択ノードがチケットならポモドーロタイマーの対象にする"""
+        df = self.state.df_nodes
+        if idx and idx in df.index and str(df.loc[idx, "node_type"]) == "ticket":
+            self.pomodoro.set_ticket(idx, str(df.loc[idx, "title"]))
+
+    def _on_pomodoro_finished(self, ticket_idx: str, start_dt, end_dt) -> None:
+        """ポモドーロ終了時: 経過時間を15分スロットに丸めて当日の実績に記録する"""
+        df = self.state.df_nodes
+        if not ticket_idx or ticket_idx not in df.index:
+            return
+        elapsed_min = (end_dt - start_dt).total_seconds() / 60
+        n_slots = int(round(elapsed_min / 15))
+        if n_slots <= 0:
+            self.statusBar().showMessage("15分未満のため実績は記録しません", 5000)
+            return
+        start_slot = start_dt.hour * 4 + start_dt.minute // 15
+        slots = list(range(start_slot, min(start_slot + n_slots,
+                                           len(DB.DAILY_TIME_COLS))))
+        # 既に実績が入力されているスロットは上書きしない
+        today = datetime.date.today().isoformat()
+        sch_idx = DB.daily_sch_idx(today, self.state.login_user)
+        df_daily = self.state.df_daily
+        free = []
+        for s in slots:
+            col = DB.DAILY_TIME_COLS[s]
+            occupied = (not df_daily.empty and sch_idx in df_daily.index
+                        and bool(df_daily.loc[sch_idx, col]))
+            if not occupied:
+                free.append(s)
+        title = str(df.loc[ticket_idx, "title"])
+        if not free:
+            QMessageBox.information(
+                self, "ポモドーロ",
+                "対象時間帯は既に実績が入力されているため記録しません")
+            return
+        hours = len(free) * 0.25
+        ans = QMessageBox.question(
+            self, "ポモドーロ実績記録",
+            f"「{title}」に {hours:.2f}h（{len(free)} スロット）の実績を記録しますか？")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._write_pomodoro_slots(sch_idx, free, ticket_idx)
+        self.statusBar().showMessage(f"ポモドーロ実績を記録しました: {title} +{hours:.2f}h", 5000)
+
+    def _write_pomodoro_slots(self, sch_idx: str, slots: list,
+                              ticket_idx: str) -> None:
+        """空きスロットへチケットを書き込み、actual_hours を伝播する（遅延保存）"""
+        df_daily = self.state.df_daily
+        if df_daily.empty or sch_idx not in df_daily.index:
+            new_row = {c: "" for c in DB.DAILY_SCH_COLS[1:]}
+            new_row["Owner"] = self.state.login_user
+            df_daily.loc[sch_idx] = new_row
+            self.state.df_daily = df_daily
+        for s in slots:
+            self.state.df_daily.loc[sch_idx, DB.DAILY_TIME_COLS[s]] = ticket_idx
+        self.state.df_daily.loc[sch_idx, "Last_Update"] = \
+            datetime.date.today().isoformat()
+        nodes = self.state.df_nodes
+        nodes.loc[ticket_idx, "actual_hours"] = (
+            float(nodes.loc[ticket_idx, "actual_hours"] or 0) + 0.25 * len(slots))
+        nodes.loc[ticket_idx, "updated_at"] = datetime.date.today().isoformat()
+        self.schedule_panel._propagate_actual_hours(ticket_idx)
+        self.state.schedule_modified = True
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
+        self.refresh()
+
+    def _on_dashboard_navigate(self, key: str) -> None:
+        """ダッシュボードのカードから対応タブへ遷移する"""
+        mapping = {"schedule": IDX_GANTT, "edit": IDX_MAIN,
+                   "request": IDX_ASSIGN, "team": IDX_TEAM}
+        self._switch_view(mapping.get(key, IDX_GANTT))
 
     def _on_member_changed(self, member: str) -> None:
         """項目7: メンバー選択時にボタンのチェック状態を更新"""
