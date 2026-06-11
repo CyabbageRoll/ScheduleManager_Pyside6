@@ -29,7 +29,7 @@ NODE_COLUMNS = [
     "IDX", "node_type", "parent_id", "title", "status", "priority",
     "assigned_to", "estimated_hours", "actual_hours",
     "deadline", "start_available", "actual_start", "actual_end",
-    "memo", "color", "created_at", "updated_at",
+    "memo", "link", "color", "created_at", "updated_at",
 ]
 # daily_schedule の時間スロット列名（C0000〜C2345 の 96 列、15分刻み）
 DAILY_TIME_COLS = [f"C{i // 4:02d}{(i % 4) * 15:02d}" for i in range(24 * 4)]
@@ -119,6 +119,7 @@ def create_initial_node(owner: str, node_type: str, title: str,
         "actual_start":     None,
         "actual_end":       None,
         "memo":             "",
+        "link":             "",
         "color":            color,
         "created_at":       today,
         "updated_at":       today,
@@ -143,6 +144,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     actual_start    TEXT,
     actual_end      TEXT,
     memo            TEXT DEFAULT '',
+    link            TEXT DEFAULT '',
     color           TEXT DEFAULT 'Cyan',
     created_at      TEXT NOT NULL DEFAULT '',
     updated_at      TEXT NOT NULL DEFAULT ''
@@ -188,6 +190,19 @@ CREATE TABLE IF NOT EXISTS permanent_notices (
     username   TEXT PRIMARY KEY,
     text       TEXT DEFAULT '',
     updated_at TEXT DEFAULT ''
+);
+"""
+
+# 進捗スナップショット（月次進捗レポートの推移グラフ用に日次で記録）
+_SCHEMA_PROGRESS_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS progress_snapshots (
+    snap_date       TEXT NOT NULL,
+    node_idx        TEXT NOT NULL,
+    done_count      INTEGER DEFAULT 0,
+    total_count     INTEGER DEFAULT 0,
+    actual_hours    REAL DEFAULT 0.0,
+    estimated_hours REAL DEFAULT 0.0,
+    PRIMARY KEY (snap_date, node_idx)
 );
 """
 
@@ -314,7 +329,14 @@ class Database:
             conn.execute(_SCHEMA_ASSIGNMENTS)
             conn.execute(_SCHEMA_MEMO)
             conn.execute(_SCHEMA_PERMANENT_NOTICES)
+            conn.execute(_SCHEMA_PROGRESS_SNAPSHOTS)
             conn.commit()
+            # 既存 DB へのマイグレーション: link 列が無ければ追加
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+            if "link" not in cols:
+                conn.execute("ALTER TABLE nodes ADD COLUMN link TEXT DEFAULT ''")
+                conn.commit()
+                self._logi("[DB] マイグレーション: nodes.link 列を追加")
             self._log(f"DB 初期化完了: {self.db_path}")
         except Exception as e:
             self._log(f"DB 初期化エラー: {e}")
@@ -644,6 +666,54 @@ class Database:
             conn.commit()
         finally:
             conn.close()
+
+    # ---------- progress_snapshots ----------
+
+    def save_progress_snapshots(self, rows: list, snap_date: str = None) -> int:
+        """
+        進捗スナップショットを記録する（1日1回想定）。
+        同一 (snap_date, node_idx) は INSERT OR IGNORE でスキップし、新規記録件数を返す。
+        rows: {"node_idx", "done_count", "total_count", "actual_hours",
+               "estimated_hours"} の辞書リスト（logic.build_progress_snapshot_rows で生成）
+        """
+        if not rows:
+            return 0
+        snap_date = snap_date or datetime.date.today().isoformat()
+        conn = self._connect()
+        saved = 0
+        try:
+            for r in rows:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO progress_snapshots"
+                    " (snap_date, node_idx, done_count, total_count,"
+                    "  actual_hours, estimated_hours) VALUES (?,?,?,?,?,?)",
+                    [snap_date, r["node_idx"], int(r["done_count"]),
+                     int(r["total_count"]), float(r["actual_hours"]),
+                     float(r["estimated_hours"])],
+                )
+                saved += cur.rowcount
+            conn.commit()
+            if saved:
+                self._log(f"save_progress_snapshots: {saved} 件 ({snap_date})")
+        except Exception as e:
+            self._log(f"save_progress_snapshots エラー: {e}")
+        finally:
+            conn.close()
+        return saved
+
+    def read_progress_snapshots(self, node_idx: str, date_from: str = "",
+                                date_to: str = "") -> pd.DataFrame:
+        """指定ノードのスナップショットを日付昇順の DataFrame で返す"""
+        sql = "SELECT * FROM progress_snapshots WHERE node_idx=?"
+        params = [node_idx]
+        if date_from:
+            sql += " AND snap_date>=?"
+            params.append(date_from)
+        if date_to:
+            sql += " AND snap_date<=?"
+            params.append(date_to)
+        sql += " ORDER BY snap_date"
+        return self._read_df(sql, params=params)
 
     # ---------- actual_hours 再集計 ----------
 

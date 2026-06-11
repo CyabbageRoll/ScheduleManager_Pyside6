@@ -55,6 +55,8 @@ class AppConfig:
     window_width: int = 1500
     window_height: int = 900
     font_size: int = 9
+    # 起動時に表示するタブ（today / main / edit / plan）
+    start_tab: str = "today"
 
     # [Schedule]
     daily_begin_time: int = 6
@@ -67,6 +69,14 @@ class AppConfig:
     work_place_options: List[str] = field(default_factory=lambda: ["Office", "Home"])
     safety_options: List[str] = field(default_factory=lambda: ["OK", "NG"])
     overwork_options: List[str] = field(default_factory=lambda: ["No", "Yes"])
+
+    # [Report]
+    # 週報・月報などの Markdown 出力先フォルダ（空の場合は保存時にダイアログで選択）
+    report_output_dir: str = ""
+
+    # [Pomodoro]
+    pomodoro_work_minutes: int = 25
+    pomodoro_break_minutes: int = 5
 
     # [DisplayNames] - メールアドレス → 表示名 のマッピング
     display_names: Dict[str, str] = field(default_factory=dict)
@@ -119,6 +129,7 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
         cfg.window_width  = parser.getint("GUI", "window_width",  fallback=cfg.window_width)
         cfg.window_height = parser.getint("GUI", "window_height", fallback=cfg.window_height)
         cfg.font_size     = parser.getint("GUI", "font_size",     fallback=cfg.font_size)
+        cfg.start_tab     = parser.get("GUI", "start_tab", fallback=cfg.start_tab).strip().lower()
 
     # [Schedule]
     if parser.has_section("Schedule"):
@@ -140,6 +151,18 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
         cfg.work_place_options = _split("work_place",    cfg.work_place_options)
         cfg.safety_options     = _split("safety",        cfg.safety_options)
         cfg.overwork_options   = _split("overwork",      cfg.overwork_options)
+
+    # [Report]
+    if parser.has_section("Report"):
+        cfg.report_output_dir = parser.get("Report", "output_dir",
+                                           fallback=cfg.report_output_dir)
+
+    # [Pomodoro]
+    if parser.has_section("Pomodoro"):
+        cfg.pomodoro_work_minutes = parser.getint(
+            "Pomodoro", "work_minutes", fallback=cfg.pomodoro_work_minutes)
+        cfg.pomodoro_break_minutes = parser.getint(
+            "Pomodoro", "break_minutes", fallback=cfg.pomodoro_break_minutes)
 
     # [DisplayNames]
     if parser.has_section("DisplayNames"):
@@ -460,6 +483,16 @@ def main() -> None:
     # 起動時に daily_schedule から actual_hours を再集計
     if not state.df_nodes.empty:
         state.df_nodes = state.db.recalc_actual_hours(state.df_nodes, state.df_daily)
+
+    # 進捗スナップショットを当日分として記録（1日1回、最初に起動したユーザーが記録）
+    try:
+        from logic import build_progress_snapshot_rows
+        saved = database.save_progress_snapshots(
+            build_progress_snapshot_rows(state.df_nodes))
+        if saved:
+            logger.info(f"進捗スナップショット記録: {saved} 件")
+    except Exception:
+        logger.exception("進捗スナップショット記録エラー")
 
     # Qt アプリケーション起動
     app = QApplication.instance() or QApplication(sys.argv)
