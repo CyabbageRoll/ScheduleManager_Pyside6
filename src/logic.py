@@ -4,6 +4,7 @@ logic.py - スケジューリング・テキストパーサー・検索・エク
 import datetime
 import csv
 import os
+import re
 from typing import List, Optional
 
 import pandas as pd
@@ -387,3 +388,269 @@ def col_to_hhmm(col: str) -> str:
     if not col or len(col) < 5:
         return ""
     return f"{col[1:3]}:{col[3:5]}"
+
+
+# ---------- 週報・月報レポート生成 ----------
+
+def _date_str(v) -> str:
+    """日付値を YYYY-MM-DD 文字列に正規化する。欠損(None/NaN/空)は空文字を返す。"""
+    if v is None or v != v:
+        return ""
+    s = str(v)
+    if s in ("", "nan", "None", "NaT"):
+        return ""
+    return s[:10]
+
+
+def _md_escape(s: str) -> str:
+    """Markdown テーブルセル用にパイプ文字をエスケープする"""
+    return str(s).replace("|", "\\|").replace("\n", " ")
+
+
+def calc_period_hours(df_daily: pd.DataFrame, ticket_idxs: list,
+                      date_from: str, date_to: str) -> dict:
+    """
+    指定期間における各チケットの実績工数(h)を daily_schedule から一括集計する。
+    日付境界が空文字の場合、その側は無制限として扱う。
+    戻り値: {ticket_idx: hours}
+    """
+    counts: dict = {idx: 0 for idx in ticket_idxs}
+    ticket_set = set(ticket_idxs)
+    if df_daily.empty or not ticket_set:
+        return {idx: 0.0 for idx in ticket_idxs}
+    for row_idx in df_daily.index:
+        # IDX 先頭10文字が日付 (YYYY-MM-DD)
+        date_part = str(row_idx)[:10]
+        if date_from and date_part < date_from:
+            continue
+        if date_to and date_part > date_to:
+            continue
+        for col in DAILY_TIME_COLS:
+            if col not in df_daily.columns:
+                continue
+            val = df_daily.loc[row_idx, col]
+            if val in ticket_set:
+                counts[val] = counts.get(val, 0) + 1
+    return {idx: round(cnt * 0.25, 2) for idx, cnt in counts.items()}
+
+
+def collect_descendant_tickets(df_nodes: pd.DataFrame, root_idx: str) -> List[str]:
+    """root_idx 配下の全 Ticket IDX を再帰的に収集する（deleted 除外）"""
+    result: List[str] = []
+    if df_nodes.empty:
+        return result
+    stack = [root_idx]
+    while stack:
+        cur = stack.pop()
+        children = df_nodes[df_nodes["parent_id"] == cur]
+        for cidx in children.index:
+            if str(children.loc[cidx, "status"]) == "deleted":
+                continue
+            if str(children.loc[cidx, "node_type"]) == "ticket":
+                result.append(cidx)
+            else:
+                stack.append(cidx)
+    return result
+
+
+def collect_report_data(df_nodes: pd.DataFrame, df_daily: pd.DataFrame,
+                        root_idx: str, date_from: str, date_to: str,
+                        display_name_func=None) -> dict:
+    """
+    週報・月報用に root_idx（通常 Project4）配下のチケットを期間集計して分類する。
+
+    戻り値 dict のキー:
+        root_title, date_from, date_to,
+        completed   : 期間内に完了したチケット行のリスト
+        in_progress : 進行中（期間内に工数投入あり or 実績あり）の未完了チケット
+        upcoming    : 来期間（同じ長さの次期間）に開始/納期が入る未着手チケット
+        overdue     : 納期超過の未完了チケット
+        approaching : 納期 7 日以内の未完了チケット
+        period_hours_total : 期間内投入工数の合計(h)
+        task_hours  : {タスク名: 期間内工数} の内訳
+    """
+    name = display_name_func or (lambda s: s)
+    data = {
+        "root_title": "", "date_from": date_from, "date_to": date_to,
+        "completed": [], "in_progress": [], "upcoming": [],
+        "overdue": [], "approaching": [],
+        "period_hours_total": 0.0, "task_hours": {},
+    }
+    if df_nodes.empty or root_idx not in df_nodes.index:
+        return data
+    data["root_title"] = str(df_nodes.loc[root_idx, "title"])
+
+    tickets = collect_descendant_tickets(df_nodes, root_idx)
+    hours = calc_period_hours(df_daily, tickets, date_from, date_to)
+
+    today = datetime.date.today()
+    today_s = today.isoformat()
+    approach_s = (today + datetime.timedelta(days=7)).isoformat()
+
+    # 来期間 = 終了日翌日から同じ日数分
+    next_from, next_to = "", ""
+    try:
+        d_from = datetime.date.fromisoformat(date_from)
+        d_to = datetime.date.fromisoformat(date_to)
+        span = (d_to - d_from).days + 1
+        next_from = (d_to + datetime.timedelta(days=1)).isoformat()
+        next_to = (d_to + datetime.timedelta(days=span)).isoformat()
+    except (ValueError, TypeError):
+        pass
+
+    for idx in tickets:
+        r = df_nodes.loc[idx]
+        status = str(r.get("status", ""))
+        if status == "cancel":
+            continue
+        pid = str(r.get("parent_id", ""))
+        task_title = str(df_nodes.loc[pid, "title"]) if pid in df_nodes.index else ""
+        row = {
+            "title":           str(r.get("title", "")),
+            "task":            task_title,
+            "assigned_to":     name(str(r.get("assigned_to", ""))),
+            "estimated":       float(r.get("estimated_hours", 0) or 0),
+            "actual":          float(r.get("actual_hours", 0) or 0),
+            "period_hours":    hours.get(idx, 0.0),
+            "deadline":        _date_str(r.get("deadline")),
+            "actual_end":      _date_str(r.get("actual_end")),
+            "start_available": _date_str(r.get("start_available")),
+        }
+        data["period_hours_total"] += row["period_hours"]
+        if row["period_hours"] > 0:
+            data["task_hours"][task_title] = round(
+                data["task_hours"].get(task_title, 0.0) + row["period_hours"], 2)
+
+        if status == "done":
+            # 期間内に完了したものだけ実績として報告
+            if row["actual_end"] and date_from <= row["actual_end"] <= date_to:
+                data["completed"].append(row)
+            continue
+
+        # 以降は未完了（todo / regularly）
+        if row["period_hours"] > 0 or row["actual"] > 0:
+            data["in_progress"].append(row)
+        elif next_from and (
+            (row["start_available"] and next_from <= row["start_available"] <= next_to)
+            or (row["deadline"] and next_from <= row["deadline"] <= next_to)
+        ):
+            data["upcoming"].append(row)
+
+        # 納期リスク（進行中・未着手を問わず判定）
+        if row["deadline"]:
+            if row["deadline"] < today_s:
+                data["overdue"].append(row)
+            elif row["deadline"] <= approach_s:
+                data["approaching"].append(row)
+
+    data["period_hours_total"] = round(data["period_hours_total"], 2)
+    return data
+
+
+def _ticket_table(rows: list, columns: list) -> List[str]:
+    """
+    チケット行リストから Markdown テーブル行を生成する。
+    columns: (ヘッダー名, 行辞書から値を取り出す関数) のリスト
+    """
+    if not rows:
+        return ["（なし）"]
+    lines = [
+        "| " + " | ".join(h for h, _ in columns) + " |",
+        "|" + "---|" * len(columns),
+    ]
+    for r in rows:
+        lines.append("| " + " | ".join(_md_escape(f(r)) for _, f in columns) + " |")
+    return lines
+
+
+def build_report_markdown(data: dict, mode: str = "weekly") -> str:
+    """
+    collect_report_data の結果から週報/月報の Markdown を組み立てる。
+    mode: "weekly" または "monthly"
+    """
+    d_from, d_to = data["date_from"], data["date_to"]
+    title = data["root_title"]
+    if mode == "monthly":
+        head = f"# 月報 {d_from[:7]}: {title}"
+        period_label = "今月"
+        next_label = "来月"
+    else:
+        try:
+            iso = datetime.date.fromisoformat(d_from).isocalendar()
+            week_s = f"{iso[0]}-W{iso[1]:02d}"
+        except (ValueError, TypeError):
+            week_s = d_from
+        head = f"# 週報 {week_s}: {title}"
+        period_label = "今週"
+        next_label = "来週"
+
+    lines = [
+        head,
+        "",
+        f"- 期間: {d_from} 〜 {d_to}",
+        f"- 生成: Schedule Manager ({datetime.date.today().isoformat()})",
+        "",
+        f"## {period_label}の実績（完了）",
+        "",
+    ]
+    lines += _ticket_table(data["completed"], [
+        ("チケット", lambda r: r["title"]),
+        ("タスク",   lambda r: r["task"]),
+        ("担当",     lambda r: r["assigned_to"]),
+        ("工数(実績/見積)", lambda r: f"{r['actual']:.2f}h / {r['estimated']:.2f}h"),
+        ("完了日",   lambda r: r["actual_end"]),
+    ])
+
+    lines += ["", "## 進行中", ""]
+    lines += _ticket_table(data["in_progress"], [
+        ("チケット", lambda r: r["title"]),
+        ("タスク",   lambda r: r["task"]),
+        ("担当",     lambda r: r["assigned_to"]),
+        ("進捗工数", lambda r: f"{r['actual']:.2f}h / {r['estimated']:.2f}h"),
+        ("納期",     lambda r: r["deadline"] or "-"),
+    ])
+
+    lines += ["", f"## {period_label}の投入工数", "",
+              f"合計: **{data['period_hours_total']:.2f}h**", ""]
+    if data["task_hours"]:
+        lines += ["| タスク | 工数(h) |", "|---|---|"]
+        for task, h in sorted(data["task_hours"].items(),
+                              key=lambda kv: kv[1], reverse=True):
+            lines.append(f"| {_md_escape(task)} | {h:.2f} |")
+
+    lines += ["", f"## {next_label}の予定", ""]
+    lines += _ticket_table(data["upcoming"], [
+        ("チケット",   lambda r: r["title"]),
+        ("タスク",     lambda r: r["task"]),
+        ("見積(h)",    lambda r: f"{r['estimated']:.2f}"),
+        ("開始可能日", lambda r: r["start_available"] or "-"),
+        ("納期",       lambda r: r["deadline"] or "-"),
+    ])
+
+    lines += ["", "## 納期リスク", ""]
+    risk_rows = ([dict(r, _risk="超過") for r in data["overdue"]]
+                 + [dict(r, _risk="接近") for r in data["approaching"]])
+    lines += _ticket_table(risk_rows, [
+        ("区分",     lambda r: r["_risk"]),
+        ("チケット", lambda r: r["title"]),
+        ("タスク",   lambda r: r["task"]),
+        ("担当",     lambda r: r["assigned_to"]),
+        ("納期",     lambda r: r["deadline"]),
+    ])
+
+    return "\n".join(lines) + "\n"
+
+
+def report_filename(mode: str, date_from: str, root_title: str) -> str:
+    """レポートのファイル名を生成する（ファイル名禁止文字は _ に置換）"""
+    safe_title = re.sub(r'[\\/:*?"<>|]', "_", root_title).strip() or "report"
+    if mode == "monthly":
+        period = date_from[:7]  # YYYY-MM
+    else:
+        try:
+            iso = datetime.date.fromisoformat(date_from).isocalendar()
+            period = f"{iso[0]}-W{iso[1]:02d}"
+        except (ValueError, TypeError):
+            period = date_from
+    prefix = "monthly" if mode == "monthly" else "weekly"
+    return f"{prefix}_{period}_{safe_title}.md"

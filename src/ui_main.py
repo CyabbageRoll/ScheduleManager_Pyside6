@@ -39,6 +39,7 @@ IDX_AIIMPORT = 7
 IDX_MEMO    = 8
 IDX_VERSION  = 9
 IDX_CONFIG   = 10
+IDX_REPORT   = 11
 
 
 # ---------- 日次スケジュール用カスタムデリゲート ----------
@@ -712,6 +713,7 @@ class MainWindow(QMainWindow):
             ("🤖 AI取込",  IDX_AIIMPORT),
             ("📝 Memo",    IDX_MEMO),
             ("📈 Analyze", IDX_ANALYSIS),
+            ("📋 Report",  IDX_REPORT),
             ("ℹ Version", IDX_VERSION),
             ("⚙ Config",  IDX_CONFIG),
         ]
@@ -807,11 +809,13 @@ class MainWindow(QMainWindow):
         self.ver_view    = ui_sub.VersionView(self.state, self.version)
         self.config_view     = ui_sub.ConfigView(self.state)
         self.ai_import_view  = ui_sub.AIImportView(self.state)
+        self.report_view     = ui_sub.ReportView(self.state)
 
+        # 追加順は IDX_* 定数と一致させること（QStackedWidget のインデックス）
         for w in [self.main_pane, self.gantt_view, self.road_view,
                   self.anal_view, self.search_view, self.team_view,
                   self.assign_view, self.ai_import_view, self.memo_view,
-                  self.ver_view, self.config_view]:
+                  self.ver_view, self.config_view, self.report_view]:
             self.stack.addWidget(w)
 
         # シグナル接続：チケット選択 → スケジュールパネルへ（ガントチャートからのみ）
@@ -2435,6 +2439,39 @@ class DetailPane(QWidget):
             lbl.setWordWrap(True)
             self.form.addRow(f"{label}:", lbl)
 
+        # リンク（成果物・参考資料）: 値表示 + 開くボタン
+        link_val = str(row.get("link", "") or "")
+        link_row = QWidget()
+        link_layout = QHBoxLayout(link_row)
+        link_layout.setContentsMargins(0, 0, 0, 0)
+        link_lbl = QLabel(link_val)
+        link_lbl.setWordWrap(True)
+        link_layout.addWidget(link_lbl, stretch=1)
+        if link_val:
+            open_btn = QPushButton("📂 開く")
+            open_btn.setToolTip("リンク先を既定のアプリで開く")
+            open_btn.clicked.connect(lambda _=False, p=link_val: self._open_link(p))
+            link_layout.addWidget(open_btn)
+        self.form.addRow("リンク:", link_row)
+
+    def _open_link(self, link: str) -> None:
+        """リンク先を OS の既定アプリで開く。URL とローカルパスの両方に対応。"""
+        link = link.strip()
+        if not link:
+            return
+        if "://" in link:
+            url = QUrl(link)
+        else:
+            path = Path(link)
+            if not path.exists():
+                QMessageBox.warning(
+                    self, "リンクエラー", f"リンク先が見つかりません:\n{link}")
+                return
+            url = QUrl.fromLocalFile(str(path))
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(
+                self, "リンクエラー", f"リンクを開けませんでした:\n{link}")
+
 
 # ---------- ノード編集ダイアログ ----------
 
@@ -2496,6 +2533,8 @@ class _NodeEditDialog(QDialog):
         self.f_color = ColorCombo()
         self.f_memo = QTextEdit()
         self.f_memo.setMaximumHeight(80)
+        self.f_link = QLineEdit()
+        self.f_link.setPlaceholderText("成果物・参考資料のファイルパスまたは URL")
 
         form.addRow("タイトル *:",   self.f_title)
         form.addRow("順序:",         self.f_priority)
@@ -2505,6 +2544,7 @@ class _NodeEditDialog(QDialog):
         form.addRow("納期:",         deadline_row)
         form.addRow("表示色:",       self.f_color)
         form.addRow("メモ:",         self.f_memo)
+        form.addRow("リンク:",       self.f_link)
 
         layout.addLayout(form)
 
@@ -2528,6 +2568,7 @@ class _NodeEditDialog(QDialog):
             self.f_deadline.set_date(str(row.get("deadline", "") or ""))
             self.f_color.set_color(str(row.get("color", "Cyan")))
             self.f_memo.setPlainText(str(row.get("memo", "")))
+            self.f_link.setText(str(row.get("link", "") or ""))
         else:
             self.f_color.set_color(default_color)
 
@@ -2557,5 +2598,6 @@ class _NodeEditDialog(QDialog):
         ds["deadline"]        = self.f_deadline.get_date() or None
         ds["color"]           = self.f_color.current_color()
         ds["memo"]            = self.f_memo.toPlainText()
+        ds["link"]            = self.f_link.text().strip()
         ds["updated_at"]      = datetime.date.today().isoformat()
         return ds

@@ -29,7 +29,7 @@ NODE_COLUMNS = [
     "IDX", "node_type", "parent_id", "title", "status", "priority",
     "assigned_to", "estimated_hours", "actual_hours",
     "deadline", "start_available", "actual_start", "actual_end",
-    "memo", "color", "created_at", "updated_at",
+    "memo", "link", "color", "created_at", "updated_at",
 ]
 # daily_schedule の時間スロット列名（C0000〜C2345 の 96 列、15分刻み）
 DAILY_TIME_COLS = [f"C{i // 4:02d}{(i % 4) * 15:02d}" for i in range(24 * 4)]
@@ -119,6 +119,7 @@ def create_initial_node(owner: str, node_type: str, title: str,
         "actual_start":     None,
         "actual_end":       None,
         "memo":             "",
+        "link":             "",
         "color":            color,
         "created_at":       today,
         "updated_at":       today,
@@ -143,6 +144,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     actual_start    TEXT,
     actual_end      TEXT,
     memo            TEXT DEFAULT '',
+    link            TEXT DEFAULT '',
     color           TEXT DEFAULT 'Cyan',
     created_at      TEXT NOT NULL DEFAULT '',
     updated_at      TEXT NOT NULL DEFAULT ''
@@ -315,6 +317,12 @@ class Database:
             conn.execute(_SCHEMA_MEMO)
             conn.execute(_SCHEMA_PERMANENT_NOTICES)
             conn.commit()
+            # 既存 DB へのマイグレーション: link 列が無ければ追加
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+            if "link" not in cols:
+                conn.execute("ALTER TABLE nodes ADD COLUMN link TEXT DEFAULT ''")
+                conn.commit()
+                self._logi("[DB] マイグレーション: nodes.link 列を追加")
             self._log(f"DB 初期化完了: {self.db_path}")
         except Exception as e:
             self._log(f"DB 初期化エラー: {e}")

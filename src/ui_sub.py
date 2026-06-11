@@ -2135,25 +2135,9 @@ class SearchView(QWidget):
         """
         if not date_from and not date_to:
             return {}
-        df_daily = self.state.df_daily
-        counts: dict = {idx: 0 for idx in ticket_idxs}
-        ticket_set = set(ticket_idxs)
-        if df_daily.empty or not ticket_set:
-            return {idx: 0.0 for idx in ticket_idxs}
-        for row_idx in df_daily.index:
-            # IDX 先頭10文字が日付 (YYYY-MM-DD)
-            date_part = str(row_idx)[:10]
-            if date_from and date_part < date_from:
-                continue
-            if date_to and date_part > date_to:
-                continue
-            for col in DB.DAILY_TIME_COLS:
-                if col not in df_daily.columns:
-                    continue
-                val = df_daily.loc[row_idx, col]
-                if val in ticket_set:
-                    counts[val] = counts.get(val, 0) + 1
-        return {idx: round(cnt * 0.25, 2) for idx, cnt in counts.items()}
+        # 集計本体はレポート機能と共用の logic.calc_period_hours に委譲
+        return LG.calc_period_hours(
+            self.state.df_daily, ticket_idxs, date_from, date_to)
 
     def _get_ancestors(self, idx: str) -> dict:
         """指定ノードの祖先タイトルを種別ごとに返す"""
@@ -3035,6 +3019,7 @@ class ConfigView(QWidget):
         self._build_section_gui()
         self._build_section_schedule()
         self._build_section_daily_info()
+        self._build_section_report()
         self._build_section_commands()
 
         self._form_layout.addStretch()
@@ -3148,6 +3133,12 @@ class ConfigView(QWidget):
         self._text("di_safety",    ", ".join(cfg.safety_options),     fl, "safety:")
         self._text("di_overwork",  ", ".join(cfg.overwork_options),   fl, "overwork:")
 
+    def _build_section_report(self) -> None:
+        cfg = self.state.config
+        fl = self._group("[Report]")
+        self._text("report_output_dir", cfg.report_output_dir, fl,
+                   "output_dir (Markdown 出力先フォルダ):")
+
     def _build_section_commands(self) -> None:
         cfg = self.state.config
         fl = self._group("[Commands]")
@@ -3187,6 +3178,7 @@ class ConfigView(QWidget):
         _set("di_workplace",     ", ".join(cfg.work_place_options))
         _set("di_safety",        ", ".join(cfg.safety_options))
         _set("di_overwork",      ", ".join(cfg.overwork_options))
+        _set("report_output_dir", cfg.report_output_dir)
 
     # ── 保存 ──
 
@@ -3241,6 +3233,9 @@ class ConfigView(QWidget):
         parser.set("DailyInfoCombo", "safety",        self._get("di_safety"))
         parser.set("DailyInfoCombo", "overwork",      self._get("di_overwork"))
 
+        _ensure("Report")
+        parser.set("Report", "output_dir", self._get("report_output_dir"))
+
         # Commands は既存エントリをそのまま保持（フォームに表示した分のみ更新）
         _ensure("Commands")
         cfg = self.state.config
@@ -3254,6 +3249,223 @@ class ConfigView(QWidget):
             with open(str(self._USER_CONFIG_PATH), "w", encoding="utf-8") as f:
                 parser.write(f)
             self.info.set_info("user_config.ini を保存しました（一部設定は再起動後に反映）")
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", str(e))
+
+
+# ---------- レポート生成ビュー ----------
+
+class ReportView(QWidget):
+    """週報・月報の Markdown を生成・保存するビュー"""
+
+    def __init__(self, state):
+        super().__init__()
+        self.state = state
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        layout.addWidget(QLabel("📋 Report 週報・月報生成"))
+        layout.addWidget(Separator())
+
+        # 1行目: 種別・Project4 選択
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("種別:"))
+        self.f_mode = QComboBox()
+        self.f_mode.addItem("週報", "weekly")
+        self.f_mode.addItem("月報", "monthly")
+        row1.addWidget(self.f_mode)
+        row1.addSpacing(12)
+        row1.addWidget(QLabel("Project4:"))
+        self.f_p4 = QComboBox()
+        self.f_p4.setMinimumWidth(320)
+        row1.addWidget(self.f_p4, stretch=1)
+        self.f_own_only = QCheckBox("自分の担当のみ")
+        self.f_own_only.setChecked(True)
+        self.f_own_only.stateChanged.connect(lambda _=0: self._rebuild_p4_combo())
+        row1.addWidget(self.f_own_only)
+        layout.addLayout(row1)
+
+        # 2行目: 期間（プリセット + 開始/終了日）
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("期間:"))
+        self.f_from = DateButton(allow_empty=True)
+        row2.addWidget(self.f_from)
+        row2.addWidget(QLabel("〜"))
+        self.f_to = DateButton(allow_empty=True)
+        row2.addWidget(self.f_to)
+        row2.addSpacing(12)
+        for label in ("今週", "先週", "今月", "先月"):
+            btn = QPushButton(label)
+            btn.setStyleSheet(STYLE_BUTTON)
+            btn.clicked.connect(lambda _=False, l=label: self._on_preset(l))
+            row2.addWidget(btn)
+        row2.addStretch()
+        layout.addLayout(row2)
+
+        # 3行目: 操作ボタン
+        row3 = QHBoxLayout()
+        gen_btn = QPushButton("📝 生成")
+        gen_btn.setStyleSheet(STYLE_BUTTON)
+        gen_btn.clicked.connect(self._on_generate)
+        copy_btn = QPushButton("📋 クリップボードへコピー")
+        copy_btn.setStyleSheet(STYLE_BUTTON)
+        copy_btn.clicked.connect(self._on_copy)
+        save_btn = QPushButton("💾 ファイル保存")
+        save_btn.setStyleSheet(STYLE_BUTTON)
+        save_btn.clicked.connect(self._on_save)
+        row3.addWidget(gen_btn)
+        row3.addWidget(copy_btn)
+        row3.addWidget(save_btn)
+        row3.addStretch()
+        layout.addLayout(row3)
+
+        # プレビュー（手直し可能）
+        self.preview = QTextEdit()
+        self.preview.setAcceptRichText(False)
+        self.preview.setPlaceholderText(
+            "Project4 と期間を選んで「生成」を押すと、ここに Markdown が表示されます。\n"
+            "内容は手直ししてからコピー・保存できます。")
+        layout.addWidget(self.preview, stretch=1)
+
+        self.info = InfoLabel()
+        layout.addWidget(self.info)
+
+        # 初期期間は今週（月曜〜日曜）
+        today = datetime.date.today()
+        monday = today - datetime.timedelta(days=today.weekday())
+        self.f_from.set_date(monday.isoformat())
+        self.f_to.set_date((monday + datetime.timedelta(days=6)).isoformat())
+
+        self._rebuild_p4_combo()
+
+    # ── Project4 コンボ ──
+
+    def _involves_user(self, df, p4_idx: str, user: str) -> bool:
+        """P4 自身または配下チケットに user の担当が含まれるか"""
+        if str(df.loc[p4_idx].get("assigned_to", "")) == user:
+            return True
+        for t_idx in LG.collect_descendant_tickets(df, p4_idx):
+            if str(df.loc[t_idx].get("assigned_to", "")) == user:
+                return True
+        return False
+
+    def _p4_label(self, df, idx: str) -> str:
+        """コンボ表示用に「親(P3) / P4」形式のラベルを返す"""
+        title = str(df.loc[idx, "title"])
+        pid = str(df.loc[idx, "parent_id"])
+        if pid in df.index:
+            return f"{df.loc[pid, 'title']} / {title}"
+        return title
+
+    def _rebuild_p4_combo(self) -> None:
+        prev = self.f_p4.currentData()
+        self.f_p4.blockSignals(True)
+        self.f_p4.clear()
+        df = self.state.df_nodes
+        if not df.empty:
+            p4s = df[(df["node_type"] == "project4")
+                     & (~df["status"].isin(["deleted", "cancel"]))]
+            own_only = self.f_own_only.isChecked()
+            user = self.state.user
+            for idx in p4s.index:
+                if own_only and not self._involves_user(df, idx, user):
+                    continue
+                self.f_p4.addItem(self._p4_label(df, idx), idx)
+            if prev:
+                pos = self.f_p4.findData(prev)
+                if pos >= 0:
+                    self.f_p4.setCurrentIndex(pos)
+        self.f_p4.blockSignals(False)
+
+    def refresh(self) -> None:
+        self._rebuild_p4_combo()
+
+    # ── 期間プリセット ──
+
+    def _on_preset(self, label: str) -> None:
+        today = datetime.date.today()
+        if label in ("今週", "先週"):
+            monday = today - datetime.timedelta(days=today.weekday())
+            if label == "先週":
+                monday -= datetime.timedelta(days=7)
+            d_from, d_to = monday, monday + datetime.timedelta(days=6)
+            self.f_mode.setCurrentIndex(0)  # 週報
+        else:
+            first = today.replace(day=1)
+            if label == "先月":
+                first = (first - datetime.timedelta(days=1)).replace(day=1)
+            last_day = calendar.monthrange(first.year, first.month)[1]
+            d_from, d_to = first, first.replace(day=last_day)
+            self.f_mode.setCurrentIndex(1)  # 月報
+        self.f_from.set_date(d_from.isoformat())
+        self.f_to.set_date(d_to.isoformat())
+        self._on_generate()
+
+    # ── 生成・コピー・保存 ──
+
+    def _on_generate(self) -> None:
+        p4_idx = self.f_p4.currentData()
+        if not p4_idx:
+            QMessageBox.information(self, "情報", "Project4 を選択してください")
+            return
+        date_from = self.f_from.get_date()
+        date_to = self.f_to.get_date()
+        if not date_from or not date_to or date_from > date_to:
+            QMessageBox.warning(self, "入力エラー", "期間を正しく指定してください")
+            return
+        data = LG.collect_report_data(
+            self.state.df_nodes, self.state.df_daily, p4_idx,
+            date_from, date_to, display_name_func=self.state.display_name)
+        md = LG.build_report_markdown(data, self.f_mode.currentData())
+        self.preview.setPlainText(md)
+        self.info.set_info(
+            f"生成しました（完了 {len(data['completed'])} 件 / "
+            f"投入工数 {data['period_hours_total']:.2f}h）")
+
+    def _on_copy(self) -> None:
+        text = self.preview.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "情報", "先にレポートを生成してください")
+            return
+        QApplication.clipboard().setText(text)
+        self.info.set_info("クリップボードへコピーしました")
+
+    def _on_save(self) -> None:
+        text = self.preview.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "情報", "先にレポートを生成してください")
+            return
+        # ファイル名は P4 タイトル + 期間から自動生成
+        p4_idx = self.f_p4.currentData()
+        root_title = ""
+        if p4_idx and p4_idx in self.state.df_nodes.index:
+            root_title = str(self.state.df_nodes.loc[p4_idx, "title"])
+        fname = LG.report_filename(
+            self.f_mode.currentData(), self.f_from.get_date() or "", root_title)
+
+        out_dir = (self.state.config.report_output_dir or "").strip()
+        if out_dir:
+            try:
+                dir_path = Path(out_dir)
+                dir_path.mkdir(parents=True, exist_ok=True)
+                path = dir_path / fname
+                path.write_text(text, encoding="utf-8")
+                self.info.set_info(f"保存しました: {path}")
+                return
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "保存エラー",
+                    f"output_dir への保存に失敗しました:\n{e}\n保存先を選択してください")
+        # output_dir 未設定または保存失敗時はダイアログで選択
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Markdown保存", str(Path.home() / fname), "Markdown (*.md)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(text, encoding="utf-8")
+            self.info.set_info(f"保存しました: {path}")
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
 

@@ -68,6 +68,10 @@ class AppConfig:
     safety_options: List[str] = field(default_factory=lambda: ["OK", "NG"])
     overwork_options: List[str] = field(default_factory=lambda: ["No", "Yes"])
 
+    # [Report]
+    # 週報・月報などの Markdown 出力先フォルダ（空の場合は保存時にダイアログで選択）
+    report_output_dir: str = ""
+
     # [DisplayNames] - メールアドレス → 表示名 のマッピング
     display_names: Dict[str, str] = field(default_factory=dict)
 
@@ -140,6 +144,11 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
         cfg.work_place_options = _split("work_place",    cfg.work_place_options)
         cfg.safety_options     = _split("safety",        cfg.safety_options)
         cfg.overwork_options   = _split("overwork",      cfg.overwork_options)
+
+    # [Report]
+    if parser.has_section("Report"):
+        cfg.report_output_dir = parser.get("Report", "output_dir",
+                                           fallback=cfg.report_output_dir)
 
     # [DisplayNames]
     if parser.has_section("DisplayNames"):

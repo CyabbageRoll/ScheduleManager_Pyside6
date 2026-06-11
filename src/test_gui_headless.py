@@ -556,6 +556,178 @@ def test_search_view(win, task_idx, ticket_idx):
         ng("期間実績(h)列 表示確認", e)
 
 
+def test_link_field(state, ticket_idx):
+    """nodes.link 列の保存・読込と編集ダイアログの確認"""
+    print("\n[11] リンク列テスト")
+    from db import NODE_COLUMNS
+
+    try:
+        assert "link" in NODE_COLUMNS, "NODE_COLUMNS に link がない"
+        assert "link" in state.df_nodes.columns, "df_nodes に link 列がない"
+        ok("NODE_COLUMNS / df_nodes に link 列が存在する")
+    except Exception as e:
+        ng("link 列の存在確認", e)
+        return
+
+    try:
+        ds = state.df_nodes.loc[ticket_idx].copy()
+        ds.name = ticket_idx
+        ds["link"] = "https://example.com/spec.md"
+        state.db.upsert_node(ds)
+        state.reload_nodes()
+        saved = state.df_nodes.loc[ticket_idx, "link"]
+        assert saved == "https://example.com/spec.md", f"link={saved!r}"
+        ok("link の保存・再読込ラウンドトリップ OK")
+    except Exception as e:
+        ng("link ラウンドトリップ", e)
+
+    try:
+        from ui_main import _NodeEditDialog
+        dlg = _NodeEditDialog(None, "ticket", state, edit_idx=ticket_idx)
+        assert dlg.f_link.text() == "https://example.com/spec.md", \
+            f"f_link={dlg.f_link.text()!r}"
+        dlg.f_link.setText("C:/tmp/result.xlsx")
+        ds = dlg.get_series()
+        assert ds["link"] == "C:/tmp/result.xlsx", f"link={ds['link']!r}"
+        ok("_NodeEditDialog の link 表示・入力 OK")
+    except Exception as e:
+        ng("_NodeEditDialog link", e)
+
+
+def test_report_logic(state):
+    """週報集計（calc_period_hours / collect_report_data）と Markdown 生成のテスト"""
+    print("\n[12] レポート生成ロジックテスト")
+    import pandas as pd
+    import logic as LG
+    from db import DAILY_SCH_COLS, DAILY_TIME_COLS, daily_sch_idx, create_initial_node
+
+    user = state.user
+    today = datetime.date.today().isoformat()
+
+    # P4 → Task → Ticket(完了/進行中) の階層を作成
+    try:
+        p4 = create_initial_node(user, "project4", "テストP4", "0", 1)
+        state.db.upsert_node(p4)
+        task = create_initial_node(user, "task", "P4配下Task", p4.name, 1)
+        state.db.upsert_node(task)
+        t_done = create_initial_node(user, "ticket", "完了チケット", task.name, 1)
+        t_done["status"] = "done"
+        t_done["actual_end"] = today
+        t_done["estimated_hours"] = 2.0
+        state.db.upsert_node(t_done)
+        t_wip = create_initial_node(user, "ticket", "進行中チケット", task.name, 2)
+        t_wip["estimated_hours"] = 4.0
+        t_wip["deadline"] = (datetime.date.today()
+                             + datetime.timedelta(days=3)).isoformat()
+        state.db.upsert_node(t_wip)
+        state.reload_nodes()
+        ok("P4/Task/Ticket テストデータ作成 OK")
+    except Exception as e:
+        ng("テストデータ作成", e)
+        return
+
+    # 期間工数集計（2スロット = 0.5h）
+    try:
+        sch_id = daily_sch_idx(today, user)
+        row = {c: "" for c in DAILY_SCH_COLS[1:]}
+        row["Owner"] = user
+        row[DAILY_TIME_COLS[36]] = t_wip.name
+        row[DAILY_TIME_COLS[37]] = t_wip.name
+        df_daily = pd.DataFrame([row], index=[sch_id])
+        hours = LG.calc_period_hours(df_daily, [t_wip.name], today, today)
+        assert abs(hours[t_wip.name] - 0.5) < 1e-9, f"hours={hours}"
+        ok("calc_period_hours: 2スロット = 0.5h")
+    except Exception as e:
+        ng("calc_period_hours", e)
+        return
+
+    # 配下チケット収集と期間集計・分類
+    try:
+        tickets = LG.collect_descendant_tickets(state.df_nodes, p4.name)
+        assert t_done.name in tickets and t_wip.name in tickets, f"tickets={tickets}"
+        ok(f"collect_descendant_tickets: {len(tickets)} 件")
+    except Exception as e:
+        ng("collect_descendant_tickets", e)
+
+    try:
+        data = LG.collect_report_data(
+            state.df_nodes, df_daily, p4.name, today, today)
+        comp_titles = [r["title"] for r in data["completed"]]
+        wip_titles = [r["title"] for r in data["in_progress"]]
+        appr_titles = [r["title"] for r in data["approaching"]]
+        assert "完了チケット" in comp_titles, f"completed={comp_titles}"
+        assert "進行中チケット" in wip_titles, f"in_progress={wip_titles}"
+        assert "進行中チケット" in appr_titles, f"approaching={appr_titles}"
+        assert abs(data["period_hours_total"] - 0.5) < 1e-9, \
+            f"total={data['period_hours_total']}"
+        ok("collect_report_data: 完了/進行中/納期接近/合計工数 OK")
+    except Exception as e:
+        ng("collect_report_data", e)
+        return
+
+    # Markdown 生成
+    try:
+        md = LG.build_report_markdown(data, "weekly")
+        assert "# 週報" in md and "テストP4" in md, md[:80]
+        assert "完了チケット" in md and "進行中チケット" in md
+        assert "0.50h" in md, "投入工数合計が見つからない"
+        ok("build_report_markdown(weekly) OK")
+        md_m = LG.build_report_markdown(data, "monthly")
+        assert "# 月報" in md_m, md_m[:80]
+        ok("build_report_markdown(monthly) OK")
+    except Exception as e:
+        ng("build_report_markdown", e)
+
+    # ファイル名サニタイズ
+    try:
+        fname = LG.report_filename("weekly", today, 'A/B:C*テスト')
+        assert fname.endswith(".md"), fname
+        assert all(c not in fname for c in '/\\:*?"<>|'), fname
+        ok(f"report_filename サニタイズ OK: {fname}")
+    except Exception as e:
+        ng("report_filename", e)
+
+
+def test_report_view(win):
+    """ReportView の生成・プレビュー・保存のテスト"""
+    print("\n[13] ReportView テスト")
+    rv = win.report_view
+
+    try:
+        rv.refresh()
+        assert rv.f_p4.count() >= 1, f"P4コンボが空: {rv.f_p4.count()}"
+        ok(f"P4コンボ件数: {rv.f_p4.count()}")
+    except Exception as e:
+        ng("P4コンボ", e)
+        return
+
+    try:
+        today = datetime.date.today().isoformat()
+        rv.f_from.set_date(today)
+        rv.f_to.set_date(today)
+        rv._on_generate()
+        text = rv.preview.toPlainText()
+        assert text.strip().startswith("#"), f"preview={text[:40]!r}"
+        ok("レポート生成 → プレビュー表示 OK")
+    except Exception as e:
+        ng("レポート生成", e)
+        return
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            win.state.config.report_output_dir = td
+            rv._on_save()
+            files = list(Path(td).glob("*.md"))
+            assert len(files) == 1, f"保存ファイル数={len(files)}"
+            content = files[0].read_text(encoding="utf-8")
+            assert content.strip().startswith("#"), "保存内容が空"
+            ok(f"output_dir への保存 OK: {files[0].name}")
+        win.state.config.report_output_dir = ""
+    except Exception as e:
+        win.state.config.report_output_dir = ""
+        ng("output_dir 保存", e)
+
+
 def test_save_load(state):
     """save() → load() のラウンドトリップ確認"""
     print("\n[8] save / load ラウンドトリップテスト")
@@ -599,6 +771,9 @@ def main():
             test_gantt_view(win)
             test_actual_hours_propagation(win, task_idx, ticket_idx)
             test_search_view(win, task_idx, ticket_idx)
+            test_link_field(state, ticket_idx)
+            test_report_logic(state)
+            test_report_view(win)
             test_save_load(state)
 
     print("\n" + "=" * 55)
