@@ -1413,9 +1413,52 @@ class TreePane(QWidget):
             return
         menu = QMenu(self)
         act_req = menu.addAction("📨 Request")
+        # Project4 選択時のみテンプレート一括作成を表示
+        act_tmpl = None
+        if idx in self.state.df_nodes.index and \
+                str(self.state.df_nodes.loc[idx, "node_type"]) == "project4":
+            act_tmpl = menu.addAction("📋 テンプレートから作成")
         act = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if act == act_req:
             self.request_requested.emit(idx)
+        elif act_tmpl is not None and act == act_tmpl:
+            self._on_create_from_template(idx)
+
+    def _on_create_from_template(self, p4_idx: str) -> None:
+        """テンプレートから P4 配下に Task/Ticket を一括作成する（インメモリのみ）"""
+        tmpl_dir = Path(__file__).parent / "documents" / "templates"
+        templates = {}
+        if tmpl_dir.exists():
+            for f in sorted(tmpl_dir.glob("*.txt")):
+                try:
+                    templates[f.stem] = f.read_text(encoding="utf-8")
+                except Exception:
+                    pass
+        if not templates:
+            QMessageBox.information(
+                self, "情報",
+                f"テンプレートがありません。\n{tmpl_dir} に .txt を配置してください")
+            return
+        dlg = _TemplateSelectDialog(templates, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        nodes, errors = LG.parse_template_text(
+            dlg.selected_text(), p4_idx, self.state.user, self.state.df_nodes)
+        if errors:
+            QMessageBox.warning(self, "テンプレートエラー", "\n".join(errors[:15]))
+            if not nodes:
+                return
+        if not nodes:
+            QMessageBox.information(self, "情報", "作成対象がありません")
+            return
+        for ds in nodes:
+            self.state.df_nodes.loc[ds.name] = ds
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
+        self.state.refresh()
+        QMessageBox.information(
+            self, "完了",
+            f"{len(nodes)} 件のノードを作成しました（Ctrl+S で DB に保存されます）")
 
     def _on_node_reparented(self, dragged_idx: str, new_parent_idx: str) -> None:
         """ドラッグ&ドロップによる親変更を処理する。
@@ -2471,6 +2514,48 @@ class DetailPane(QWidget):
         if not QDesktopServices.openUrl(url):
             QMessageBox.warning(
                 self, "リンクエラー", f"リンクを開けませんでした:\n{link}")
+
+
+# ---------- テンプレート選択ダイアログ ----------
+
+class _TemplateSelectDialog(QDialog):
+    """プロジェクトテンプレート選択ダイアログ（一覧 + プレビュー）"""
+
+    def __init__(self, templates: dict, parent=None):
+        # templates: {テンプレート名: ファイル内容}
+        super().__init__(parent)
+        self.setWindowTitle("テンプレートから作成")
+        self.setMinimumSize(480, 380)
+        self._templates = templates
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("テンプレート:"))
+        self.combo = QComboBox()
+        self.combo.addItems(list(templates.keys()))
+        self.combo.currentTextChanged.connect(self._on_changed)
+        layout.addWidget(self.combo)
+
+        layout.addWidget(QLabel("内容プレビュー:"))
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        layout.addWidget(self.preview, stretch=1)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        if templates:
+            self._on_changed(self.combo.currentText())
+
+    def _on_changed(self, name: str) -> None:
+        self.preview.setPlainText(self._templates.get(name, ""))
+
+    def selected_text(self) -> str:
+        return self._templates.get(self.combo.currentText(), "")
 
 
 # ---------- ノード編集ダイアログ ----------

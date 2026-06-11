@@ -12,7 +12,7 @@ import pandas as pd
 
 from db import (
     NODE_TYPES, STATUS_LIST, DAILY_TIME_COLS,
-    create_initial_node, generate_idx,
+    create_initial_node, generate_idx, build_auto_children, daily_sch_idx,
 )
 
 
@@ -124,6 +124,155 @@ def _parse_date(s: str) -> Optional[str]:
         return s
     except ValueError:
         return None
+
+
+# ---------- プロジェクトテンプレート一括作成 ----------
+
+def parse_template_text(text: str, p4_idx: str, owner: str,
+                        df_nodes: pd.DataFrame) -> tuple:
+    """
+    テンプレートテキストから Task / Ticket の pd.Series リストを生成する。
+
+    フォーマット（# はコメント行）:
+        > Task名         … 行頭 > で新しい Task を開始
+        タイトル, 優先度, 見積工数(h), 開始可能日, 納期, ステータス, メモ
+                         … parse_ticket_text と同じチケット書式
+    Task には「詳細作成」「完了」チケットが自動付与される（spec 2.2）。
+
+    戻り値:
+        (ノードリスト[pd.Series]（Task → 自動チケット → テンプレチケットの順）,
+         エラーリスト[str])
+    """
+    results: List[pd.Series] = []
+    errors: List[str] = []
+    existing_task_titles = set(
+        df_nodes[(df_nodes["parent_id"] == p4_idx)
+                 & (df_nodes["node_type"] == "task")]["title"].tolist()
+    ) if not df_nodes.empty else set()
+
+    # 既存の兄弟ノードの最大 priority から連番を振る
+    next_priority = 1
+    if not df_nodes.empty:
+        siblings = df_nodes[df_nodes["parent_id"] == p4_idx]
+        if not siblings.empty:
+            next_priority = int(siblings["priority"].max()) + 1
+
+    current_task: Optional[pd.Series] = None
+    buffer: List[str] = []
+
+    def _flush() -> None:
+        """貯めたチケット行を現在の Task 配下としてパースする"""
+        nonlocal current_task, buffer
+        if current_task is None:
+            return
+        tickets, errs = parse_ticket_text(
+            "\n".join(buffer), current_task.name, owner, df_nodes)
+        results.extend(tickets)
+        errors.extend(errs)
+        current_task = None
+        buffer = []
+
+    for line_no, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith(">"):
+            _flush()
+            title = line[1:].strip()
+            if not title:
+                errors.append(f"行 {line_no}: Task 名が空です → {raw}")
+                continue
+            if title in existing_task_titles:
+                errors.append(f"行 {line_no}: 同名 Task が既に存在します → {title}")
+                continue
+            task_ds = create_initial_node(owner, "task", title, p4_idx,
+                                          next_priority)
+            next_priority += 1
+            results.append(task_ds)
+            # 「詳細作成」「完了」チケットを自動付与
+            results.extend(build_auto_children(task_ds, owner))
+            existing_task_titles.add(title)
+            current_task = task_ds
+            buffer = []
+        else:
+            if current_task is None:
+                errors.append(
+                    f"行 {line_no}: Task 行（> 名前）より前にチケット行があります → {raw}")
+                continue
+            buffer.append(raw)
+    _flush()
+    return results, errors
+
+
+# ---------- デイリーワークログ Markdown 出力 ----------
+
+def build_daily_log_markdown(df_daily: pd.DataFrame, df_nodes: pd.DataFrame,
+                             df_log, date_str: str, user: str) -> str:
+    """
+    指定日の作業実績（daily_schedule のスロットを連続区間にまとめたもの）と
+    日次ログ（体調・勤務地・連絡事項）を Markdown 化する。
+    """
+    idx = daily_sch_idx(date_str, user)
+    lines = [f"# 作業ログ {date_str}", ""]
+
+    # 勤務時間サマリー
+    wh = calc_working_hours(df_daily, idx)
+    if wh["total"] > 0:
+        lines.append(
+            f"- 勤務: {col_to_hhmm(wh['from'])}〜{col_to_hhmm(wh['to'])}"
+            f"（休憩 {wh['break']:.2f}h、合計 {wh['total']:.2f}h）")
+    else:
+        lines.append("- 勤務: 記録なし")
+
+    # daily_log（体調・勤務地・連絡事項）
+    notes = ""
+    if df_log is not None and not df_log.empty and idx in df_log.index:
+        lg = df_log.loc[idx]
+        health = str(lg.get("health_status", "") or "")
+        place = str(lg.get("work_place", "") or "")
+        if health or place:
+            lines.append(f"- 体調: {health or '-'} / 勤務地: {place or '-'}")
+        notes = str(lg.get("notes", "") or "")
+    lines += ["", "## 作業内訳", ""]
+
+    # スロットを「同一チケットの連続区間」にまとめる
+    segments: List[tuple] = []  # (開始スロットi, 終了スロットi(排他), ticket_idx)
+    if not df_daily.empty and idx in df_daily.index:
+        ds = df_daily.loc[idx]
+        prev, start_i = "", 0
+        for i in range(len(DAILY_TIME_COLS) + 1):
+            col = DAILY_TIME_COLS[i] if i < len(DAILY_TIME_COLS) else None
+            val = ""
+            if col is not None and col in ds.index and ds[col]:
+                val = str(ds[col])
+            if val != prev:
+                if prev:
+                    segments.append((start_i, i, prev))
+                start_i = i
+                prev = val
+
+    if segments:
+        lines += ["| 時間帯 | チケット | タスク | 時間(h) |", "|---|---|---|---|"]
+        for s, e, t_idx in segments:
+            end_s = ("24:00" if e >= len(DAILY_TIME_COLS)
+                     else col_to_hhmm(DAILY_TIME_COLS[e]))
+            title, task_title = t_idx, ""
+            if df_nodes is not None and not df_nodes.empty \
+                    and t_idx in df_nodes.index:
+                title = str(df_nodes.loc[t_idx, "title"])
+                pid = str(df_nodes.loc[t_idx, "parent_id"])
+                if pid in df_nodes.index:
+                    task_title = str(df_nodes.loc[pid, "title"])
+            lines.append(
+                f"| {col_to_hhmm(DAILY_TIME_COLS[s])}〜{end_s}"
+                f" | {_md_escape(title)} | {_md_escape(task_title)}"
+                f" | {(e - s) * 0.25:.2f} |")
+    else:
+        lines.append("（記録なし）")
+
+    lines += ["", "## メモ・連絡事項", ""]
+    lines.append(notes if notes.strip() else "（なし）")
+    return "\n".join(lines) + "\n"
 
 
 # ---------- EDF + 優先度スケジューリング ----------

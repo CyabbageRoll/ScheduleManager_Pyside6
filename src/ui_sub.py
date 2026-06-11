@@ -2851,7 +2851,10 @@ class MemoView(QWidget):
         self.editor.textChanged.connect(self._on_changed)
         layout.addWidget(self.editor, stretch=1)
 
-        btn_row = ButtonRow([("保存", self._on_save)])
+        btn_row = ButtonRow([
+            ("保存", self._on_save),
+            ("📅 当日ログをmd出力", self._on_export_daily),
+        ])
         layout.addWidget(btn_row)
 
         self.info = InfoLabel()
@@ -2861,6 +2864,42 @@ class MemoView(QWidget):
         self.editor.blockSignals(True)
         self.editor.setPlainText(self.state.memo_text)
         self.editor.blockSignals(False)
+
+    def _on_export_daily(self) -> None:
+        """表示中の日付の作業ログ（スケジュール+日次ログ）を Markdown 出力する"""
+        date_str = self.state.current_date
+        md = LG.build_daily_log_markdown(
+            self.state.df_daily, self.state.df_nodes,
+            self.state.df_daily_log, date_str, self.state.user)
+        fname = f"{date_str}.md"
+        out_dir = (self.state.config.report_output_dir or "").strip()
+        if out_dir:
+            try:
+                daily_dir = Path(out_dir) / "daily"
+                daily_dir.mkdir(parents=True, exist_ok=True)
+                path = daily_dir / fname
+                if path.exists():
+                    ans = QMessageBox.question(
+                        self, "上書き確認",
+                        f"{path.name} は既に存在します。上書きしますか？")
+                    if ans != QMessageBox.StandardButton.Yes:
+                        return
+                path.write_text(md, encoding="utf-8")
+                self.info.set_info(f"作業ログを出力しました: {path}")
+                return
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "保存エラー",
+                    f"output_dir への保存に失敗しました:\n{e}\n保存先を選択してください")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "作業ログ保存", str(Path.home() / fname), "Markdown (*.md)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(md, encoding="utf-8")
+            self.info.set_info(f"作業ログを出力しました: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", str(e))
 
     def _on_changed(self) -> None:
         self.state.memo_text = self.editor.toPlainText()
@@ -3258,6 +3297,13 @@ class ConfigView(QWidget):
 class ReportView(QWidget):
     """週報・月報の Markdown を生成・保存するビュー"""
 
+    # LLM 文章化プロンプトのテンプレート（ユーザーがカスタマイズ可能）
+    _LLM_TEMPLATE_PATH = Path(__file__).parent / "documents" / "llm_report.md"
+    _LLM_FALLBACK = (
+        "以下の実績データから、上司向けの業務報告を簡潔な敬体で作成してください。\n"
+        "構成: 1) 成果サマリー 2) 進行中と見通し 3) 課題・リスク 4) 所感（叩き台）\n"
+        "数値はデータのまま正確に使い、データにない事実は創作しないでください。")
+
     def __init__(self, state):
         super().__init__()
         self.state = state
@@ -3318,9 +3364,15 @@ class ReportView(QWidget):
         save_btn = QPushButton("💾 ファイル保存")
         save_btn.setStyleSheet(STYLE_BUTTON)
         save_btn.clicked.connect(self._on_save)
+        llm_btn = QPushButton("🤖 LLM用にコピー")
+        llm_btn.setStyleSheet(STYLE_BUTTON)
+        llm_btn.setToolTip("文章化指示プロンプト付きでクリップボードへコピー\n"
+                           "（社内 LLM 等に貼ると報告文章のドラフトを作成できます）")
+        llm_btn.clicked.connect(self._on_copy_llm)
         row3.addWidget(gen_btn)
         row3.addWidget(copy_btn)
         row3.addWidget(save_btn)
+        row3.addWidget(llm_btn)
         row3.addStretch()
         layout.addLayout(row3)
 
@@ -3458,6 +3510,21 @@ class ReportView(QWidget):
             return
         QApplication.clipboard().setText(text)
         self.info.set_info("クリップボードへコピーしました")
+
+    def _on_copy_llm(self) -> None:
+        """文章化指示プロンプト + 実績データをクリップボードへコピーする"""
+        text = self.preview.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "情報", "先にレポートを生成してください")
+            return
+        try:
+            template = self._LLM_TEMPLATE_PATH.read_text(encoding="utf-8")
+        except Exception:
+            # テンプレート欠落時は内蔵のデフォルト文を使用
+            template = self._LLM_FALLBACK
+        QApplication.clipboard().setText(
+            template.rstrip() + "\n\n# 実績データ\n\n" + text)
+        self.info.set_info("LLM 用プロンプトをクリップボードにコピーしました")
 
     def _on_save(self) -> None:
         text = self.preview.toPlainText()

@@ -855,6 +855,166 @@ def test_progress_report(state, win):
         ng("月次進捗保存", e)
 
 
+def test_template_parse(state):
+    """プロジェクトテンプレートのパース（Task/自動チケット/Ticket 階層）テスト"""
+    print("\n[16] テンプレート一括作成テスト")
+    import logic as LG
+
+    df = state.df_nodes
+    p4_idx = df[(df["node_type"] == "project4") & (df["title"] == "テストP4")].index[0]
+
+    text = (
+        "# コメント行\n"
+        "> 要件整理\n"
+        "ヒアリング, 1, 2.0, , , ,\n"
+        "要件まとめ, 2, 2.0, , , ,メモ付き\n"
+        "> 執筆\n"
+        "ドラフト執筆, 1, 6.0, , , ,\n"
+    )
+    try:
+        nodes, errors = LG.parse_template_text(text, p4_idx, state.user, df)
+        assert not errors, f"errors={errors}"
+        # Task2件 + 自動チケット2件×2 + テンプレチケット3件 = 9件
+        assert len(nodes) == 9, f"nodes={len(nodes)}"
+        ok(f"パース OK: {len(nodes)} 件（エラーなし）")
+    except Exception as e:
+        ng("parse_template_text", e)
+        return
+
+    try:
+        tasks = [n for n in nodes if n["node_type"] == "task"]
+        tickets = [n for n in nodes if n["node_type"] == "ticket"]
+        assert [t["title"] for t in tasks] == ["要件整理", "執筆"]
+        assert all(t["parent_id"] == p4_idx for t in tasks)
+        ok("Task 2 件が P4 直下に生成される")
+        # 各 Task に「詳細作成」「完了」が付与されている
+        for task in tasks:
+            children = [t["title"] for t in tickets if t["parent_id"] == task.name]
+            assert "詳細作成" in children and "完了" in children, \
+                f"{task['title']} の子: {children}"
+        ok("自動チケット（詳細作成・完了）付与 OK")
+        hearing = [t for t in tickets if t["title"] == "ヒアリング"][0]
+        assert hearing["parent_id"] == tasks[0].name
+        assert abs(float(hearing["estimated_hours"]) - 2.0) < 1e-9
+        memo_t = [t for t in tickets if t["title"] == "要件まとめ"][0]
+        assert memo_t["memo"] == "メモ付き"
+        ok("チケットの親・見積・メモが正しい")
+    except Exception as e:
+        ng("テンプレート階層検証", e)
+
+    # エラー系: Task 行より前のチケット行・同名 Task
+    try:
+        bad = "迷子チケット, 1, 1.0, , , ,\n> 要件整理\n"
+        df_with = state.df_nodes.copy()
+        for n in nodes:
+            df_with.loc[n.name] = n
+        _, errors2 = LG.parse_template_text(bad, p4_idx, state.user, df_with)
+        assert len(errors2) == 2, f"errors2={errors2}"
+        ok(f"エラー検出 OK: {len(errors2)} 件（迷子チケット・同名 Task）")
+    except Exception as e:
+        ng("テンプレートエラー検出", e)
+
+
+def test_daily_log_markdown(state):
+    """デイリーワークログ Markdown 生成のテスト"""
+    print("\n[17] デイリーログ md 出力テスト")
+    import pandas as pd
+    import logic as LG
+    from db import DAILY_SCH_COLS, DAILY_TIME_COLS, DAILY_LOG_COLS, daily_sch_idx
+
+    df = state.df_nodes
+    ticket_idx = df[df["title"] == "進行中チケット"].index[0]
+    user = state.user
+    today = datetime.date.today().isoformat()
+    sch_id = daily_sch_idx(today, user)
+
+    # 9:00〜9:30 連続 + 10:00〜10:15 の 2 区間
+    row = {c: "" for c in DAILY_SCH_COLS[1:]}
+    row["Owner"] = user
+    row[DAILY_TIME_COLS[36]] = ticket_idx  # 09:00
+    row[DAILY_TIME_COLS[37]] = ticket_idx  # 09:15
+    row[DAILY_TIME_COLS[40]] = ticket_idx  # 10:00
+    df_daily = pd.DataFrame([row], index=[sch_id])
+
+    log_row = {c: "" for c in DAILY_LOG_COLS[1:]}
+    log_row["Owner"] = user
+    log_row["health_status"] = "Good"
+    log_row["work_place"] = "Home"
+    log_row["notes"] = "定時退社します"
+    df_log = pd.DataFrame([log_row], index=[sch_id])
+
+    try:
+        md = LG.build_daily_log_markdown(df_daily, df, df_log, today, user)
+        assert f"# 作業ログ {today}" in md, md[:40]
+        assert "09:00〜09:30" in md, "連続区間がまとまっていない"
+        assert "10:00〜10:15" in md, "単独区間が出力されていない"
+        assert "進行中チケット" in md and "0.50" in md
+        assert "Good" in md and "Home" in md and "定時退社します" in md
+        ok("作業内訳（区間集約）・体調・連絡事項 OK")
+    except Exception as e:
+        ng("build_daily_log_markdown", e)
+        return
+
+    try:
+        # 記録がない日は「記録なし」表示
+        md_empty = LG.build_daily_log_markdown(
+            df_daily, df, df_log, "2000-01-01", user)
+        assert "勤務: 記録なし" in md_empty and "（記録なし）" in md_empty
+        ok("記録なしの日も正常に生成される")
+    except Exception as e:
+        ng("記録なし日の生成", e)
+
+
+def test_llm_copy_and_daily_export(win):
+    """ReportView LLM コピーと MemoView デイリーログ出力のテスト"""
+    print("\n[18] LLM コピー・デイリーログ出力 UI テスト")
+    from PySide6.QtWidgets import QApplication
+
+    rv = win.report_view
+    try:
+        rv.refresh()
+        rv.f_mode.setCurrentIndex(0)
+        today = datetime.date.today().isoformat()
+        rv.f_from.set_date(today)
+        rv.f_to.set_date(today)
+        rv._on_generate()
+        rv._on_copy_llm()
+        clip = QApplication.clipboard().text()
+        assert "# 実績データ" in clip, "プロンプトヘッダーがない"
+        assert "# 週報" in clip, "実績データ本体がない"
+        ok("LLM 用コピー: プロンプト + 実績データ OK")
+    except Exception as e:
+        ng("LLM 用コピー", e)
+
+    try:
+        # テンプレート欠落時のフォールバック
+        orig = rv._LLM_TEMPLATE_PATH
+        rv._LLM_TEMPLATE_PATH = Path("/nonexistent/llm_report.md")
+        rv._on_copy_llm()
+        clip = QApplication.clipboard().text()
+        assert "# 実績データ" in clip
+        rv._LLM_TEMPLATE_PATH = orig
+        ok("テンプレート欠落時のフォールバック OK")
+    except Exception as e:
+        rv._LLM_TEMPLATE_PATH = orig
+        ng("LLM フォールバック", e)
+
+    try:
+        mv = win.memo_view
+        with tempfile.TemporaryDirectory() as td:
+            win.state.config.report_output_dir = td
+            mv._on_export_daily()
+            files = list((Path(td) / "daily").glob("*.md"))
+            assert len(files) == 1, f"出力ファイル数={len(files)}"
+            content = files[0].read_text(encoding="utf-8")
+            assert content.startswith("# 作業ログ"), content[:30]
+            ok(f"デイリーログ出力 OK: daily/{files[0].name}")
+        win.state.config.report_output_dir = ""
+    except Exception as e:
+        win.state.config.report_output_dir = ""
+        ng("デイリーログ出力", e)
+
+
 def test_save_load(state):
     """save() → load() のラウンドトリップ確認"""
     print("\n[8] save / load ラウンドトリップテスト")
@@ -903,6 +1063,9 @@ def main():
             test_report_view(win)
             test_progress_snapshots(state)
             test_progress_report(state, win)
+            test_template_parse(state)
+            test_daily_log_markdown(state)
+            test_llm_copy_and_daily_export(win)
             test_save_load(state)
 
     print("\n" + "=" * 55)
