@@ -1191,6 +1191,118 @@ def test_personal_review(state, win):
         ng("個人振り返り描画", e)
 
 
+def test_slot_context_menu(win):
+    """スロット右クリック割り当てメニュー（最近使った + 階層カスケード）"""
+    print("\n[22] スロット右クリックメニューテスト")
+    from PySide6.QtWidgets import QMenu
+    from db import create_initial_node, DAILY_TIME_COLS, daily_sch_idx
+    panel = win.schedule_panel
+    state = win.state
+    df = state.df_nodes
+    user = state.user
+
+    # ── MRU ロジック（重複除去・順序・上限8）──
+    try:
+        state.recent_tickets = []
+        for i in range(10):
+            state.push_recent_ticket(f"id{i}")
+        state.push_recent_ticket("id0")  # 既存を先頭へ
+        assert state.recent_tickets[0] == "id0", state.recent_tickets
+        assert len(state.recent_tickets) == 8, state.recent_tickets
+        assert state.recent_tickets.count("id0") == 1, state.recent_tickets
+        ok("push_recent_ticket（重複除去・順序・上限8）OK")
+    except Exception as e:
+        ng("push_recent_ticket", e)
+    finally:
+        state.recent_tickets = []
+
+    # regularly チケットを追加（yamada 担当）
+    task_idx = df[df["title"] == "テストTask"].index[0]
+    reg = create_initial_node(user, "ticket", "定常チケットR", task_idx, 9)
+    reg["status"] = "regularly"
+    state.db.upsert_node(reg)
+    state.reload_nodes()
+    df = state.df_nodes
+    ticket_a = df[df["title"] == "チケットA"].index[0]
+
+    # ── 階層メニューの葉ロジック: 自分の todo/regularly のみ・Edit と同じ並び ──
+    # （QMenu ラッパ走査は PySide のオブジェクト寿命でフレーキーなため、
+    #   フィルタ・並び順は純ロジック _assignable_leaves_in_order で検証する）
+    assignable_idx = df[
+        (df["node_type"] == "ticket")
+        & (df["assigned_to"] == user)
+        & (df["status"].isin(["todo", "regularly"]))
+    ].index
+    visible_ids = panel._assignable_subtree_ids(df, assignable_idx)
+    try:
+        leaves = panel._assignable_leaves_in_order(df, visible_ids)
+        leaf_titles = [str(df.loc[i, "title"]) for i in leaves]
+        assert "チケットA" in leaf_titles, leaf_titles
+        assert "定常チケットR" in leaf_titles, leaf_titles
+        assert "チケットB" not in leaf_titles, leaf_titles    # 他人担当は除外
+        assert "完了チケット" not in leaf_titles, leaf_titles  # done は除外
+        # 並びは Edit と同じ priority 昇順（同一親 テストTask 内: A=2 < R=9）
+        same_parent = [t for t in leaf_titles if t in ("チケットA", "定常チケットR")]
+        assert same_parent == ["チケットA", "定常チケットR"], same_parent
+        ok(f"葉フィルタ・並び順（priority昇順）OK（{len(leaves)}件）")
+    except Exception as e:
+        ng("葉フィルタ・並び順", e)
+
+    # ── 祖先が visible_ids に含まれる（枝刈り用）──
+    try:
+        assert task_idx in visible_ids
+        pj_idx = df.loc[task_idx, "parent_id"]
+        assert pj_idx in visible_ids
+        ok("_assignable_subtree_ids が祖先(Task/PJ)を含む OK")
+    except Exception as e:
+        ng("_assignable_subtree_ids 祖先", e)
+
+    # ── Qt メニュー構築が例外なく動く（スモーク）──
+    try:
+        menu = QMenu(panel)
+        panel._build_assign_menu(menu, df, "0", visible_ids, [40])
+        assert len(menu.actions()) > 0
+        ok("_build_assign_menu 構築 OK（例外なし）")
+    except Exception as e:
+        ng("_build_assign_menu 構築", e)
+
+    # ── 割り当て(_assign_to_rows) → スロット + 工数加算 + MRU更新 ──
+    try:
+        state.recent_tickets = []
+        before_h = float(df.loc[ticket_a, "actual_hours"] or 0)
+        assigned = panel._assign_to_rows([40], ticket_a)
+        sch_id = daily_sch_idx(state.current_date, user)
+        col = DAILY_TIME_COLS[40]
+        assert assigned is True
+        assert state.df_daily.loc[sch_id, col] == ticket_a, state.df_daily.loc[sch_id, col]
+        assert float(state.df_nodes.loc[ticket_a, "actual_hours"] or 0) > before_h
+        assert state.recent_tickets[0] == ticket_a, state.recent_tickets
+        ok("_assign_to_rows 割り当て + 工数加算 + MRU更新 OK")
+    except Exception as e:
+        ng("_assign_to_rows 割り当て", e)
+
+    # ── 他人担当チケットは _assign_to_rows で拒否される ──
+    try:
+        ticket_b = df[df["title"] == "チケットB"].index[0]
+        rejected = panel._assign_to_rows([48], ticket_b)
+        assert rejected is False
+        ok("_assign_to_rows 他人チケット拒否 OK")
+    except Exception as e:
+        ng("_assign_to_rows 他人チケット拒否", e)
+
+    # ── リグレッション: ガント行クリック(assign_ticket)も従来通り ──
+    try:
+        panel.schedule_table.clearSelection()
+        panel.schedule_table.selectRow(44)
+        panel.assign_ticket(ticket_a)
+        sch_id = daily_sch_idx(state.current_date, user)
+        col = DAILY_TIME_COLS[44]
+        assert state.df_daily.loc[sch_id, col] == ticket_a
+        ok("assign_ticket（ガント行クリック）リグレッションなし OK")
+    except Exception as e:
+        ng("assign_ticket リグレッション", e)
+
+
 def test_save_load(state):
     """save() → load() のラウンドトリップ確認"""
     print("\n[8] save / load ラウンドトリップテスト")
@@ -1245,6 +1357,7 @@ def main():
             test_dashboard(win, ticket_idx)
             test_pomodoro(win, ticket_idx)
             test_personal_review(state, win)
+            test_slot_context_menu(win)
             test_save_load(state)
 
     print("\n" + "=" * 55)

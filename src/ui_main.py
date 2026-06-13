@@ -264,6 +264,10 @@ class DailyScheduleWidget(QWidget):
         # デリゲートを設定（毎時00分に区切り線、同一チケットに囲み線を描画）
         self.schedule_table.setItemDelegate(_HourLineDelegate(self.schedule_table))
 
+        # 右クリックメニュー（最近使った + 階層カスケードで割り当て）
+        self.schedule_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.schedule_table.customContextMenuRequested.connect(self._on_slot_context_menu)
+
         # 時刻ラベルを設定（全行フル表示、毎時にスタイルを付与）
         hour_font = QFont()
         hour_font.setBold(True)
@@ -317,10 +321,8 @@ class DailyScheduleWidget(QWidget):
 
         if rows and self.state.current_member == self.state.user and is_own_ticket:
             # 選択行に割り当て
-            self._update_schedule_slots(rows, ticket_idx)
+            self._assign_to_rows(rows, ticket_idx)
             self.schedule_table.clearSelection()  # 割り当て後は選択解除
-            title = self.state.df_nodes.loc[ticket_idx, "title"]
-            self.info.set_info(f"割り当て完了: {title}")
         elif rows and is_ticket and not is_own_ticket:
             # 他人のチケットは割り当て不可
             title = self.state.df_nodes.loc[ticket_idx, "title"]
@@ -331,6 +333,142 @@ class DailyScheduleWidget(QWidget):
             title = self.state.df_nodes.loc[ticket_idx, "title"] if is_ticket else ""
             if title:
                 self.info.set_info(f"選択中: {title}")
+
+    def _assign_to_rows(self, rows: list, ticket_idx: str) -> bool:
+        """指定スロット行に自分担当チケットを割り当てる。
+
+        ガント行クリック・右クリックメニューの双方から呼ばれる共通処理。
+        割り当てたら最近使ったリストを更新し True を、不可なら False を返す。
+        """
+        if not rows or ticket_idx not in self.state.df_nodes.index:
+            return False
+        if self.state.current_member != self.state.user:
+            return False
+        node = self.state.df_nodes.loc[ticket_idx]
+        is_own_ticket = (node["node_type"] == "ticket"
+                         and str(node["assigned_to"]) == self.state.user)
+        title = str(node["title"])
+        if not is_own_ticket:
+            self.info.set_info(f"⚠ {title} は自分のチケットではありません")
+            return False
+        self._update_schedule_slots(rows, ticket_idx)
+        self.state.push_recent_ticket(ticket_idx)
+        self.info.set_info(f"割り当て完了: {title}")
+        return True
+
+    # ── 右クリックメニューによる割り当て ──
+
+    def _on_slot_context_menu(self, pos) -> None:
+        """スロット表の右クリックメニュー（最近使った + 階層カスケード + クリア）"""
+        if self.state.current_member != self.state.user:
+            return  # 他人のスケジュール表示中は割り当て不可
+        # 対象行: 選択があれば選択行、無ければ右クリックした行
+        rows = sorted(set(idx.row() for idx in self.schedule_table.selectedIndexes()))
+        if not rows:
+            r = self.schedule_table.rowAt(pos.y())
+            if r < 0:
+                return
+            rows = [r]
+
+        df = self.state.df_nodes
+        menu = QMenu(self)
+
+        # 自分担当・割り当て可能(todo/regularly)のチケット
+        if df.empty:
+            assignable_idx = pd.Index([])
+        else:
+            assignable_idx = df[
+                (df["node_type"] == "ticket")
+                & (df["assigned_to"] == self.state.user)
+                & (df["status"].isin(["todo", "regularly"]))
+            ].index
+
+        # ── 最近使った ──
+        recent_idxs = [i for i in self.state.recent_tickets if i in assignable_idx]
+        if recent_idxs:
+            menu.addSection("最近使った")
+            for t_idx in recent_idxs:
+                act = menu.addAction(self._ticket_menu_label(df, t_idx))
+                act.triggered.connect(
+                    lambda checked=False, ti=t_idx: self._assign_to_rows(rows, ti)
+                )
+            menu.addSeparator()
+
+        # ── 階層カスケード（Edit と同じ priority 昇順）──
+        if len(assignable_idx) > 0:
+            visible_ids = self._assignable_subtree_ids(df, assignable_idx)
+            self._build_assign_menu(menu, df, "0", visible_ids, rows)
+
+        # ── クリア ──
+        menu.addSeparator()
+        clear_act = menu.addAction("クリア（割り当て解除）")
+        clear_act.triggered.connect(
+            lambda checked=False: self._update_schedule_slots(rows, "")
+        )
+
+        menu.exec(self.schedule_table.viewport().mapToGlobal(pos))
+
+    def _ticket_menu_label(self, df: pd.DataFrame, t_idx: str) -> str:
+        """最近使った節用ラベル: 親(Task)名 / チケット名"""
+        title = str(df.loc[t_idx, "title"]) if t_idx in df.index else ""
+        pid = str(df.loc[t_idx, "parent_id"] or "") if t_idx in df.index else ""
+        parent_title = str(df.loc[pid, "title"]) if pid in df.index else ""
+        return f"{parent_title} / {title}" if parent_title else title
+
+    def _assignable_subtree_ids(self, df: pd.DataFrame, leaf_idxs) -> set:
+        """葉チケットとその祖先（Task〜P1）の IDX 集合を返す（枝刈り用）"""
+        result = set(leaf_idxs)
+        for idx in leaf_idxs:
+            pid = df.loc[idx, "parent_id"] if idx in df.index else None
+            while pid and pid != "0" and pid in df.index:
+                result.add(pid)
+                pid = df.loc[pid, "parent_id"]
+        return result
+
+    def _assignable_leaves_in_order(self, df: pd.DataFrame, visible_ids: set,
+                                     parent_id: str = "0") -> list:
+        """visible_ids 内のチケット葉を Edit と同じ priority 昇順・DFS 順で返す。
+
+        メニュー構築(_build_assign_menu)と同じ走査規則の純ロジック版。
+        フィルタ結果と並び順の検証はこちらで行う（QMenu を介さない）。
+        """
+        out = []
+        children = df[df["parent_id"] == parent_id]
+        if children.empty:
+            return out
+        for idx, row in children.sort_values("priority").iterrows():
+            if idx not in visible_ids:
+                continue
+            if str(row["node_type"]) == "ticket":
+                out.append(idx)
+            else:
+                out.extend(self._assignable_leaves_in_order(df, visible_ids, idx))
+        return out
+
+    def _build_assign_menu(self, parent_menu, df: pd.DataFrame,
+                            parent_id: str, visible_ids: set, rows: list) -> None:
+        """parent_id 配下を priority 昇順で再帰生成する。
+
+        チケット(葉)は addAction、中間ノード(P1〜Task)は addMenu。
+        visible_ids に無い枝は刈る（割り当て可能チケットを持たない枝は出ない）。
+        並び順・フィルタ規則は _assignable_leaves_in_order と一致させること。
+        """
+        children = df[df["parent_id"] == parent_id]
+        if children.empty:
+            return
+        children = children.sort_values("priority")
+        for idx, row in children.iterrows():
+            if idx not in visible_ids:
+                continue
+            if str(row["node_type"]) == "ticket":
+                status_icon = "↻ " if str(row["status"]) == "regularly" else ""
+                act = parent_menu.addAction(f"{status_icon}{row['title']}")
+                act.triggered.connect(
+                    lambda checked=False, ti=idx: self._assign_to_rows(rows, ti)
+                )
+            else:
+                sub = parent_menu.addMenu(str(row["title"]))
+                self._build_assign_menu(sub, df, idx, visible_ids, rows)
 
     def _on_free(self) -> None:
         """選択スロットをクリアする"""
