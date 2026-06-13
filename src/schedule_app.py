@@ -213,6 +213,7 @@ class AppState:
     all_permanent_notices: Dict[str, str] = field(default_factory=dict)  # 全員の常時メモ
     nodes_modified: bool = False     # ノード変更フラグ（Ctrl+S 保存前に True になる）
     schedule_modified: bool = False  # 日次スケジュール/ログ/メモ変更フラグ
+    recent_tickets: List[str] = field(default_factory=list)  # 最近割り当てたチケット IDX（MRU、セッション内）
 
     def __post_init__(self):
         if not self.login_user:
@@ -237,6 +238,15 @@ class AppState:
     def display_name(self, email: str) -> str:
         """メールアドレスから表示名を返す"""
         return self.config.get_display_name(email)
+
+    def push_recent_ticket(self, idx: str, limit: int = 8) -> None:
+        """最近割り当てたチケットを MRU リスト先頭に追加する（重複除去・上限切り）"""
+        if not idx:
+            return
+        if idx in self.recent_tickets:
+            self.recent_tickets.remove(idx)
+        self.recent_tickets.insert(0, idx)
+        del self.recent_tickets[limit:]
 
     @property
     def members(self) -> List[str]:
