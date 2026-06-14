@@ -557,14 +557,15 @@ def test_search_view(win, task_idx, ticket_idx):
 
 
 def test_link_field(state, ticket_idx):
-    """nodes.link 列の保存・読込と編集ダイアログの確認"""
-    print("\n[11] リンク列テスト")
+    """nodes.link 列（休眠カラム）の存在確認と extract_md_links のテスト"""
+    print("\n[11] リンク列・md リンク抽出テスト")
     from db import NODE_COLUMNS
+    import logic as LG
 
     try:
         assert "link" in NODE_COLUMNS, "NODE_COLUMNS に link がない"
         assert "link" in state.df_nodes.columns, "df_nodes に link 列がない"
-        ok("NODE_COLUMNS / df_nodes に link 列が存在する")
+        ok("NODE_COLUMNS / df_nodes に link 列が存在する（休眠）")
     except Exception as e:
         ng("link 列の存在確認", e)
         return
@@ -577,21 +578,34 @@ def test_link_field(state, ticket_idx):
         state.reload_nodes()
         saved = state.df_nodes.loc[ticket_idx, "link"]
         assert saved == "https://example.com/spec.md", f"link={saved!r}"
-        ok("link の保存・再読込ラウンドトリップ OK")
+        ok("link DB ラウンドトリップ OK（休眠列として保持）")
     except Exception as e:
         ng("link ラウンドトリップ", e)
 
     try:
         from ui_main import _NodeEditDialog
         dlg = _NodeEditDialog(None, "ticket", state, edit_idx=ticket_idx)
-        assert dlg.f_link.text() == "https://example.com/spec.md", \
-            f"f_link={dlg.f_link.text()!r}"
-        dlg.f_link.setText("C:/tmp/result.xlsx")
-        ds = dlg.get_series()
-        assert ds["link"] == "C:/tmp/result.xlsx", f"link={ds['link']!r}"
-        ok("_NodeEditDialog の link 表示・入力 OK")
+        assert not hasattr(dlg, "f_link"), "f_link が削除されていない"
+        ok("_NodeEditDialog に f_link 欄がない（廃止済み）")
     except Exception as e:
-        ng("_NodeEditDialog link", e)
+        ng("_NodeEditDialog f_link 廃止確認", e)
+
+    try:
+        text = "参考: [仕様書](https://example.com/spec.pdf) と [議事録](C:/tmp/memo.md)"
+        links = LG.extract_md_links(text)
+        assert len(links) == 2, f"links={links}"
+        assert links[0] == ("仕様書", "https://example.com/spec.pdf")
+        assert links[1] == ("議事録", "C:/tmp/memo.md")
+        ok("extract_md_links: 複数リンク抽出 OK")
+    except Exception as e:
+        ng("extract_md_links", e)
+
+    try:
+        assert LG.extract_md_links("リンクなしのテキスト") == []
+        assert LG.extract_md_links("") == []
+        ok("extract_md_links: リンクなし → [] OK")
+    except Exception as e:
+        ng("extract_md_links 空", e)
 
 
 def test_report_logic(state):
@@ -678,181 +692,29 @@ def test_report_logic(state):
     except Exception as e:
         ng("build_report_markdown", e)
 
-    # ファイル名サニタイズ
+    # P2 単位月次ファイルのパス命名規約
     try:
-        fname = LG.report_filename("weekly", today, 'A/B:C*テスト')
-        assert fname.endswith(".md"), fname
-        assert all(c not in fname for c in '/\\:*?"<>|'), fname
-        ok(f"report_filename サニタイズ OK: {fname}")
+        import tempfile
+        import pandas as pd
+        from db import NODE_COLUMNS, create_initial_node
+        td = tempfile.mkdtemp()
+        user = state.user
+        p1 = create_initial_node(user, "project1", "確認P1", "0", 1)
+        p2 = create_initial_node(user, "project2", "確認P2", p1.name, 1)
+        tkt = create_initial_node(user, "ticket", "確認Ticket", p2.name, 1)
+        df_tmp = pd.DataFrame([p1, p2, tkt], columns=NODE_COLUMNS)
+        df_tmp.index = [p1.name, p2.name, tkt.name]
+        p = LG.report_p2_path(td, df_tmp, tkt.name, "202601")
+        assert p is not None, "パスが None"
+        assert p.parent.name == "reports", f"parent={p.parent.name}"
+        fname = p.name
+        assert fname.startswith("202601_"), f"yyyymm prefix: {fname}"
+        assert p2.name in fname, f"p2idx in fname: {fname}"
+        assert "確認P1" in fname and "確認P2" in fname, f"titles in fname: {fname}"
+        ok(f"report_p2_path 命名規約 OK: {fname}")
     except Exception as e:
-        ng("report_filename", e)
+        ng("report_p2_path 命名規約", e)
 
-
-def test_report_view(win):
-    """ReportView の生成・プレビュー・保存のテスト"""
-    print("\n[13] ReportView テスト")
-    rv = win.report_view
-
-    try:
-        rv.refresh()
-        assert rv.f_p4.count() >= 1, f"P4コンボが空: {rv.f_p4.count()}"
-        ok(f"P4コンボ件数: {rv.f_p4.count()}")
-    except Exception as e:
-        ng("P4コンボ", e)
-        return
-
-    try:
-        today = datetime.date.today().isoformat()
-        rv.f_from.set_date(today)
-        rv.f_to.set_date(today)
-        rv._on_generate()
-        text = rv.preview.toPlainText()
-        assert text.strip().startswith("#"), f"preview={text[:40]!r}"
-        ok("レポート生成 → プレビュー表示 OK")
-    except Exception as e:
-        ng("レポート生成", e)
-        return
-
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            win.state.config.report_output_dir = td
-            rv._on_save()
-            files = list(Path(td).glob("*.md"))
-            assert len(files) == 1, f"保存ファイル数={len(files)}"
-            content = files[0].read_text(encoding="utf-8")
-            assert content.strip().startswith("#"), "保存内容が空"
-            ok(f"output_dir への保存 OK: {files[0].name}")
-        win.state.config.report_output_dir = ""
-    except Exception as e:
-        win.state.config.report_output_dir = ""
-        ng("output_dir 保存", e)
-
-
-def test_progress_snapshots(state):
-    """進捗スナップショットの計算・保存（重複防止）・読込のテスト"""
-    print("\n[14] 進捗スナップショットテスト")
-    import logic as LG
-
-    try:
-        rows = LG.build_progress_snapshot_rows(state.df_nodes)
-        assert len(rows) >= 1, f"スナップショット行が空: {rows}"
-        ok(f"スナップショット行計算: {len(rows)} 件")
-    except Exception as e:
-        ng("build_progress_snapshot_rows", e)
-        return
-
-    try:
-        n1 = state.db.save_progress_snapshots(rows)
-        n2 = state.db.save_progress_snapshots(rows)  # 同日 2 回目はスキップされる
-        assert n1 == len(rows), f"初回保存 {n1} 件 (期待 {len(rows)})"
-        assert n2 == 0, f"同日再実行 {n2} 件 (期待 0)"
-        ok(f"保存 {n1} 件 / 同日再実行 {n2} 件（重複防止 OK）")
-    except Exception as e:
-        ng("save_progress_snapshots", e)
-        return
-
-    try:
-        df = state.db.read_progress_snapshots(rows[0]["node_idx"])
-        assert len(df) == 1, f"読込件数 {len(df)}"
-        assert int(df.iloc[0]["total_count"]) == rows[0]["total_count"]
-        ok("read_progress_snapshots: 件数・内容一致 OK")
-    except Exception as e:
-        ng("read_progress_snapshots", e)
-
-
-def test_progress_report(state, win):
-    """月次進捗レポート（進捗計算・チャート・md・ReportView）のテスト"""
-    print("\n[15] 月次進捗レポートテスト")
-    import logic as LG
-
-    df = state.df_nodes
-    try:
-        p4_rows = df[(df["node_type"] == "project4") & (df["title"] == "テストP4")]
-        assert len(p4_rows) == 1, "テストP4 が見つからない"
-        p4_idx = p4_rows.index[0]
-        ok("テストP4 を取得")
-    except Exception as e:
-        ng("テストP4 取得", e)
-        return
-
-    try:
-        prog = LG.calc_progress(df, p4_idx)
-        # テストP4 配下: 完了チケット(done) + 進行中チケット(todo) の 2 件
-        assert prog["total_count"] == 2, f"total={prog['total_count']}"
-        assert prog["done_count"] == 1, f"done={prog['done_count']}"
-        assert abs(prog["count_rate"] - 50.0) < 1e-9, f"rate={prog['count_rate']}"
-        ok(f"calc_progress: {prog['count_rate']}% ({prog['done_count']}/{prog['total_count']})")
-    except Exception as e:
-        ng("calc_progress", e)
-        return
-
-    try:
-        tasks = LG.calc_task_summary(df, p4_idx)
-        assert len(tasks) == 1, f"tasks={len(tasks)}"
-        assert tasks[0]["title"] == "P4配下Task"
-        assert tasks[0]["total_count"] == 2
-        ok(f"calc_task_summary: {tasks[0]['title']} "
-           f"({tasks[0]['done_count']}/{tasks[0]['total_count']}, {tasks[0]['state']})")
-    except Exception as e:
-        ng("calc_task_summary", e)
-        return
-
-    try:
-        df_snap = state.db.read_progress_snapshots(p4_idx)
-        data = LG.collect_progress_data(df, df_snap, p4_idx)
-        md = LG.build_progress_markdown(data, ["charts/a.png", "charts/b.png"])
-        assert "# 月次進捗" in md and "テストP4" in md, md[:80]
-        assert "charts/a.png" in md and "スケジュール状況" in md
-        ok("build_progress_markdown OK")
-    except Exception as e:
-        ng("build_progress_markdown", e)
-        return
-
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            paths = LG.save_progress_charts(df_snap, data["tasks"], "test_base", td)
-            assert len(paths) == 2, f"paths={paths}"
-            for rel in paths:
-                f = Path(td) / rel
-                assert f.exists() and f.stat().st_size > 0, f"PNG 未生成: {rel}"
-            ok(f"チャート PNG 出力 OK: {len(paths)} 枚")
-    except Exception as e:
-        ng("save_progress_charts", e)
-
-    # ReportView の月次進捗モード
-    rv = win.report_view
-    try:
-        rv.refresh()
-        pos = rv.f_mode.findData("progress")
-        assert pos >= 0, "月次進捗モードがコンボにない"
-        rv.f_mode.setCurrentIndex(pos)
-        rv._on_generate()
-        text = rv.preview.toPlainText()
-        assert "# 月次進捗" in text, f"preview={text[:40]}"
-        ok("ReportView 月次進捗生成 OK")
-    except Exception as e:
-        ng("ReportView 月次進捗生成", e)
-        return
-
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            win.state.config.report_output_dir = td
-            rv._on_save()
-            mds = list(Path(td).glob("progress_*.md"))
-            pngs = list((Path(td) / "charts").glob("*.png"))
-            assert len(mds) == 1, f"md 数={len(mds)}"
-            assert len(pngs) == 2, f"PNG 数={len(pngs)}"
-            content = mds[0].read_text(encoding="utf-8")
-            # md 内のチャート参照名と実ファイル名が一致しているか
-            for p in pngs:
-                assert f"charts/{p.name}" in content, f"md 内に参照なし: {p.name}"
-            ok(f"月次進捗保存 OK: {mds[0].name} + PNG {len(pngs)} 枚（参照一致）")
-        win.state.config.report_output_dir = ""
-        rv.f_mode.setCurrentIndex(0)
-    except Exception as e:
-        win.state.config.report_output_dir = ""
-        rv.f_mode.setCurrentIndex(0)
-        ng("月次進捗保存", e)
 
 
 def test_template_parse(state):
@@ -965,40 +827,9 @@ def test_daily_log_markdown(state):
         ng("記録なし日の生成", e)
 
 
-def test_llm_copy_and_daily_export(win):
-    """ReportView LLM コピーと MemoView デイリーログ出力のテスト"""
-    print("\n[18] LLM コピー・デイリーログ出力 UI テスト")
-    from PySide6.QtWidgets import QApplication
-
-    rv = win.report_view
-    try:
-        rv.refresh()
-        rv.f_mode.setCurrentIndex(0)
-        today = datetime.date.today().isoformat()
-        rv.f_from.set_date(today)
-        rv.f_to.set_date(today)
-        rv._on_generate()
-        rv._on_copy_llm()
-        clip = QApplication.clipboard().text()
-        assert "# 実績データ" in clip, "プロンプトヘッダーがない"
-        assert "# 週報" in clip, "実績データ本体がない"
-        ok("LLM 用コピー: プロンプト + 実績データ OK")
-    except Exception as e:
-        ng("LLM 用コピー", e)
-
-    try:
-        # テンプレート欠落時のフォールバック
-        orig = rv._LLM_TEMPLATE_PATH
-        rv._LLM_TEMPLATE_PATH = Path("/nonexistent/llm_report.md")
-        rv._on_copy_llm()
-        clip = QApplication.clipboard().text()
-        assert "# 実績データ" in clip
-        rv._LLM_TEMPLATE_PATH = orig
-        ok("テンプレート欠落時のフォールバック OK")
-    except Exception as e:
-        rv._LLM_TEMPLATE_PATH = orig
-        ng("LLM フォールバック", e)
-
+def test_daily_export(win):
+    """MemoView デイリーログ出力のテスト"""
+    print("\n[18] デイリーログ出力 UI テスト")
     try:
         mv = win.memo_view
         with tempfile.TemporaryDirectory() as td:
@@ -1192,9 +1023,8 @@ def test_personal_review(state, win):
 
 
 def test_slot_context_menu(win):
-    """スロット右クリック割り当てメニュー（最近使った + 階層カスケード）"""
+    """スロット右クリック割り当てメニュー（最近使った + 2階層グループ）"""
     print("\n[22] スロット右クリックメニューテスト")
-    from PySide6.QtWidgets import QMenu
     from db import create_initial_node, DAILY_TIME_COLS, daily_sch_idx
     panel = win.schedule_panel
     state = win.state
@@ -1225,46 +1055,32 @@ def test_slot_context_menu(win):
     df = state.df_nodes
     ticket_a = df[df["title"] == "チケットA"].index[0]
 
-    # ── 階層メニューの葉ロジック: 自分の todo/regularly のみ・Edit と同じ並び ──
-    # （QMenu ラッパ走査は PySide のオブジェクト寿命でフレーキーなため、
-    #   フィルタ・並び順は純ロジック _assignable_leaves_in_order で検証する）
+    # ── 2階層グループ: プロジェクトパス group_label / Task・Ticket リーフ ──
     assignable_idx = df[
         (df["node_type"] == "ticket")
         & (df["assigned_to"] == user)
         & (df["status"].isin(["todo", "regularly"]))
     ].index
-    visible_ids = panel._assignable_subtree_ids(df, assignable_idx)
     try:
-        leaves = panel._assignable_leaves_in_order(df, visible_ids)
-        leaf_titles = [str(df.loc[i, "title"]) for i in leaves]
-        assert "チケットA" in leaf_titles, leaf_titles
-        assert "定常チケットR" in leaf_titles, leaf_titles
-        assert "チケットB" not in leaf_titles, leaf_titles    # 他人担当は除外
-        assert "完了チケット" not in leaf_titles, leaf_titles  # done は除外
-        # 並びは Edit と同じ priority 昇順（同一親 テストTask 内: A=2 < R=9）
-        same_parent = [t for t in leaf_titles if t in ("チケットA", "定常チケットR")]
-        assert same_parent == ["チケットA", "定常チケットR"], same_parent
-        ok(f"葉フィルタ・並び順（priority昇順）OK（{len(leaves)}件）")
+        groups = panel._assignable_groups(df, assignable_idx)
+        # group_label はプロジェクトパス（テストPJ 配下なので "テストPJ"）
+        labels = [gl for gl, _ in groups]
+        assert "テストPJ" in labels, labels
+        # 全リーフラベルを集約
+        all_leaves = [(lbl) for _, leaves in groups for (_, lbl) in leaves]
+        # リーフは「Task名 / Ticket名」、regularly は ↻ 付き
+        assert "テストTask / チケットA" in all_leaves, all_leaves
+        assert "↻ テストTask / 定常チケットR" in all_leaves, all_leaves
+        # 他人担当(チケットB)・done(完了チケット) は出ない
+        assert all("チケットB" not in l for l in all_leaves), all_leaves
+        assert all("完了チケット" not in l for l in all_leaves), all_leaves
+        # テストPJ グループ内 テストTask の並びは priority 昇順（A=2 < R=9）
+        pj_leaves = [lbl for gl, leaves in groups if gl == "テストPJ" for (_, lbl) in leaves]
+        order = [l for l in pj_leaves if "チケットA" in l or "定常チケットR" in l]
+        assert order == ["テストTask / チケットA", "↻ テストTask / 定常チケットR"], order
+        ok(f"2階層グループ（パス/Task・Ticket・priority昇順）OK（{len(groups)}グループ）")
     except Exception as e:
-        ng("葉フィルタ・並び順", e)
-
-    # ── 祖先が visible_ids に含まれる（枝刈り用）──
-    try:
-        assert task_idx in visible_ids
-        pj_idx = df.loc[task_idx, "parent_id"]
-        assert pj_idx in visible_ids
-        ok("_assignable_subtree_ids が祖先(Task/PJ)を含む OK")
-    except Exception as e:
-        ng("_assignable_subtree_ids 祖先", e)
-
-    # ── Qt メニュー構築が例外なく動く（スモーク）──
-    try:
-        menu = QMenu(panel)
-        panel._build_assign_menu(menu, df, "0", visible_ids, [40])
-        assert len(menu.actions()) > 0
-        ok("_build_assign_menu 構築 OK（例外なし）")
-    except Exception as e:
-        ng("_build_assign_menu 構築", e)
+        ng("2階層グループ", e)
 
     # ── 割り当て(_assign_to_rows) → スロット + 工数加算 + MRU更新 ──
     try:
@@ -1301,6 +1117,358 @@ def test_slot_context_menu(win):
         ok("assign_ticket（ガント行クリック）リグレッションなし OK")
     except Exception as e:
         ng("assign_ticket リグレッション", e)
+
+
+def test_detail_pane_link(win):
+    """共通 DetailPane（右端・main/plan/edit 共有）配置・配線・トグル・md リンク表示"""
+    print("\n[23] DetailPane（共有・md リンク表示）テスト")
+    from PySide6.QtWidgets import QPushButton
+    from ui_main import (DetailPane, IDX_MAIN, IDX_GANTT, IDX_ROADMAP,
+                         IDX_TEAM)
+    state = win.state
+    df = state.df_nodes
+
+    # 共通 DetailPane が MainWindow に存在すること
+    try:
+        dp = win.detail_pane
+        assert isinstance(dp, DetailPane)
+        ok("共通 DetailPane が MainWindow に配置されている")
+    except Exception as e:
+        ng("DetailPane 配置", e)
+        return
+
+    # report_edit に md リンクを書くと links_layout にボタンが生成される
+    try:
+        ticket_a = df[df["title"] == "チケットA"].index[0]
+        dp.update_for_node(ticket_a)
+        dp.report_edit.blockSignals(True)
+        dp.report_edit.setPlainText(
+            "[仕様書](https://example.com/spec.pdf) と [議事録](C:/tmp/memo.md)")
+        dp.report_edit.blockSignals(False)
+        dp._update_links()
+        btns = [b for b in dp.links_area.findChildren(QPushButton)
+                if b.text().startswith("[")]
+        assert len(btns) == 2, f"リンクボタン数={len(btns)}"
+        assert btns[0].text() == "[仕様書]"
+        assert btns[1].text() == "[議事録]"
+        ok("md リンク2件 → links_layout ボタン生成 OK")
+    except Exception as e:
+        ng("md リンク表示", e)
+
+    # リンクなし本文 → links_layout が空
+    try:
+        dp.report_edit.blockSignals(True)
+        dp.report_edit.clear()
+        dp.report_edit.blockSignals(False)
+        dp._update_links()
+        btns = [b for b in dp.links_area.findChildren(QPushButton)
+                if b.text().startswith("[")]
+        assert len(btns) == 0, f"ボタン数={len(btns)}"
+        ok("本文なし → links_layout 空 OK")
+    except Exception as e:
+        ng("リンクなし表示", e)
+
+    # main(gantt)・plan(roadmap)・edit の各選択シグナルで DetailPane が更新される
+    try:
+        ticket_a = df[df["title"] == "チケットA"].index[0]
+        win.main_pane.table_pane.node_selected.emit(ticket_a)
+        assert win.detail_pane._node_idx == ticket_a, "table 配線"
+        win.gantt_view.ticket_clicked.emit(ticket_a)
+        assert win.detail_pane._node_idx == ticket_a, "gantt 配線"
+        win.road_view.node_selected.emit(ticket_a)
+        assert win.detail_pane._node_idx == ticket_a, "roadmap 配線"
+        ok("main/plan/edit のノード選択 → DetailPane 更新 OK")
+    except Exception as e:
+        ng("3画面の選択配線", e)
+
+    # トグルと、タブによる表示制御
+    try:
+        win._switch_view(IDX_GANTT)
+        assert win.detail_pane.isVisible(), "main で表示されるべき"
+        win._switch_view(IDX_ROADMAP)
+        assert win.detail_pane.isVisible(), "plan で表示されるべき"
+        win._switch_view(IDX_TEAM)
+        assert not win.detail_pane.isVisible(), "team では非表示であるべき"
+        # トグル OFF → main でも非表示
+        win._switch_view(IDX_MAIN)
+        assert win.detail_pane.isVisible()
+        win._on_toggle_detail(False)
+        assert not win.detail_pane.isVisible(), "トグルOFFで非表示"
+        win._on_toggle_detail(True)
+        assert win.detail_pane.isVisible(), "トグルONで再表示"
+        ok("トグル・タブ別表示制御 OK")
+    except Exception as e:
+        ng("トグル・表示制御", e)
+
+
+def test_detail_pane_report(win):
+    """DetailPane の月次 P2 レポート（セクション保存・月ナビ・md リンク・P1 無効化）"""
+    print("\n[28] DetailPane 月次 P2 レポートテスト")
+    import tempfile
+    import logic as LG
+    from db import create_initial_node
+    state = win.state
+    df = state.df_nodes
+    dp = win.detail_pane
+    user = state.user
+
+    # P1 > P2 > Ticket の階層を作成
+    p1 = create_initial_node(user, "project1", "レポートP1", "0", 99)
+    state.db.upsert_node(p1)
+    p2 = create_initial_node(user, "project2", "レポートP2", p1.name, 99)
+    state.db.upsert_node(p2)
+    ticket_r = create_initial_node(user, "ticket", "レポートチケット", p2.name, 1)
+    state.db.upsert_node(ticket_r)
+    state.reload_nodes()
+    df = state.df_nodes
+    p1_idx = df[df["title"] == "レポートP1"].index[0]
+    p2_idx = df[df["title"] == "レポートP2"].index[0]
+    tr_idx = df[df["title"] == "レポートチケット"].index[0]
+
+    d = tempfile.mkdtemp()
+    orig_dir = state.config.report_output_dir
+    state.config.report_output_dir = d
+    try:
+        # P1 選択 → レポート欄が無効化される
+        dp.update_for_node(p1_idx)
+        assert dp._node_idx == p1_idx
+        assert not dp.report_edit.isEnabled(), "P1 選択でレポート欄が無効でない"
+        ok("P1 選択でレポート欄無効化 OK")
+    except Exception as e:
+        ng("P1 選択レポート無効化", e)
+
+    try:
+        # P2 選択 → レポート欄が有効化・空本文
+        dp.update_for_node(p2_idx)
+        assert dp.report_edit.isEnabled(), "P2 選択でレポート欄が有効でない"
+        assert dp.report_edit.toPlainText() == ""
+        ok("P2 選択でレポート欄有効化・空本文 OK")
+    except Exception as e:
+        ng("P2 選択レポート有効化", e)
+
+    try:
+        # Ticket 選択 → レポート欄有効化
+        dp.update_for_node(tr_idx)
+        assert dp.report_edit.isEnabled(), "Ticket 選択でレポート欄が有効でない"
+        ok("Ticket 選択でレポート欄有効化 OK")
+    except Exception as e:
+        ng("Ticket 選択レポート有効化", e)
+
+    try:
+        # 実績挿入 → report_edit に週報 md が入る
+        dp.rep_mode.setCurrentIndex(0)  # 週報
+        dp._on_insert_actuals()
+        assert "# 週報" in dp.report_edit.toPlainText(), dp.report_edit.toPlainText()[:40]
+        ok("実績挿入 OK（collect_report_data 経路）")
+    except Exception as e:
+        ng("実績挿入", e)
+
+    try:
+        # 保存 → P2 単位の月次ファイルに IDX セクションが書き込まれる
+        # ※ H1〜H3 見出しはセクション区切りになるので #### 以下か地の文を使う
+        body = "テスト所感: 月次レポートの検証本文です。"
+        dp.report_edit.setPlainText(body)
+        dp._on_save_report()
+        yyyymm = dp._rep_month.strftime("%Y%m")
+        p2_path = LG.report_p2_path(d, state.df_nodes, tr_idx, yyyymm)
+        assert p2_path and p2_path.exists(), f"P2 ファイルが存在しない: {p2_path}"
+        md_text = p2_path.read_text(encoding="utf-8")
+        loaded = LG.read_section(md_text, tr_idx)
+        assert loaded is not None and "テスト所感" in loaded, \
+            f"セクションが見つからない: {md_text[:120]}"
+        ok(f"月次 P2 保存・セクション読込 OK: {p2_path.name}")
+    except Exception as e:
+        ng("月次 P2 保存・セクション読込", e)
+
+    try:
+        # 別セクション（P2 自身）も同じファイルに共存できる
+        dp.update_for_node(p2_idx)
+        dp.report_edit.setPlainText("P2 自身の本文")
+        dp._on_save_report()
+        yyyymm = dp._rep_month.strftime("%Y%m")
+        p2_path = LG.report_p2_path(d, state.df_nodes, p2_idx, yyyymm)
+        md_text = p2_path.read_text(encoding="utf-8")
+        loaded_p2 = LG.read_section(md_text, p2_idx)
+        loaded_tr = LG.read_section(md_text, tr_idx)
+        assert loaded_p2 is not None and "P2 自身" in loaded_p2, \
+            f"P2 セクション: {loaded_p2!r}"
+        assert loaded_tr is not None and "テスト所感" in loaded_tr, \
+            f"Ticket セクション: {loaded_tr!r}"
+        ok("P2・Ticket セクションが同一ファイルに共存 OK")
+    except Exception as e:
+        ng("マルチセクション共存", e)
+
+    try:
+        # 月ナビ ◀ で前月へ移動 → 前月データなしで空本文
+        dp.update_for_node(tr_idx)
+        dp.report_edit.setPlainText("今月の確認本文")
+        # setPlainText が textChanged を発火するので dirty が立つ
+        dp._rep_shift_month(-1)  # 前月へ（dirty なら自動保存後に移動）
+        assert dp.report_edit.toPlainText() == "", \
+            f"前月データは空のはず: {dp.report_edit.toPlainText()[:40]}"
+        ok("月ナビ前月移動 → 空本文 OK")
+    except Exception as e:
+        ng("月ナビ前月移動", e)
+
+    try:
+        # Plan(road_view)選択で対象ノードが切り替わる
+        dp.update_for_node(tr_idx)
+        task = df[df["title"] == "テストTask"].index[0]
+        win.road_view.node_selected.emit(task)
+        assert dp._node_idx == task
+        ok("Plan 選択でレポート対象切替 OK")
+    except Exception as e:
+        ng("Plan 選択切替", e)
+    finally:
+        state.config.report_output_dir = orig_dir
+
+
+def test_edit_open_no_dirty(win):
+    """Edit を開く/選択しただけでは未保存(dirty)にならない"""
+    print("\n[24] Edit 表示時の未保存誤検知テスト")
+    state = win.state
+    df = state.df_nodes
+    tp = win.main_pane.table_pane
+    task_idx = df[df["title"] == "テストTask"].index[0]
+
+    # 子の priority を非連番にする（以前はこれで update_for_parent が dirty にしていた）
+    try:
+        children = df[(df["parent_id"] == task_idx) & (df["status"] != "deleted")]
+        first_child = children.sort_values("priority").index[0]
+        state.df_nodes.loc[first_child, "priority"] = 99  # 連番を崩す
+        state.nodes_modified = False
+        tp.update_for_parent(task_idx)
+        assert state.nodes_modified is False, "表示・選択で dirty になってはいけない"
+        ok("update_for_parent では dirty にならない OK")
+    except Exception as e:
+        ng("update_for_parent 非dirty", e)
+
+    # dirty 機構そのものは生きている（実編集ならフラグが立つ）
+    try:
+        state.nodes_modified = False
+        tp._mark_dirty()
+        assert state.nodes_modified is True
+        state.nodes_modified = False
+        ok("_mark_dirty で dirty になる（機構は健在）OK")
+    except Exception as e:
+        ng("_mark_dirty 機構", e)
+
+
+def test_pomodoro_overwrite(win):
+    """ポモドーロのスロット上書き（旧チケットの実績減算・新チケット加算）"""
+    print("\n[25] ポモドーロ上書きテスト")
+    from db import DAILY_TIME_COLS, daily_sch_idx
+    state = win.state
+    df = state.df_nodes
+    user = state.login_user
+    sch_idx = daily_sch_idx(datetime.date.today().isoformat(), user)
+    # yamada 担当の 2 チケット
+    old_t = df[df["title"] == "チケットA"].index[0]
+    new_t = df[df["title"] == "進行中チケット"].index[0]
+    slot = 70  # 17:30 付近の空きスロット
+
+    try:
+        # まず old_t を書く
+        win._write_pomodoro_slots(sch_idx, [slot], old_t)
+        assert state.df_daily.loc[sch_idx, DAILY_TIME_COLS[slot]] == old_t
+        old_h_after_write = float(state.df_nodes.loc[old_t, "actual_hours"] or 0)
+        new_h_before = float(state.df_nodes.loc[new_t, "actual_hours"] or 0)
+        # new_t で上書き
+        win._write_pomodoro_slots(sch_idx, [slot], new_t)
+        assert state.df_daily.loc[sch_idx, DAILY_TIME_COLS[slot]] == new_t, "上書きされる"
+        # old_t は -0.25、new_t は +0.25
+        assert abs(float(state.df_nodes.loc[old_t, "actual_hours"] or 0)
+                   - (old_h_after_write - 0.25)) < 1e-9, "旧チケット実績が減算される"
+        assert abs(float(state.df_nodes.loc[new_t, "actual_hours"] or 0)
+                   - (new_h_before + 0.25)) < 1e-9, "新チケット実績が加算される"
+        ok("上書き: 旧-0.25 / 新+0.25 / スロット置換 OK")
+    except Exception as e:
+        ng("ポモドーロ上書き", e)
+
+    # 後始末: スロットを解放
+    try:
+        win._write_pomodoro_slots(sch_idx, [slot], new_t)  # 冪等確認（同一なら変化なし）
+        state.df_daily.loc[sch_idx, DAILY_TIME_COLS[slot]] = ""
+        ok("後始末 OK")
+    except Exception as e:
+        ng("後始末", e)
+
+
+def test_personal_review_member(win):
+    """個人振り返りが選択中メンバーで集計される"""
+    print("\n[26] 個人振り返り メンバー指定テスト")
+    state = win.state
+    anal = win.anal_view
+    orig = state.current_member
+    try:
+        state.current_member = "tanaka@email.com"
+        anal._calc_personal()
+        title = anal._fig.axes[0].get_title()
+        assert state.display_name("tanaka@email.com") in title, title
+        ok(f"選択メンバーで集計 OK（{title}）")
+    except Exception as e:
+        ng("個人振り返り メンバー指定", e)
+    finally:
+        state.current_member = orig
+
+
+def test_team_log_export(win):
+    """チームログの期間Markdown出力（純ロジック + UI保存）"""
+    print("\n[27] チームログ出力テスト")
+    import tempfile
+    import logic as LG
+    from db import daily_sch_idx
+    import pandas as pd
+    state = win.state
+
+    today = datetime.date.today().isoformat()
+    members = ["yamada@email.com", "tanaka@email.com"]
+    name_map = {m: state.display_name(m) for m in members}
+
+    # 純ロジック: build_team_log_markdown
+    try:
+        log_idx = daily_sch_idx(today, "yamada@email.com")
+        df_log = pd.DataFrame(
+            [{"Owner": "yamada@email.com", "health_status": "良好",
+              "work_place": "在宅", "safety": "宣言", "overwork": "なし",
+              "notes": "作業中", "Last_Update": today}],
+            index=[log_idx])
+        all_perm = {"yamada@email.com": "常時メモX"}
+        md = LG.build_team_log_markdown(
+            state.df_daily, df_log, all_perm, members, name_map, today, today)
+        assert "| 日付 | メンバー |" in md, md[:200]
+        assert "良好" in md and "在宅" in md and "作業中" in md
+        assert "## 常時メモ" in md and "常時メモX" in md
+        ok("build_team_log_markdown 表組み OK")
+    except Exception as e:
+        ng("build_team_log_markdown", e)
+
+    # 期間外は除外される
+    try:
+        past = (datetime.date.today() - datetime.timedelta(days=400)).isoformat()
+        md2 = LG.build_team_log_markdown(
+            state.df_daily, df_log, {}, members, name_map, past, past)
+        assert "良好" not in md2, "期間外データが含まれてはいけない"
+        ok("期間外除外 OK")
+    except Exception as e:
+        ng("期間外除外", e)
+
+    # UI 保存: output_dir に team_*.md が出力される
+    try:
+        d = tempfile.mkdtemp()
+        orig_dir = state.config.report_output_dir
+        state.config.report_output_dir = d
+        win.team_view.f_from.set_date(today)
+        win.team_view.f_to.set_date(today)
+        win.team_view._on_export_team()
+        team_dir = Path(d) / "team"
+        files = list(team_dir.glob("team_*.md")) if team_dir.exists() else []
+        assert len(files) == 1, f"files={files}"
+        ok(f"output_dir へ出力 OK（{files[0].name}）")
+    except Exception as e:
+        ng("チームログ UI 出力", e)
+    finally:
+        state.config.report_output_dir = orig_dir
 
 
 def test_save_load(state):
@@ -1348,16 +1516,19 @@ def main():
             test_search_view(win, task_idx, ticket_idx)
             test_link_field(state, ticket_idx)
             test_report_logic(state)
-            test_report_view(win)
-            test_progress_snapshots(state)
-            test_progress_report(state, win)
             test_template_parse(state)
             test_daily_log_markdown(state)
-            test_llm_copy_and_daily_export(win)
+            test_daily_export(win)
             test_dashboard(win, ticket_idx)
             test_pomodoro(win, ticket_idx)
             test_personal_review(state, win)
             test_slot_context_menu(win)
+            test_detail_pane_link(win)
+            test_detail_pane_report(win)
+            test_edit_open_no_dirty(win)
+            test_pomodoro_overwrite(win)
+            test_personal_review_member(win)
+            test_team_log_export(win)
             test_save_load(state)
 
     print("\n" + "=" * 55)

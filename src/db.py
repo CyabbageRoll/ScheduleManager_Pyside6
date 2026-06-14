@@ -193,19 +193,6 @@ CREATE TABLE IF NOT EXISTS permanent_notices (
 );
 """
 
-# 進捗スナップショット（月次進捗レポートの推移グラフ用に日次で記録）
-_SCHEMA_PROGRESS_SNAPSHOTS = """
-CREATE TABLE IF NOT EXISTS progress_snapshots (
-    snap_date       TEXT NOT NULL,
-    node_idx        TEXT NOT NULL,
-    done_count      INTEGER DEFAULT 0,
-    total_count     INTEGER DEFAULT 0,
-    actual_hours    REAL DEFAULT 0.0,
-    estimated_hours REAL DEFAULT 0.0,
-    PRIMARY KEY (snap_date, node_idx)
-);
-"""
-
 
 def _daily_schedule_create_sql() -> str:
     """15分スロット96列 + 集計列を持つ daily_schedule テーブルの CREATE 文を返す"""
@@ -329,7 +316,6 @@ class Database:
             conn.execute(_SCHEMA_ASSIGNMENTS)
             conn.execute(_SCHEMA_MEMO)
             conn.execute(_SCHEMA_PERMANENT_NOTICES)
-            conn.execute(_SCHEMA_PROGRESS_SNAPSHOTS)
             conn.commit()
             # 既存 DB へのマイグレーション: link 列が無ければ追加
             cols = {r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
@@ -666,54 +652,6 @@ class Database:
             conn.commit()
         finally:
             conn.close()
-
-    # ---------- progress_snapshots ----------
-
-    def save_progress_snapshots(self, rows: list, snap_date: str = None) -> int:
-        """
-        進捗スナップショットを記録する（1日1回想定）。
-        同一 (snap_date, node_idx) は INSERT OR IGNORE でスキップし、新規記録件数を返す。
-        rows: {"node_idx", "done_count", "total_count", "actual_hours",
-               "estimated_hours"} の辞書リスト（logic.build_progress_snapshot_rows で生成）
-        """
-        if not rows:
-            return 0
-        snap_date = snap_date or datetime.date.today().isoformat()
-        conn = self._connect()
-        saved = 0
-        try:
-            for r in rows:
-                cur = conn.execute(
-                    "INSERT OR IGNORE INTO progress_snapshots"
-                    " (snap_date, node_idx, done_count, total_count,"
-                    "  actual_hours, estimated_hours) VALUES (?,?,?,?,?,?)",
-                    [snap_date, r["node_idx"], int(r["done_count"]),
-                     int(r["total_count"]), float(r["actual_hours"]),
-                     float(r["estimated_hours"])],
-                )
-                saved += cur.rowcount
-            conn.commit()
-            if saved:
-                self._log(f"save_progress_snapshots: {saved} 件 ({snap_date})")
-        except Exception as e:
-            self._log(f"save_progress_snapshots エラー: {e}")
-        finally:
-            conn.close()
-        return saved
-
-    def read_progress_snapshots(self, node_idx: str, date_from: str = "",
-                                date_to: str = "") -> pd.DataFrame:
-        """指定ノードのスナップショットを日付昇順の DataFrame で返す"""
-        sql = "SELECT * FROM progress_snapshots WHERE node_idx=?"
-        params = [node_idx]
-        if date_from:
-            sql += " AND snap_date>=?"
-            params.append(date_from)
-        if date_to:
-            sql += " AND snap_date<=?"
-            params.append(date_to)
-        sql += " ORDER BY snap_date"
-        return self._read_df(sql, params=params)
 
     # ---------- actual_hours 再集計 ----------
 
