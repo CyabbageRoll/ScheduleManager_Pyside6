@@ -782,6 +782,7 @@ class RoadmapView(QWidget):
     edit_requested       = Signal(str)  # Edit タブにジャンプしてノードを表示
     edit_popup_requested = Signal(str)  # ポップアップダイアログで編集
     request_requested    = Signal(str)  # 項目3: Request メニュー選択時に IDX を送出
+    node_selected        = Signal(str)  # 行クリック時に IDX を送出（共通詳細ペイン用）
 
     _LEVEL_TYPES = [
         ("Project2", "project2"),
@@ -984,6 +985,7 @@ class RoadmapView(QWidget):
         )
         # ダブルクリック・右クリックメニューの設定
         self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.table.cellClicked.connect(self._on_cell_clicked)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
 
@@ -1207,6 +1209,12 @@ class RoadmapView(QWidget):
         idx = self._get_idx_at(item.row())
         if idx:
             self.edit_popup_requested.emit(idx)
+
+    def _on_cell_clicked(self, row: int, col: int) -> None:
+        """行クリックで共通詳細ペインへノード IDX を通知する"""
+        idx = self._get_idx_at(row)
+        if idx:
+            self.node_selected.emit(idx)
 
     def _on_context_menu(self, pos) -> None:
         """右クリックコンテキストメニューを表示。
@@ -2015,8 +2023,8 @@ class AnalysisView(QWidget):
         )
 
     def _calc_personal(self) -> None:
-        """個人振り返り: 自分の週別投入工数（P1別）と見積精度を描画する"""
-        user = self.state.user
+        """個人振り返り: 選択中メンバーの週別投入工数（P1別）と見積精度を描画する"""
+        user = self.state.current_member
         weekly = LG.calc_weekly_user_hours_by_p1(
             self.state.df_nodes, self.state.df_daily, user, weeks=4)
         acc = LG.calc_estimate_accuracy(self.state.df_nodes, user)
@@ -2324,6 +2332,30 @@ class TeamLogView(QWidget):
         self.info_table = ScrollableTable(INFO_COLS, [120, 90, 250, 300], reset_sort_on_update=True)
         layout.addWidget(self.info_table, stretch=1)
 
+        # ── 期間指定でチーム情報を Markdown 出力（画面最下部）──
+        layout.addWidget(Separator())
+        export_row = QHBoxLayout()
+        export_row.addWidget(QLabel("期間ログ出力:"))
+        self.f_from = DateButton(allow_empty=True)
+        self.f_to = DateButton(allow_empty=True)
+        export_row.addWidget(self.f_from)
+        export_row.addWidget(QLabel("〜"))
+        export_row.addWidget(self.f_to)
+        for label in ("今週", "今月", "先月", "過去1ヶ月"):
+            btn = QPushButton(label)
+            btn.setStyleSheet(STYLE_BUTTON)
+            btn.clicked.connect(lambda _=False, l=label: self._team_preset(l))
+            export_row.addWidget(btn)
+        self.export_btn = QPushButton("📤 期間ログを出力")
+        self.export_btn.setStyleSheet(STYLE_BUTTON)
+        self.export_btn.setToolTip("指定期間のチーム情報を Markdown 表で output_dir に保存")
+        self.export_btn.clicked.connect(self._on_export_team)
+        export_row.addWidget(self.export_btn)
+        export_row.addStretch()
+        layout.addLayout(export_row)
+        # 既定期間: 今月
+        self._team_preset("今月", export=False)
+
         self.info_lbl = InfoLabel()
         layout.addWidget(self.info_lbl)
 
@@ -2361,6 +2393,73 @@ class TeamLogView(QWidget):
 
         self.work_table.set_rows(work_rows)
         self.info_table.set_rows(info_rows)
+
+    # ── 期間ログ出力 ──
+
+    def _team_preset(self, name: str, export: bool = False) -> None:
+        """期間プリセットボタン: from/to を設定する（export=True なら続けて出力）"""
+        today = datetime.date.today()
+        if name == "今週":
+            monday = today - datetime.timedelta(days=today.weekday())
+            d_from, d_to = monday, monday + datetime.timedelta(days=6)
+        elif name == "今月":
+            first = today.replace(day=1)
+            last = calendar.monthrange(first.year, first.month)[1]
+            d_from, d_to = first, first.replace(day=last)
+        elif name == "先月":
+            first = (today.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)
+            last = calendar.monthrange(first.year, first.month)[1]
+            d_from, d_to = first, first.replace(day=last)
+        elif name == "過去1ヶ月":
+            d_from, d_to = today - datetime.timedelta(days=30), today
+        else:
+            return
+        self.f_from.set_date(d_from.isoformat())
+        self.f_to.set_date(d_to.isoformat())
+
+    def _on_export_team(self) -> None:
+        """指定期間のチーム情報を Markdown 表で output_dir に保存する"""
+        d_from = self.f_from.get_date()
+        d_to = self.f_to.get_date()
+        if not d_from or not d_to:
+            QMessageBox.warning(self, "期間未指定", "開始日と終了日を指定してください")
+            return
+        name_map = {m: self.state.display_name(m) for m in self.state.members}
+        all_permanent = getattr(self.state, "all_permanent_notices", {})
+        md = LG.build_team_log_markdown(
+            self.state.df_daily, self.state.df_daily_log, all_permanent,
+            list(self.state.members), name_map, d_from, d_to)
+        fname = f"team_{d_from}_{d_to}.md"
+
+        out_dir = (self.state.config.report_output_dir or "").strip()
+        if out_dir:
+            try:
+                team_dir = Path(out_dir) / "team"
+                team_dir.mkdir(parents=True, exist_ok=True)
+                path = team_dir / fname
+                if path.exists():
+                    ans = QMessageBox.question(
+                        self, "上書き確認",
+                        f"{path.name} は既に存在します。上書きしますか？")
+                    if ans != QMessageBox.StandardButton.Yes:
+                        return
+                path.write_text(md, encoding="utf-8")
+                self.info_lbl.set_info(f"チームログを出力しました: {path}")
+                return
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "保存エラー",
+                    f"output_dir への保存に失敗しました:\n{e}\n保存先を選択してください")
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "チームログ保存", str(Path.home() / fname), "Markdown (*.md)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(md, encoding="utf-8")
+            self.info_lbl.set_info(f"チームログを出力しました: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", str(e))
 
 
 # ---------- タスク依頼 ----------
@@ -3526,286 +3625,6 @@ class DashboardView(QWidget):
                 lst.addItem(item)
         self._set_badge("team", 0,
                         zero_text=f"{reported}/{len(self.state.members)} 人入力済")
-
-
-# ---------- レポート生成ビュー ----------
-
-class ReportView(QWidget):
-    """週報・月報の Markdown を生成・保存するビュー"""
-
-    # LLM 文章化プロンプトのテンプレート（ユーザーがカスタマイズ可能）
-    _LLM_TEMPLATE_PATH = Path(__file__).parent / "documents" / "llm_report.md"
-    _LLM_FALLBACK = (
-        "以下の実績データから、上司向けの業務報告を簡潔な敬体で作成してください。\n"
-        "構成: 1) 成果サマリー 2) 進行中と見通し 3) 課題・リスク 4) 所感（叩き台）\n"
-        "数値はデータのまま正確に使い、データにない事実は創作しないでください。")
-
-    def __init__(self, state):
-        super().__init__()
-        self.state = state
-        # 月次進捗の生成コンテキスト（保存時のチャート出力に使用）
-        self._progress_ctx = None
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
-
-        layout.addWidget(QLabel("📋 Report 週報・月報生成"))
-        layout.addWidget(Separator())
-
-        # 1行目: 種別・Project4 選択
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("種別:"))
-        self.f_mode = QComboBox()
-        self.f_mode.addItem("週報", "weekly")
-        self.f_mode.addItem("月報", "monthly")
-        self.f_mode.addItem("月次進捗", "progress")
-        row1.addWidget(self.f_mode)
-        row1.addSpacing(12)
-        row1.addWidget(QLabel("Project4:"))
-        self.f_p4 = QComboBox()
-        self.f_p4.setMinimumWidth(320)
-        row1.addWidget(self.f_p4, stretch=1)
-        self.f_own_only = QCheckBox("自分の担当のみ")
-        self.f_own_only.setChecked(True)
-        self.f_own_only.stateChanged.connect(lambda _=0: self._rebuild_p4_combo())
-        row1.addWidget(self.f_own_only)
-        layout.addLayout(row1)
-
-        # 2行目: 期間（プリセット + 開始/終了日）
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("期間:"))
-        self.f_from = DateButton(allow_empty=True)
-        row2.addWidget(self.f_from)
-        row2.addWidget(QLabel("〜"))
-        self.f_to = DateButton(allow_empty=True)
-        row2.addWidget(self.f_to)
-        row2.addSpacing(12)
-        for label in ("今週", "先週", "今月", "先月"):
-            btn = QPushButton(label)
-            btn.setStyleSheet(STYLE_BUTTON)
-            btn.clicked.connect(lambda _=False, l=label: self._on_preset(l))
-            row2.addWidget(btn)
-        row2.addStretch()
-        layout.addLayout(row2)
-
-        # 3行目: 操作ボタン
-        row3 = QHBoxLayout()
-        gen_btn = QPushButton("📝 生成")
-        gen_btn.setStyleSheet(STYLE_BUTTON)
-        gen_btn.clicked.connect(self._on_generate)
-        copy_btn = QPushButton("📋 クリップボードへコピー")
-        copy_btn.setStyleSheet(STYLE_BUTTON)
-        copy_btn.clicked.connect(self._on_copy)
-        save_btn = QPushButton("💾 ファイル保存")
-        save_btn.setStyleSheet(STYLE_BUTTON)
-        save_btn.clicked.connect(self._on_save)
-        llm_btn = QPushButton("🤖 LLM用にコピー")
-        llm_btn.setStyleSheet(STYLE_BUTTON)
-        llm_btn.setToolTip("文章化指示プロンプト付きでクリップボードへコピー\n"
-                           "（社内 LLM 等に貼ると報告文章のドラフトを作成できます）")
-        llm_btn.clicked.connect(self._on_copy_llm)
-        row3.addWidget(gen_btn)
-        row3.addWidget(copy_btn)
-        row3.addWidget(save_btn)
-        row3.addWidget(llm_btn)
-        row3.addStretch()
-        layout.addLayout(row3)
-
-        # プレビュー（手直し可能）
-        self.preview = QTextEdit()
-        self.preview.setAcceptRichText(False)
-        self.preview.setPlaceholderText(
-            "Project4 と期間を選んで「生成」を押すと、ここに Markdown が表示されます。\n"
-            "内容は手直ししてからコピー・保存できます。")
-        layout.addWidget(self.preview, stretch=1)
-
-        self.info = InfoLabel()
-        layout.addWidget(self.info)
-
-        # 初期期間は今週（月曜〜日曜）
-        today = datetime.date.today()
-        monday = today - datetime.timedelta(days=today.weekday())
-        self.f_from.set_date(monday.isoformat())
-        self.f_to.set_date((monday + datetime.timedelta(days=6)).isoformat())
-
-        self._rebuild_p4_combo()
-
-    # ── Project4 コンボ ──
-
-    def _involves_user(self, df, p4_idx: str, user: str) -> bool:
-        """P4 自身または配下チケットに user の担当が含まれるか"""
-        if str(df.loc[p4_idx].get("assigned_to", "")) == user:
-            return True
-        for t_idx in LG.collect_descendant_tickets(df, p4_idx):
-            if str(df.loc[t_idx].get("assigned_to", "")) == user:
-                return True
-        return False
-
-    def _p4_label(self, df, idx: str) -> str:
-        """コンボ表示用に「親(P3) / P4」形式のラベルを返す"""
-        title = str(df.loc[idx, "title"])
-        pid = str(df.loc[idx, "parent_id"])
-        if pid in df.index:
-            return f"{df.loc[pid, 'title']} / {title}"
-        return title
-
-    def _rebuild_p4_combo(self) -> None:
-        prev = self.f_p4.currentData()
-        self.f_p4.blockSignals(True)
-        self.f_p4.clear()
-        df = self.state.df_nodes
-        if not df.empty:
-            p4s = df[(df["node_type"] == "project4")
-                     & (~df["status"].isin(["deleted", "cancel"]))]
-            own_only = self.f_own_only.isChecked()
-            user = self.state.user
-            for idx in p4s.index:
-                if own_only and not self._involves_user(df, idx, user):
-                    continue
-                self.f_p4.addItem(self._p4_label(df, idx), idx)
-            if prev:
-                pos = self.f_p4.findData(prev)
-                if pos >= 0:
-                    self.f_p4.setCurrentIndex(pos)
-        self.f_p4.blockSignals(False)
-
-    def refresh(self) -> None:
-        self._rebuild_p4_combo()
-
-    # ── 期間プリセット ──
-
-    def _on_preset(self, label: str) -> None:
-        today = datetime.date.today()
-        if label in ("今週", "先週"):
-            monday = today - datetime.timedelta(days=today.weekday())
-            if label == "先週":
-                monday -= datetime.timedelta(days=7)
-            d_from, d_to = monday, monday + datetime.timedelta(days=6)
-            self.f_mode.setCurrentIndex(0)  # 週報
-        else:
-            first = today.replace(day=1)
-            if label == "先月":
-                first = (first - datetime.timedelta(days=1)).replace(day=1)
-            last_day = calendar.monthrange(first.year, first.month)[1]
-            d_from, d_to = first, first.replace(day=last_day)
-            self.f_mode.setCurrentIndex(1)  # 月報
-        self.f_from.set_date(d_from.isoformat())
-        self.f_to.set_date(d_to.isoformat())
-        self._on_generate()
-
-    # ── 生成・コピー・保存 ──
-
-    def _on_generate(self) -> None:
-        p4_idx = self.f_p4.currentData()
-        if not p4_idx:
-            QMessageBox.information(self, "情報", "Project4 を選択してください")
-            return
-        if self.f_mode.currentData() == "progress":
-            self._generate_progress(p4_idx)
-            return
-        self._progress_ctx = None
-        date_from = self.f_from.get_date()
-        date_to = self.f_to.get_date()
-        if not date_from or not date_to or date_from > date_to:
-            QMessageBox.warning(self, "入力エラー", "期間を正しく指定してください")
-            return
-        data = LG.collect_report_data(
-            self.state.df_nodes, self.state.df_daily, p4_idx,
-            date_from, date_to, display_name_func=self.state.display_name)
-        md = LG.build_report_markdown(data, self.f_mode.currentData())
-        self.preview.setPlainText(md)
-        self.info.set_info(
-            f"生成しました（完了 {len(data['completed'])} 件 / "
-            f"投入工数 {data['period_hours_total']:.2f}h）")
-
-    def _generate_progress(self, p4_idx: str) -> None:
-        """月次進捗レポートを生成する（期間指定は不要、基準日=今日）"""
-        df_snap = (self.state.db.read_progress_snapshots(p4_idx)
-                   if self.state.db else None)
-        data = LG.collect_progress_data(
-            self.state.df_nodes, df_snap, p4_idx,
-            display_name_func=self.state.display_name)
-        fname = LG.report_filename("progress", data["as_of"], data["root_title"])
-        basename = Path(fname).stem
-        chart_paths = [f"charts/{basename}_progress.png",
-                       f"charts/{basename}_evm.png"]
-        # チャート PNG はファイル保存時に md と同じ場所へ出力する
-        self._progress_ctx = (data, df_snap, basename)
-        md = LG.build_progress_markdown(data, chart_paths)
-        self.preview.setPlainText(md)
-        rate = data["progress"].get("count_rate", 0.0) if data["progress"] else 0.0
-        self.info.set_info(
-            f"生成しました（進捗率 {rate:.1f}% / "
-            "グラフ PNG はファイル保存時に出力されます）")
-
-    def _on_copy(self) -> None:
-        text = self.preview.toPlainText()
-        if not text.strip():
-            QMessageBox.information(self, "情報", "先にレポートを生成してください")
-            return
-        QApplication.clipboard().setText(text)
-        self.info.set_info("クリップボードへコピーしました")
-
-    def _on_copy_llm(self) -> None:
-        """文章化指示プロンプト + 実績データをクリップボードへコピーする"""
-        text = self.preview.toPlainText()
-        if not text.strip():
-            QMessageBox.information(self, "情報", "先にレポートを生成してください")
-            return
-        try:
-            template = self._LLM_TEMPLATE_PATH.read_text(encoding="utf-8")
-        except Exception:
-            # テンプレート欠落時は内蔵のデフォルト文を使用
-            template = self._LLM_FALLBACK
-        QApplication.clipboard().setText(
-            template.rstrip() + "\n\n# 実績データ\n\n" + text)
-        self.info.set_info("LLM 用プロンプトをクリップボードにコピーしました")
-
-    def _on_save(self) -> None:
-        text = self.preview.toPlainText()
-        if not text.strip():
-            QMessageBox.information(self, "情報", "先にレポートを生成してください")
-            return
-        # ファイル名は P4 タイトル + 期間から自動生成
-        p4_idx = self.f_p4.currentData()
-        root_title = ""
-        if p4_idx and p4_idx in self.state.df_nodes.index:
-            root_title = str(self.state.df_nodes.loc[p4_idx, "title"])
-        fname = LG.report_filename(
-            self.f_mode.currentData(), self.f_from.get_date() or "", root_title)
-
-        out_dir = (self.state.config.report_output_dir or "").strip()
-        if out_dir:
-            try:
-                path = Path(out_dir) / fname
-                self._save_report_to(path, text)
-                self.info.set_info(f"保存しました: {path}")
-                return
-            except Exception as e:
-                QMessageBox.warning(
-                    self, "保存エラー",
-                    f"output_dir への保存に失敗しました:\n{e}\n保存先を選択してください")
-        # output_dir 未設定または保存失敗時はダイアログで選択
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Markdown保存", str(Path.home() / fname), "Markdown (*.md)")
-        if not path:
-            return
-        try:
-            self._save_report_to(Path(path), text)
-            self.info.set_info(f"保存しました: {path}")
-        except Exception as e:
-            QMessageBox.critical(self, "保存エラー", str(e))
-
-    def _save_report_to(self, md_path: Path, text: str) -> None:
-        """md を書き込む。月次進捗の場合はチャート PNG も同じ場所の charts/ へ出力する"""
-        md_path.parent.mkdir(parents=True, exist_ok=True)
-        if (self.f_mode.currentData() == "progress"
-                and self._progress_ctx is not None):
-            data, df_snap, basename = self._progress_ctx
-            LG.save_progress_charts(
-                df_snap, data["tasks"], basename, str(md_path.parent))
-        md_path.write_text(text, encoding="utf-8")
 
 
 # ---------- AI取込ビュー ----------

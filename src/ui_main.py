@@ -40,8 +40,7 @@ IDX_AIIMPORT = 7
 IDX_MEMO    = 8
 IDX_VERSION  = 9
 IDX_CONFIG   = 10
-IDX_REPORT   = 11
-IDX_TODAY    = 12
+IDX_TODAY    = 11
 
 
 # ---------- 日次スケジュール用カスタムデリゲート ----------
@@ -394,10 +393,14 @@ class DailyScheduleWidget(QWidget):
                 )
             menu.addSeparator()
 
-        # ── 階層カスケード（Edit と同じ priority 昇順）──
-        if len(assignable_idx) > 0:
-            visible_ids = self._assignable_subtree_ids(df, assignable_idx)
-            self._build_assign_menu(menu, df, "0", visible_ids, rows)
+        # ── 2階層メニュー（プロジェクトパス ▸ Task/Ticket、Edit と同じ priority 昇順）──
+        for group_label, leaves in self._assignable_groups(df, assignable_idx):
+            sub = menu.addMenu(group_label)
+            for t_idx, leaf_label in leaves:
+                act = sub.addAction(leaf_label)
+                act.triggered.connect(
+                    lambda checked=False, ti=t_idx: self._assign_to_rows(rows, ti)
+                )
 
         # ── クリア ──
         menu.addSeparator()
@@ -415,60 +418,69 @@ class DailyScheduleWidget(QWidget):
         parent_title = str(df.loc[pid, "title"]) if pid in df.index else ""
         return f"{parent_title} / {title}" if parent_title else title
 
-    def _assignable_subtree_ids(self, df: pd.DataFrame, leaf_idxs) -> set:
-        """葉チケットとその祖先（Task〜P1）の IDX 集合を返す（枝刈り用）"""
-        result = set(leaf_idxs)
-        for idx in leaf_idxs:
-            pid = df.loc[idx, "parent_id"] if idx in df.index else None
-            while pid and pid != "0" and pid in df.index:
-                result.add(pid)
-                pid = df.loc[pid, "parent_id"]
+    def _priority_path(self, df: pd.DataFrame, idx: str) -> tuple:
+        """ルートから idx までの priority タプルを返す（Edit と同じ DFS 順のソートキー）"""
+        path = []
+        cur = idx
+        while cur and cur != "0" and cur in df.index:
+            try:
+                path.append(int(df.loc[cur, "priority"]))
+            except (ValueError, TypeError):
+                path.append(0)
+            cur = str(df.loc[cur, "parent_id"] or "")
+        path.reverse()
+        return tuple(path)
+
+    def _assignable_groups(self, df: pd.DataFrame, assignable_idx) -> list:
+        """割り当て可能チケットを「プロジェクトパス」グループにまとめて返す。
+
+        2階層メニュー用。各チケットの最も近い project 系祖先を group_node とし、
+        group_label = ルート〜group_node の project タイトルを " / " 連結、
+        leaf_label  = group_node〜チケット間の Task タイトル + チケットタイトルを " / " 連結。
+        並びはグループ・リーフとも Edit と同じ priority パス順。
+
+        Returns: [(group_label, [(ticket_idx, leaf_label), ...]), ...]
+        """
+        groups: dict = {}  # group_node_id -> {"label", "key", "leaves": [(key, idx, leaf_label)]}
+        for t_idx in assignable_idx:
+            # 祖先チェーンを収集（project 系と非 project 系を分ける）
+            proj_titles, mid_titles = [], []
+            group_node = None
+            cur = str(df.loc[t_idx, "parent_id"] or "") if t_idx in df.index else ""
+            while cur and cur != "0" and cur in df.index:
+                ntype = str(df.loc[cur, "node_type"])
+                title = str(df.loc[cur, "title"])
+                if ntype.startswith("project"):
+                    if group_node is None:
+                        group_node = cur
+                    proj_titles.append(title)
+                else:
+                    mid_titles.append(title)
+                cur = str(df.loc[cur, "parent_id"] or "")
+            if group_node is None:
+                group_node = "0"
+            proj_titles.reverse()
+            mid_titles.reverse()
+            group_label = " / ".join(proj_titles) if proj_titles else "（プロジェクト未設定）"
+
+            status_icon = "↻ " if str(df.loc[t_idx, "status"]) == "regularly" else ""
+            leaf_parts = mid_titles + [str(df.loc[t_idx, "title"])]
+            leaf_label = status_icon + " / ".join(leaf_parts)
+
+            g = groups.setdefault(group_node, {
+                "label": group_label,
+                "key": self._priority_path(df, group_node) if group_node != "0" else (),
+                "leaves": [],
+            })
+            g["leaves"].append((self._priority_path(df, t_idx), t_idx, leaf_label))
+
+        # グループを priority パス順、リーフも priority パス順でソート
+        ordered = sorted(groups.values(), key=lambda g: g["key"])
+        result = []
+        for g in ordered:
+            leaves = [(t_idx, label) for _, t_idx, label in sorted(g["leaves"], key=lambda x: x[0])]
+            result.append((g["label"], leaves))
         return result
-
-    def _assignable_leaves_in_order(self, df: pd.DataFrame, visible_ids: set,
-                                     parent_id: str = "0") -> list:
-        """visible_ids 内のチケット葉を Edit と同じ priority 昇順・DFS 順で返す。
-
-        メニュー構築(_build_assign_menu)と同じ走査規則の純ロジック版。
-        フィルタ結果と並び順の検証はこちらで行う（QMenu を介さない）。
-        """
-        out = []
-        children = df[df["parent_id"] == parent_id]
-        if children.empty:
-            return out
-        for idx, row in children.sort_values("priority").iterrows():
-            if idx not in visible_ids:
-                continue
-            if str(row["node_type"]) == "ticket":
-                out.append(idx)
-            else:
-                out.extend(self._assignable_leaves_in_order(df, visible_ids, idx))
-        return out
-
-    def _build_assign_menu(self, parent_menu, df: pd.DataFrame,
-                            parent_id: str, visible_ids: set, rows: list) -> None:
-        """parent_id 配下を priority 昇順で再帰生成する。
-
-        チケット(葉)は addAction、中間ノード(P1〜Task)は addMenu。
-        visible_ids に無い枝は刈る（割り当て可能チケットを持たない枝は出ない）。
-        並び順・フィルタ規則は _assignable_leaves_in_order と一致させること。
-        """
-        children = df[df["parent_id"] == parent_id]
-        if children.empty:
-            return
-        children = children.sort_values("priority")
-        for idx, row in children.iterrows():
-            if idx not in visible_ids:
-                continue
-            if str(row["node_type"]) == "ticket":
-                status_icon = "↻ " if str(row["status"]) == "regularly" else ""
-                act = parent_menu.addAction(f"{status_icon}{row['title']}")
-                act.triggered.connect(
-                    lambda checked=False, ti=idx: self._assign_to_rows(rows, ti)
-                )
-            else:
-                sub = parent_menu.addMenu(str(row["title"]))
-                self._build_assign_menu(sub, df, idx, visible_ids, rows)
 
     def _on_free(self) -> None:
         """選択スロットをクリアする"""
@@ -857,7 +869,6 @@ class MainWindow(QMainWindow):
             ("🤖 AI取込",  IDX_AIIMPORT),
             ("📝 Memo",    IDX_MEMO),
             ("📈 Analyze", IDX_ANALYSIS),
-            ("📋 Report",  IDX_REPORT),
             ("ℹ Version", IDX_VERSION),
             ("⚙ Config",  IDX_CONFIG),
         ]
@@ -872,6 +883,15 @@ class MainWindow(QMainWindow):
             self._tab_btns[view_idx] = btn
 
         tb.addSeparator()
+
+        # 詳細ペイン表示トグル（main/plan/edit で右の詳細ペインを開閉）
+        self.detail_toggle_btn = QPushButton("🔎 詳細")
+        self.detail_toggle_btn.setCheckable(True)
+        self.detail_toggle_btn.setChecked(True)
+        self.detail_toggle_btn.setStyleSheet(STYLE_BUTTON)
+        self.detail_toggle_btn.setToolTip("右の詳細ペインの表示/非表示（main/plan/edit）")
+        self.detail_toggle_btn.toggled.connect(self._on_toggle_detail)
+        tb.addWidget(self.detail_toggle_btn)
 
         # マニュアルを開くボタン
         manual_btn = QPushButton("📖 Manual")
@@ -943,11 +963,16 @@ class MainWindow(QMainWindow):
         # スタックウィジェット（各種ビューを切替）
         self.stack = QStackedWidget()
 
-        # 外側スプリッター
+        # 右端の共通詳細ペイン（main/plan/edit で表示、トグルで開閉）
+        self.detail_pane = DetailPane(self.state)
+        self._detail_visible = True  # トグルボタンの状態
+
+        # 外側スプリッター（左: 日次 / 中: スタック / 右: 詳細）
         outer = QSplitter(Qt.Orientation.Horizontal)
         outer.addWidget(self.schedule_panel)
         outer.addWidget(self.stack)
-        outer.setSizes([400, 1100])
+        outer.addWidget(self.detail_pane)
+        outer.setSizes([400, 900, 320])
 
         self.setCentralWidget(outer)
 
@@ -963,14 +988,13 @@ class MainWindow(QMainWindow):
         self.ver_view    = ui_sub.VersionView(self.state, self.version)
         self.config_view     = ui_sub.ConfigView(self.state)
         self.ai_import_view  = ui_sub.AIImportView(self.state)
-        self.report_view     = ui_sub.ReportView(self.state)
         self.dashboard_view  = ui_sub.DashboardView(self.state)
 
         # 追加順は IDX_* 定数と一致させること（QStackedWidget のインデックス）
         for w in [self.main_pane, self.gantt_view, self.road_view,
                   self.anal_view, self.search_view, self.team_view,
                   self.assign_view, self.ai_import_view, self.memo_view,
-                  self.ver_view, self.config_view, self.report_view,
+                  self.ver_view, self.config_view,
                   self.dashboard_view]:
             self.stack.addWidget(w)
 
@@ -979,6 +1003,12 @@ class MainWindow(QMainWindow):
         # チケット選択をポモドーロタイマーの対象に反映
         self.gantt_view.ticket_clicked.connect(self._on_pomodoro_ticket)
         self.main_pane.tree_pane.node_selected.connect(self._on_pomodoro_ticket)
+
+        # 共通 DetailPane へのノード選択配線（main/plan/edit の各画面）
+        self.main_pane.tree_pane.node_selected.connect(self.detail_pane.update_for_node)
+        self.main_pane.table_pane.node_selected.connect(self.detail_pane.update_for_node)
+        self.gantt_view.ticket_clicked.connect(self.detail_pane.update_for_node)
+        self.road_view.node_selected.connect(self.detail_pane.update_for_node)
 
         # シグナル接続：チケット選択 → スケジュールパネルへ（ガントチャートからのみ）
         # インライン編集後の軽量リフレッシュ（ツリー再構築なし）
@@ -1026,9 +1056,26 @@ class MainWindow(QMainWindow):
         cur = self.stack.currentWidget()
         if hasattr(cur, "refresh"):
             cur.refresh()
+        # 詳細ペインの表示制御（main/plan/edit のみ）
+        self._update_detail_visibility()
         # 未処理 Request バッジを常に最新化（起動時含む）
         if hasattr(self, "_tab_btns"):
             self._update_request_tab_badge()
+
+    def _on_toggle_detail(self, checked: bool) -> None:
+        """🔎 詳細トグル: 詳細ペインの表示/非表示を切り替える"""
+        self._detail_visible = checked
+        self._update_detail_visibility()
+
+    def _update_detail_visibility(self) -> None:
+        """詳細ペインは main(ガント)/plan(ロードマップ)/edit でのみ、かつトグルON時に表示"""
+        if not hasattr(self, "detail_pane"):
+            return
+        visible = (getattr(self, "_detail_visible", True)
+                   and self.stack.currentIndex() in (IDX_MAIN, IDX_GANTT, IDX_ROADMAP))
+        self.detail_pane.setVisible(visible)
+        if visible:
+            self.detail_pane.refresh()
 
     # ---------- スロット ----------
 
@@ -1077,49 +1124,69 @@ class MainWindow(QMainWindow):
         start_slot = start_dt.hour * 4 + start_dt.minute // 15
         slots = list(range(start_slot, min(start_slot + n_slots,
                                            len(DB.DAILY_TIME_COLS))))
-        # 既に実績が入力されているスロットは上書きしない
         today = datetime.date.today().isoformat()
         sch_idx = DB.daily_sch_idx(today, self.state.login_user)
         df_daily = self.state.df_daily
-        free = []
+        # 既入力(occupied)と空き(free)に分割
+        free, occupied = [], []
         for s in slots:
             col = DB.DAILY_TIME_COLS[s]
-            occupied = (not df_daily.empty and sch_idx in df_daily.index
-                        and bool(df_daily.loc[sch_idx, col]))
-            if not occupied:
-                free.append(s)
+            is_occ = (not df_daily.empty and sch_idx in df_daily.index
+                      and bool(df_daily.loc[sch_idx, col]))
+            (occupied if is_occ else free).append(s)
         title = str(df.loc[ticket_idx, "title"])
-        if not free:
+
+        # 既入力スロットがある場合は上書き可否をユーザーに確認
+        targets = list(free)
+        if occupied:
+            ans = QMessageBox.question(
+                self, "ポモドーロ実績記録",
+                f"対象時間帯のうち {len(occupied)} スロットには既に実績が入力されています。\n"
+                f"上書きしますか？\n（はい: 上書きして記録 / いいえ: 空き {len(free)} スロットのみ記録）")
+            if ans == QMessageBox.StandardButton.Yes:
+                targets = sorted(free + occupied)
+
+        if not targets:
             QMessageBox.information(
                 self, "ポモドーロ",
-                "対象時間帯は既に実績が入力されているため記録しません")
+                "記録対象のスロットがありません")
             return
-        hours = len(free) * 0.25
+        hours = len(targets) * 0.25
         ans = QMessageBox.question(
             self, "ポモドーロ実績記録",
-            f"「{title}」に {hours:.2f}h（{len(free)} スロット）の実績を記録しますか？")
+            f"「{title}」に {hours:.2f}h（{len(targets)} スロット）の実績を記録しますか？")
         if ans != QMessageBox.StandardButton.Yes:
             return
-        self._write_pomodoro_slots(sch_idx, free, ticket_idx)
+        self._write_pomodoro_slots(sch_idx, targets, ticket_idx)
         self.statusBar().showMessage(f"ポモドーロ実績を記録しました: {title} +{hours:.2f}h", 5000)
 
     def _write_pomodoro_slots(self, sch_idx: str, slots: list,
                               ticket_idx: str) -> None:
-        """空きスロットへチケットを書き込み、actual_hours を伝播する（遅延保存）"""
+        """スロットへチケットを書き込み、actual_hours を伝播する（遅延保存）。
+        既存チケットがある枠を上書きする場合は旧チケットの実績を減算する。"""
         df_daily = self.state.df_daily
         if df_daily.empty or sch_idx not in df_daily.index:
             new_row = {c: "" for c in DB.DAILY_SCH_COLS[1:]}
             new_row["Owner"] = self.state.login_user
             df_daily.loc[sch_idx] = new_row
             self.state.df_daily = df_daily
-        for s in slots:
-            self.state.df_daily.loc[sch_idx, DB.DAILY_TIME_COLS[s]] = ticket_idx
-        self.state.df_daily.loc[sch_idx, "Last_Update"] = \
-            datetime.date.today().isoformat()
         nodes = self.state.df_nodes
-        nodes.loc[ticket_idx, "actual_hours"] = (
-            float(nodes.loc[ticket_idx, "actual_hours"] or 0) + 0.25 * len(slots))
-        nodes.loc[ticket_idx, "updated_at"] = datetime.date.today().isoformat()
+        today = datetime.date.today().isoformat()
+        for s in slots:
+            col = DB.DAILY_TIME_COLS[s]
+            old_t = self.state.df_daily.loc[sch_idx, col]
+            if old_t == ticket_idx:
+                continue  # 既に同じチケット: 変更なし
+            # 上書き対象の旧チケットから実績を減算
+            if old_t and old_t in nodes.index:
+                nodes.loc[old_t, "actual_hours"] = max(
+                    0.0, float(nodes.loc[old_t, "actual_hours"] or 0) - 0.25)
+                self.schedule_panel._propagate_actual_hours(old_t)
+            self.state.df_daily.loc[sch_idx, col] = ticket_idx
+            nodes.loc[ticket_idx, "actual_hours"] = (
+                float(nodes.loc[ticket_idx, "actual_hours"] or 0) + 0.25)
+        nodes.loc[ticket_idx, "updated_at"] = today
+        self.state.df_daily.loc[sch_idx, "Last_Update"] = today
         self.schedule_panel._propagate_actual_hours(ticket_idx)
         self.state.schedule_modified = True
         self.state.nodes_modified = True
@@ -1294,6 +1361,7 @@ class _Main3Pane(QWidget):
     """
     Edit 画面の 2 分割ビュー（左: 階層ツリー / 右: 子ノード一覧テーブル）。
     TreePane でノードを選択すると TablePane が対応する子ノードを表示する。
+    ノード詳細（リンク含む）は MainWindow 共通の DetailPane（右端）に表示する。
     """
 
     def __init__(self, state):
@@ -1307,7 +1375,7 @@ class _Main3Pane(QWidget):
 
         splitter.addWidget(self.tree_pane)
         splitter.addWidget(self.table_pane)
-        splitter.setSizes([280, 920])
+        splitter.setSizes([260, 940])
         splitter.setChildrenCollapsible(False)
 
         layout = QVBoxLayout(self)
@@ -2076,15 +2144,15 @@ class TablePane(QWidget):
                 )
         else:
             self.header_label.setText("（ノードをツリーから選択してください）")
-        # 親が切り替わったときだけ連番化を実行（refresh() 経由では実行しない）
-        self._normalize_priorities(parent_idx)
+        # 表示・選択は編集ではないため正規化しない（dirty 誤検知の防止）。
+        # priority 連番化は削除・貼り付け等の実変更時にのみ行う。
         self._rebuild_table()
 
     def _normalize_priorities(self, parent_idx: str) -> None:
-        """子ノードの priority を 1 から連番に修正してインメモリを更新する。
+        """子ノード（削除済みを除く）の priority を 1 から連番に修正してインメモリを更新する。
         DB への書き込みはユーザーが明示的に保存（Ctrl+S）したときのみ行う。"""
         df = self.state.df_nodes
-        children = df[df["parent_id"] == parent_idx].copy()
+        children = df[(df["parent_id"] == parent_idx) & (df["status"] != "deleted")].copy()
         if children.empty:
             return
         children = children.sort_values("priority")
@@ -2379,6 +2447,8 @@ class TablePane(QWidget):
             return
         self.state.df_nodes.loc[idx, "status"] = "deleted"
         self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+        # 削除で生じた priority の欠番を連番化（実変更なので dirty 誤検知にならない）
+        self._normalize_priorities(self._parent_idx)
         self._mark_dirty()
         self.state.refresh()
 
@@ -2662,6 +2732,16 @@ class TablePane(QWidget):
 # ---------- 右ペイン：詳細フォームのみ ----------
 
 class DetailPane(QWidget):
+    """ノード詳細 + レポート編集（上: 詳細/本日レポート編集、下: 過去レポート閲覧）。
+    Plan/Gantt/Edit のノード選択に連動し、選択ノードの日付付きレポートを管理する。"""
+
+    # LLM 文章化プロンプトのテンプレート（ユーザーがカスタマイズ可能）
+    _LLM_TEMPLATE_PATH = Path(__file__).parent / "documents" / "llm_report.md"
+    _LLM_FALLBACK = (
+        "以下の実績データから、上司向けの業務報告を簡潔な敬体で作成してください。\n"
+        "構成: 1) 成果サマリー 2) 進行中と見通し 3) 課題・リスク 4) 所感（叩き台）\n"
+        "数値はデータのまま正確に使い、データにない事実は創作しないでください。")
+
     def __init__(self, state):
         super().__init__()
         self.state = state
@@ -2671,7 +2751,9 @@ class DetailPane(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        # ノード詳細フォーム
+        vsplit = QSplitter(Qt.Orientation.Vertical)
+
+        # ── 上: ノード詳細フォーム ──
         self.form_area = QScrollArea()
         self.form_area.setWidgetResizable(True)
         self.form_area.setFrameShape(QFrame.Shape.NoFrame)
@@ -2679,22 +2761,106 @@ class DetailPane(QWidget):
         self.form = QFormLayout(form_widget)
         self.form.setSpacing(4)
         self.form_area.setWidget(form_widget)
-        layout.addWidget(self.form_area, stretch=1)
+        vsplit.addWidget(self.form_area)
+
+        # ── 下: レポートセクション（月次・P2単位ファイル / IDX セクション）──
+        report_widget = QWidget()
+        rlay = QVBoxLayout(report_widget)
+        rlay.setContentsMargins(0, 0, 0, 0)
+        rlay.setSpacing(3)
+
+        self._rep_month = datetime.date.today().replace(day=1)  # 表示中の月（1日）
+        self._rep_dirty = False  # エディタ未保存フラグ
+
+        self.report_title_lbl = QLabel("📋 レポート")
+        self.report_title_lbl.setWordWrap(True)
+        rlay.addWidget(self.report_title_lbl)
+
+        # 月ナビ ◀ [yyyy/mm] ▶
+        mrow = QHBoxLayout()
+        mrow.setSpacing(3)
+        self.rep_prev_btn = QPushButton("◀")
+        self.rep_prev_btn.setStyleSheet(STYLE_BUTTON)
+        self.rep_prev_btn.setFixedWidth(28)
+        self.rep_prev_btn.clicked.connect(lambda: self._rep_shift_month(-1))
+        self.rep_month_lbl = QLabel("")
+        self.rep_next_btn = QPushButton("▶")
+        self.rep_next_btn.setStyleSheet(STYLE_BUTTON)
+        self.rep_next_btn.setFixedWidth(28)
+        self.rep_next_btn.clicked.connect(lambda: self._rep_shift_month(+1))
+        mrow.addWidget(self.rep_prev_btn)
+        mrow.addWidget(self.rep_month_lbl)
+        mrow.addWidget(self.rep_next_btn)
+        mrow.addStretch()
+        rlay.addLayout(mrow)
+
+        # ボタン行
+        tbar = QHBoxLayout()
+        tbar.setSpacing(3)
+        self.rep_mode = QComboBox()
+        self.rep_mode.addItem("週報", "weekly")
+        self.rep_mode.addItem("月報", "monthly")
+        tbar.addWidget(self.rep_mode)
+        self.rep_insert_btn = QPushButton("📊 実績を挿入")
+        self.rep_insert_btn.setStyleSheet(STYLE_BUTTON)
+        self.rep_insert_btn.setToolTip("選択アイテム配下の実績を集約して本文に差し込む")
+        self.rep_insert_btn.clicked.connect(self._on_insert_actuals)
+        self.rep_save_btn = QPushButton("💾 保存")
+        self.rep_save_btn.setStyleSheet(STYLE_BUTTON)
+        self.rep_save_btn.setToolTip("この月の P2 ファイルの該当セクションへ保存")
+        self.rep_save_btn.clicked.connect(self._on_save_report)
+        self.rep_llm_btn = QPushButton("🤖 LLM")
+        self.rep_llm_btn.setStyleSheet(STYLE_BUTTON)
+        self.rep_llm_btn.setToolTip("LLM 用プロンプト + 本文をクリップボードへコピー")
+        self.rep_llm_btn.clicked.connect(self._on_copy_llm)
+        tbar.addWidget(self.rep_insert_btn)
+        tbar.addWidget(self.rep_save_btn)
+        tbar.addWidget(self.rep_llm_btn)
+        tbar.addStretch()
+        rlay.addLayout(tbar)
+
+        self.report_edit = QTextEdit()
+        self.report_edit.setAcceptRichText(False)
+        self.report_edit.setPlaceholderText(
+            "このアイテムの当月レポート（自由記述。[名前](パス/URL) でリンクを貼れます）")
+        self.report_edit.textChanged.connect(self._on_report_text_changed)
+        rlay.addWidget(self.report_edit, stretch=1)
+
+        # 🔗 抽出リンク一覧
+        rlay.addWidget(QLabel("🔗 リンク"))
+        self.links_area = QScrollArea()
+        self.links_area.setWidgetResizable(True)
+        self.links_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.links_area.setMaximumHeight(110)
+        self._links_host = QWidget()
+        self.links_layout = QVBoxLayout(self._links_host)
+        self.links_layout.setContentsMargins(0, 0, 0, 0)
+        self.links_layout.setSpacing(2)
+        self.links_area.setWidget(self._links_host)
+        rlay.addWidget(self.links_area)
+
+        vsplit.addWidget(report_widget)
+        vsplit.setSizes([260, 460])
+        layout.addWidget(vsplit, stretch=1)
 
         self.info = InfoLabel()
         layout.addWidget(self.info)
 
     def update_for_node(self, idx: str) -> None:
+        if self._rep_dirty and self._node_idx:
+            self._on_save_report()
         self._node_idx = idx
+        self._rep_month = datetime.date.today().replace(day=1)
         self._rebuild_form(idx)
+        self._load_report()
 
     def refresh(self) -> None:
         if self._node_idx:
             self._rebuild_form(self._node_idx)
+            self._load_report()
 
     def _rebuild_form(self, idx: str) -> None:
         """選択ノードのフィールドをフォームに表示する"""
-        # フォームをクリア
         while self.form.rowCount():
             self.form.removeRow(0)
         if not idx or idx not in self.state.df_nodes.index:
@@ -2720,21 +2886,6 @@ class DetailPane(QWidget):
             lbl.setWordWrap(True)
             self.form.addRow(f"{label}:", lbl)
 
-        # リンク（成果物・参考資料）: 値表示 + 開くボタン
-        link_val = str(row.get("link", "") or "")
-        link_row = QWidget()
-        link_layout = QHBoxLayout(link_row)
-        link_layout.setContentsMargins(0, 0, 0, 0)
-        link_lbl = QLabel(link_val)
-        link_lbl.setWordWrap(True)
-        link_layout.addWidget(link_lbl, stretch=1)
-        if link_val:
-            open_btn = QPushButton("📂 開く")
-            open_btn.setToolTip("リンク先を既定のアプリで開く")
-            open_btn.clicked.connect(lambda _=False, p=link_val: self._open_link(p))
-            link_layout.addWidget(open_btn)
-        self.form.addRow("リンク:", link_row)
-
     def _open_link(self, link: str) -> None:
         """リンク先を OS の既定アプリで開く。URL とローカルパスの両方に対応。"""
         link = link.strip()
@@ -2752,6 +2903,164 @@ class DetailPane(QWidget):
         if not QDesktopServices.openUrl(url):
             QMessageBox.warning(
                 self, "リンクエラー", f"リンクを開けませんでした:\n{link}")
+
+    # ── レポート（月次・P2 単位ファイル / IDX セクション）──
+
+    def _on_report_text_changed(self) -> None:
+        self._rep_dirty = True
+
+    def _load_report(self) -> None:
+        """選択アイテム・選択月のセクションを読み込む"""
+        idx = self._node_idx
+        self.rep_month_lbl.setText(self._rep_month.strftime("%Y/%m"))
+
+        target = (
+            LG.report_target(self.state.df_nodes, idx)
+            if (idx and idx in self.state.df_nodes.index)
+            else None
+        )
+
+        if target is None:
+            self.report_title_lbl.setText(
+                "📋 レポート（レポート対象外：Project2 以下を選択）")
+            self.report_edit.blockSignals(True)
+            self.report_edit.clear()
+            self.report_edit.blockSignals(False)
+            self.report_edit.setEnabled(False)
+            self.rep_insert_btn.setEnabled(False)
+            self.rep_save_btn.setEnabled(False)
+            self.rep_llm_btn.setEnabled(False)
+            self._update_links()
+            return
+
+        path_titles = LG.node_path_titles(self.state.df_nodes, idx)
+        breadcrumb = " / ".join(path_titles)
+        self.report_title_lbl.setText(
+            f"📋 今月のレポート ({self._rep_month.strftime('%Y/%m')}): {breadcrumb}")
+
+        self.report_edit.setEnabled(True)
+        self.rep_insert_btn.setEnabled(True)
+        self.rep_save_btn.setEnabled(True)
+        self.rep_llm_btn.setEnabled(True)
+
+        out_dir = (self.state.config.report_output_dir or "").strip()
+        body = ""
+        if out_dir:
+            yyyymm = self._rep_month.strftime("%Y%m")
+            p2_path = LG.report_p2_path(out_dir, self.state.df_nodes, idx, yyyymm)
+            if p2_path and p2_path.exists():
+                try:
+                    md_text = p2_path.read_text(encoding="utf-8")
+                    body = LG.read_section(md_text, idx) or ""
+                except Exception:
+                    pass
+
+        self.report_edit.blockSignals(True)
+        self.report_edit.setPlainText(body)
+        self.report_edit.blockSignals(False)
+        self._rep_dirty = False
+        self._update_links()
+
+    def _rep_shift_month(self, delta: int) -> None:
+        """月ナビ ◀▶ で前月/翌月へ移動（dirty なら自動保存）"""
+        if self._rep_dirty:
+            self._on_save_report()
+        m = self._rep_month
+        new_month = m.month + delta
+        new_year = m.year
+        if new_month < 1:
+            new_month = 12
+            new_year -= 1
+        elif new_month > 12:
+            new_month = 1
+            new_year += 1
+        self._rep_month = m.replace(year=new_year, month=new_month, day=1)
+        self._load_report()
+
+    def _update_links(self) -> None:
+        """report_edit の本文から []() リンクを抽出してボタン一覧を再構築する"""
+        while self.links_layout.count():
+            item = self.links_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)  # 即時削除（deleteLater は非同期）
+        links = LG.extract_md_links(self.report_edit.toPlainText())
+        for label, target in links:
+            btn = QPushButton(f"[{label}]")
+            btn.setToolTip(target)
+            btn.setStyleSheet(STYLE_BUTTON)
+            btn.clicked.connect(lambda _=False, t=target: self._open_link(t))
+            self.links_layout.addWidget(btn)
+
+    def _report_period(self, mode: str):
+        """モードに応じた集計期間(date_from, date_to: ISO文字列)を返す"""
+        today = datetime.date.today()
+        if mode == "monthly":
+            first = today.replace(day=1)
+            nxt = (first.replace(year=first.year + 1, month=1)
+                   if first.month == 12
+                   else first.replace(month=first.month + 1))
+            return first.isoformat(), (nxt - datetime.timedelta(days=1)).isoformat()
+        # weekly: 月曜〜日曜
+        monday = today - datetime.timedelta(days=today.weekday())
+        return monday.isoformat(), (monday + datetime.timedelta(days=6)).isoformat()
+
+    def _on_insert_actuals(self) -> None:
+        """選択ノード配下の実績を集約した md を本文へ挿入する"""
+        idx = self._node_idx
+        if not idx or idx not in self.state.df_nodes.index:
+            QMessageBox.information(self, "情報", "Plan などでノードを選択してください")
+            return
+        mode = self.rep_mode.currentData()
+        d_from, d_to = self._report_period(mode)
+        data = LG.collect_report_data(
+            self.state.df_nodes, self.state.df_daily, idx, d_from, d_to,
+            display_name_func=self.state.display_name)
+        md = LG.build_report_markdown(data, mode)
+        cur = self.report_edit.toPlainText()
+        self.report_edit.setPlainText((cur + "\n\n" if cur.strip() else "") + md)
+        self.info.set_info("実績を挿入しました")
+
+    def _on_save_report(self) -> None:
+        """当月 P2 ファイルの IDX セクションへ保存する"""
+        idx = self._node_idx
+        if not idx or idx not in self.state.df_nodes.index:
+            return
+        out_dir = (self.state.config.report_output_dir or "").strip()
+        if not out_dir:
+            QMessageBox.warning(
+                self, "出力先未設定",
+                "Config で [Report] output_dir を設定してください")
+            return
+        yyyymm = self._rep_month.strftime("%Y%m")
+        p2_path = LG.report_p2_path(out_dir, self.state.df_nodes, idx, yyyymm)
+        if p2_path is None:
+            return
+        item_title = str(self.state.df_nodes.loc[idx, "title"])
+        body = self.report_edit.toPlainText()
+        try:
+            p2_path.parent.mkdir(parents=True, exist_ok=True)
+            md_text = p2_path.read_text(encoding="utf-8") if p2_path.exists() else ""
+            updated = LG.upsert_section(md_text, idx, item_title, body)
+            p2_path.write_text(updated, encoding="utf-8")
+            self._rep_dirty = False
+            self.info.set_info(f"保存しました: {p2_path.name}")
+            self._update_links()
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", str(e))
+
+    def _on_copy_llm(self) -> None:
+        """LLM 用プロンプト + 本文をクリップボードへコピーする"""
+        text = self.report_edit.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "情報", "本文がありません")
+            return
+        try:
+            template = self._LLM_TEMPLATE_PATH.read_text(encoding="utf-8")
+        except Exception:
+            template = self._LLM_FALLBACK
+        QApplication.clipboard().setText(
+            template.rstrip() + "\n\n# 実績データ\n\n" + text)
+        self.info.set_info("LLM 用プロンプトをコピーしました")
 
 
 # ---------- テンプレート選択ダイアログ ----------
@@ -2856,8 +3165,6 @@ class _NodeEditDialog(QDialog):
         self.f_color = ColorCombo()
         self.f_memo = QTextEdit()
         self.f_memo.setMaximumHeight(80)
-        self.f_link = QLineEdit()
-        self.f_link.setPlaceholderText("成果物・参考資料のファイルパスまたは URL")
 
         form.addRow("タイトル *:",   self.f_title)
         form.addRow("順序:",         self.f_priority)
@@ -2867,7 +3174,6 @@ class _NodeEditDialog(QDialog):
         form.addRow("納期:",         deadline_row)
         form.addRow("表示色:",       self.f_color)
         form.addRow("メモ:",         self.f_memo)
-        form.addRow("リンク:",       self.f_link)
 
         layout.addLayout(form)
 
@@ -2891,7 +3197,6 @@ class _NodeEditDialog(QDialog):
             self.f_deadline.set_date(str(row.get("deadline", "") or ""))
             self.f_color.set_color(str(row.get("color", "Cyan")))
             self.f_memo.setPlainText(str(row.get("memo", "")))
-            self.f_link.setText(str(row.get("link", "") or ""))
         else:
             self.f_color.set_color(default_color)
 
@@ -2921,6 +3226,5 @@ class _NodeEditDialog(QDialog):
         ds["deadline"]        = self.f_deadline.get_date() or None
         ds["color"]           = self.f_color.current_color()
         ds["memo"]            = self.f_memo.toPlainText()
-        ds["link"]            = self.f_link.text().strip()
         ds["updated_at"]      = datetime.date.today().isoformat()
         return ds

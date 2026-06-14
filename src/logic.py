@@ -293,6 +293,71 @@ def build_daily_log_markdown(df_daily: pd.DataFrame, df_nodes: pd.DataFrame,
     return "\n".join(lines) + "\n"
 
 
+def build_team_log_markdown(df_daily, df_daily_log, all_permanent: dict,
+                            members: list, name_map: dict,
+                            date_from: str, date_to: str) -> str:
+    """
+    指定期間のチーム日次ログ（勤務状況・健康・連絡事項）を Markdown 表で出力する。
+
+    日付 × メンバーで1行を作り、勤務時間・勤務場所・残業・健康状態・安全宣言・
+    連絡事項を表にまとめる。データが全く無い行はスキップ。末尾に常時メモ表を付ける。
+    """
+    try:
+        d_from = datetime.date.fromisoformat(date_from)
+        d_to = datetime.date.fromisoformat(date_to)
+    except (ValueError, TypeError):
+        return "# チーム日次ログ\n\n期間の指定が不正です。\n"
+    if d_to < d_from:
+        d_from, d_to = d_to, d_from
+
+    lines = [f"# チーム日次ログ {date_from} 〜 {date_to}", ""]
+    lines += [
+        "| 日付 | メンバー | 勤務時間 | 勤務場所 | 残業 | 健康状態 | 安全宣言 | 連絡事項 |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    has_log = df_daily_log is not None and not df_daily_log.empty
+    n_days = (d_to - d_from).days + 1
+    for i in range(n_days):
+        d = (d_from + datetime.timedelta(days=i)).isoformat()
+        for member in members:
+            idx = daily_sch_idx(d, member)
+            wh = calc_working_hours(df_daily, idx)
+            if wh["total"] > 0:
+                wh_str = (f"{col_to_hhmm(wh['from'])}〜{col_to_hhmm(wh['to'])}"
+                          f" [{wh['total']:.2f}h](休{wh['break']:.2f}h)")
+            else:
+                wh_str = ""
+            place = overwork = health = safety = notes = ""
+            if has_log and idx in df_daily_log.index:
+                row = df_daily_log.loc[idx]
+                place = str(row.get("work_place", "") or "")
+                overwork = str(row.get("overwork", "") or "")
+                health = str(row.get("health_status", "") or "")
+                safety = str(row.get("safety", "") or "")
+                notes = str(row.get("notes", "") or "")
+            # 勤務時間もログも全く無い行はスキップ
+            if not (wh_str or place or overwork or health or safety or notes):
+                continue
+            name = name_map.get(member, member)
+            lines.append(
+                f"| {d} | {_md_escape(name)} | {_md_escape(wh_str) or '-'}"
+                f" | {_md_escape(place) or '-'} | {_md_escape(overwork) or '-'}"
+                f" | {_md_escape(health) or '-'} | {_md_escape(safety) or '-'}"
+                f" | {_md_escape(notes) or '-'} |")
+
+    # 常時メモ
+    lines += ["", "## 常時メモ", ""]
+    perm_rows = [(m, str((all_permanent or {}).get(m, "") or "")) for m in members]
+    perm_rows = [(m, v) for m, v in perm_rows if v.strip()]
+    if perm_rows:
+        lines += ["| メンバー | 常時メモ |", "|---|---|"]
+        for m, v in perm_rows:
+            lines.append(f"| {_md_escape(name_map.get(m, m))} | {_md_escape(v)} |")
+    else:
+        lines.append("（なし）")
+    return "\n".join(lines) + "\n"
+
+
 # ---------- EDF + 優先度スケジューリング ----------
 
 def edf_schedule(df_nodes: pd.DataFrame, task_idx: str,
@@ -809,274 +874,129 @@ def build_report_markdown(data: dict, mode: str = "weekly") -> str:
     return "\n".join(lines) + "\n"
 
 
-def report_filename(mode: str, date_from: str, root_title: str) -> str:
-    """レポートのファイル名を生成する（ファイル名禁止文字は _ に置換）"""
-    safe_title = re.sub(r'[\\/:*?"<>|]', "_", root_title).strip() or "report"
-    if mode in ("monthly", "progress"):
-        period = date_from[:7]  # YYYY-MM
-    else:
-        try:
-            iso = datetime.date.fromisoformat(date_from).isocalendar()
-            period = f"{iso[0]}-W{iso[1]:02d}"
-        except (ValueError, TypeError):
-            period = date_from
-    prefix = {"monthly": "monthly", "progress": "progress"}.get(mode, "weekly")
-    return f"{prefix}_{period}_{safe_title}.md"
+def _safe_name(s: str) -> str:
+    """ファイル名・見出し用にパス禁止文字と区切り記号を _ へ置換する"""
+    return re.sub(r'[\\/:*?"<>|]', "_", str(s)).strip() or "_"
 
 
-# ---------- 進捗スナップショット・月次進捗レポート ----------
+def ancestor_of_type(df_nodes: pd.DataFrame, idx: str, ntype: str) -> Optional[str]:
+    """idx 自身または祖先で node_type==ntype の最初のノードIDXを返す（無ければ None）"""
+    cur = idx
+    while cur and cur != "0" and cur in df_nodes.index:
+        if str(df_nodes.loc[cur, "node_type"]) == ntype:
+            return cur
+        cur = str(df_nodes.loc[cur, "parent_id"] or "")
+    return None
 
-def build_progress_snapshot_rows(df_nodes: pd.DataFrame) -> List[dict]:
+
+def node_path_titles(df_nodes: pd.DataFrame, idx: str) -> List[str]:
+    """ルート→idx のタイトル列（["P1名","P2名",…,"item名"]）を返す"""
+    titles: List[str] = []
+    cur = idx
+    while cur and cur != "0" and cur in df_nodes.index:
+        titles.append(str(df_nodes.loc[cur, "title"]))
+        cur = str(df_nodes.loc[cur, "parent_id"] or "")
+    titles.reverse()
+    return titles
+
+
+def report_target(df_nodes: pd.DataFrame, idx: str):
     """
-    全 Project4 の進捗スナップショット行（配下チケットの件数・工数集計）を計算する。
-    DB への書き込みは db.save_progress_snapshots が行う。
+    レポート保存先の (p1_idx, p1_title, p2_idx, p2_title) を返す。
+    - P2配下（P3/P4/Task/Ticket）または P2自身 → P1・P2 を特定して返す
+    - P1 / 対象外 / 不明 → None
     """
-    rows: List[dict] = []
-    if df_nodes.empty:
-        return rows
-    p4s = df_nodes[(df_nodes["node_type"] == "project4")
-                   & (~df_nodes["status"].isin(["deleted", "cancel"]))]
-    for idx in p4s.index:
-        prog = calc_progress(df_nodes, idx)
-        rows.append({
-            "node_idx":        idx,
-            "done_count":      prog["done_count"],
-            "total_count":     prog["total_count"],
-            "actual_hours":    prog["actual_hours"],
-            "estimated_hours": prog["estimated_hours"],
-        })
-    return rows
+    if not idx or idx not in df_nodes.index:
+        return None
+    p2 = ancestor_of_type(df_nodes, idx, "project2")
+    if not p2:
+        return None
+    p1 = ancestor_of_type(df_nodes, p2, "project1")
+    if not p1:
+        return None
+    return (p1, str(df_nodes.loc[p1, "title"]),
+            p2, str(df_nodes.loc[p2, "title"]))
 
 
-def calc_progress(df_nodes: pd.DataFrame, root_idx: str) -> dict:
-    """root 配下チケットの進捗率を件数ベース・工数ベースで計算する"""
-    tickets = collect_descendant_tickets(df_nodes, root_idx)
-    valid = [t for t in tickets if str(df_nodes.loc[t, "status"]) != "cancel"]
-    done = sum(1 for t in valid if str(df_nodes.loc[t, "status"]) == "done")
-    est = sum(float(df_nodes.loc[t, "estimated_hours"]) for t in valid)
-    act = sum(float(df_nodes.loc[t, "actual_hours"]) for t in valid)
-    count_rate = (done / len(valid) * 100) if valid else 0.0
-    hours_rate = (act / est * 100) if est > 0 else None
-    return {
-        "done_count": done, "total_count": len(valid),
-        "count_rate": round(count_rate, 1),
-        "actual_hours": round(act, 2), "estimated_hours": round(est, 2),
-        "hours_rate": round(hours_rate, 1) if hours_rate is not None else None,
-    }
+def report_p2_path(out_dir: str, df_nodes: pd.DataFrame, idx: str,
+                   yyyymm: str) -> Optional[Path]:
+    """選択アイテムが属する P2 の、指定月の Markdown ファイル Path を返す（対象外は None）。
+    形式: <out_dir>/reports/<yyyymm>_<p2idx>_<p1名>_<p2名>.md"""
+    tgt = report_target(df_nodes, idx)
+    if tgt is None or not out_dir:
+        return None
+    _p1, p1_title, p2_idx, p2_title = tgt
+    fname = f"{yyyymm}_{_safe_name(p2_idx)}_{_safe_name(p1_title)}_{_safe_name(p2_title)}.md"
+    return Path(out_dir) / "reports" / fname
 
 
-def calc_task_summary(df_nodes: pd.DataFrame, root_idx: str) -> List[dict]:
-    """root 直下の Task 別に工数・進捗・期間・状態を集計する"""
-    rows: List[dict] = []
-    today = datetime.date.today().isoformat()
-    tasks = df_nodes[(df_nodes["parent_id"] == root_idx)
-                     & (df_nodes["node_type"] == "task")
-                     & (~df_nodes["status"].isin(["deleted", "cancel"]))]
-    for t_idx in tasks.index:
-        r = df_nodes.loc[t_idx]
-        prog = calc_progress(df_nodes, t_idx)
-        deadline = _date_str(r.get("deadline"))
-        status = str(r.get("status", ""))
-        if status == "done":
-            label = "完了"
-        elif deadline and deadline < today:
-            label = "⚠超過"
-        elif prog["actual_hours"] > 0:
-            label = "進行中"
-        else:
-            label = "未着手"
-        rows.append({
-            "title":           str(r.get("title", "")),
-            "estimated":       prog["estimated_hours"],
-            "actual":          prog["actual_hours"],
-            "remaining":       round(max(0.0, prog["estimated_hours"]
-                                        - prog["actual_hours"]), 2),
-            "done_count":      prog["done_count"],
-            "total_count":     prog["total_count"],
-            "count_rate":      prog["count_rate"],
-            "start_available": _date_str(r.get("start_available")),
-            "deadline":        deadline,
-            "state":           label,
-        })
-    return rows
+def section_header(item_idx: str, item_title: str) -> str:
+    """アイテムのセクション見出し（### IDX_<idx>_<名>）を返す"""
+    return f"### IDX_{item_idx}_{item_title}"
 
 
-def collect_progress_data(df_nodes: pd.DataFrame, df_snapshots,
-                          root_idx: str, display_name_func=None) -> dict:
-    """
-    月次進捗レポート用のデータ一式を集計する。
-    df_snapshots: db.read_progress_snapshots(root_idx) の結果（None 可）
-    """
-    name = display_name_func or (lambda s: s)
-    today = datetime.date.today()
-    data = {
-        "root_title": "", "as_of": today.isoformat(),
-        "progress": {}, "prev_rate": None, "tasks": [],
-        "overdue": [], "approaching": [],
-    }
-    if df_nodes.empty or root_idx not in df_nodes.index:
-        return data
-    data["root_title"] = str(df_nodes.loc[root_idx, "title"])
-    data["progress"] = calc_progress(df_nodes, root_idx)
-    data["tasks"] = calc_task_summary(df_nodes, root_idx)
-
-    # 先月末時点の進捗率（スナップショットの最終記録から取得）
-    prev_month_end = (today.replace(day=1) - datetime.timedelta(days=1)).isoformat()
-    if df_snapshots is not None and not df_snapshots.empty:
-        past = df_snapshots[df_snapshots["snap_date"] <= prev_month_end]
-        if not past.empty:
-            last = past.iloc[-1]
-            total = int(last["total_count"])
-            if total > 0:
-                data["prev_rate"] = round(int(last["done_count"]) / total * 100, 1)
-
-    # 納期リスク（未完了チケットの超過・7日以内接近）
-    today_s = today.isoformat()
-    approach_s = (today + datetime.timedelta(days=7)).isoformat()
-    for t_idx in collect_descendant_tickets(df_nodes, root_idx):
-        r = df_nodes.loc[t_idx]
-        status = str(r.get("status", ""))
-        if status in ("done", "cancel"):
-            continue
-        deadline = _date_str(r.get("deadline"))
-        if not deadline:
-            continue
-        pid = str(r.get("parent_id", ""))
-        row = {
-            "title":       str(r.get("title", "")),
-            "task":        str(df_nodes.loc[pid, "title"]) if pid in df_nodes.index else "",
-            "assigned_to": name(str(r.get("assigned_to", ""))),
-            "deadline":    deadline,
-        }
-        if deadline < today_s:
-            data["overdue"].append(row)
-        elif deadline <= approach_s:
-            data["approaching"].append(row)
-    return data
+def _section_bounds(lines: List[str], item_idx: str):
+    """lines 内で item_idx のセクション [開始行, 本文開始, 終了)（終了は次のH1〜H3/EOF）を返す。
+    見つからなければ None。"""
+    head_prefix = f"### IDX_{item_idx}"
+    start = None
+    for i, ln in enumerate(lines):
+        if ln.startswith(head_prefix) and (
+                ln[len(head_prefix):len(head_prefix) + 1] in ("", "_", " ")):
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if re.match(r"^#{1,3}\s", lines[j]):
+            end = j
+            break
+    return start, start + 1, end
 
 
-def save_progress_charts(df_snapshots, task_rows: list, basename: str,
-                         out_dir: str) -> List[str]:
-    """
-    進捗推移とタスク別見積vs実績の PNG を out_dir/charts/ に保存する。
-    戻り値: md から参照する相対パスのリスト [推移, 見積vs実績]
-    """
-    # matplotlib は遅延インポート（GUI 非依存の Agg バックエンドで描画）
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.font_manager as _fm
-    # システムにインストール済みのフォントのみ指定（AnalysisView と同方式）
-    installed = {f.name for f in _fm.fontManager.ttflist}
-    candidates = ["Hiragino Sans", "Yu Gothic", "Noto Sans CJK JP", "sans-serif"]
-    matplotlib.rcParams["font.family"] = [f for f in candidates
-                                          if f in installed or f == "sans-serif"]
-    import matplotlib.pyplot as plt
-
-    charts_dir = Path(out_dir) / "charts"
-    charts_dir.mkdir(parents=True, exist_ok=True)
-    rel_paths: List[str] = []
-
-    # 1. 進捗推移（完了チケット件数ベース %）
-    fig, ax = plt.subplots(figsize=(7, 3.2))
-    if df_snapshots is not None and not df_snapshots.empty:
-        dates = [str(d) for d in df_snapshots["snap_date"]]
-        rates = [int(d) / int(t) * 100 if int(t) else 0.0
-                 for d, t in zip(df_snapshots["done_count"],
-                                 df_snapshots["total_count"])]
-        ax.plot(dates, rates, marker="o", color="#1565C0")
-    ax.set_ylim(0, 105)
-    ax.set_ylabel("進捗率 (%)")
-    ax.set_title("進捗推移（完了チケット件数ベース）")
-    ax.grid(True, alpha=0.3)
-    fig.autofmt_xdate(rotation=45)
-    fig.tight_layout()
-    p1 = charts_dir / f"{basename}_progress.png"
-    fig.savefig(str(p1), dpi=110)
-    plt.close(fig)
-    rel_paths.append(f"charts/{p1.name}")
-
-    # 2. タスク別 見積 vs 実績（横棒）
-    fig, ax = plt.subplots(figsize=(7, max(2.4, 0.5 * len(task_rows) + 1.2)))
-    if task_rows:
-        titles = [r["title"] for r in task_rows][::-1]
-        ests = [r["estimated"] for r in task_rows][::-1]
-        acts = [r["actual"] for r in task_rows][::-1]
-        ypos = list(range(len(titles)))
-        ax.barh([y + 0.2 for y in ypos], ests, height=0.38,
-                label="見積", color="#90CAF9")
-        ax.barh([y - 0.2 for y in ypos], acts, height=0.38,
-                label="実績", color="#1565C0")
-        ax.set_yticks(ypos)
-        ax.set_yticklabels(titles)
-        ax.legend()
-    ax.set_xlabel("工数 (h)")
-    ax.set_title("タスク別 見積 vs 実績")
-    ax.grid(True, axis="x", alpha=0.3)
-    fig.tight_layout()
-    p2 = charts_dir / f"{basename}_evm.png"
-    fig.savefig(str(p2), dpi=110)
-    plt.close(fig)
-    rel_paths.append(f"charts/{p2.name}")
-    return rel_paths
+def read_section(md_text: str, item_idx: str) -> Optional[str]:
+    """md からアイテムのセクション本文を返す（見出し行は含まない）。無ければ None。"""
+    lines = md_text.splitlines()
+    b = _section_bounds(lines, item_idx)
+    if b is None:
+        return None
+    _start, body_start, end = b
+    return "\n".join(lines[body_start:end]).strip("\n")
 
 
-def build_progress_markdown(data: dict,
-                            chart_paths: Optional[List[str]] = None) -> str:
-    """collect_progress_data の結果から月次進捗レポートの Markdown を組み立てる"""
-    prog = data.get("progress", {})
-    month = data["as_of"][:7]
-    lines = [
-        f"# 月次進捗 {month}: {data['root_title']}",
-        "",
-        f"- 基準日: {data['as_of']}",
-    ]
-    if prog:
-        rate_s = (f"{prog['count_rate']:.1f}%"
-                  f"（{prog['done_count']}/{prog['total_count']} 件）")
-        hours_s = (f"{prog['hours_rate']:.1f}%"
-                   if prog.get("hours_rate") is not None else "—")
-        lines.append(
-            f"- 進捗率: 件数 {rate_s} / 工数 {hours_s}"
-            f"（実績 {prog['actual_hours']:.2f}h / 見積 {prog['estimated_hours']:.2f}h）")
-        if data.get("prev_rate") is not None:
-            diff = prog["count_rate"] - data["prev_rate"]
-            lines.append(f"- 先月末比: {diff:+.1f}pt（先月末 {data['prev_rate']:.1f}%）")
-    lines.append("")
+def upsert_section(md_text: str, item_idx: str, item_title: str,
+                   body: str) -> str:
+    """md の該当 IDX セクションの本文を body で置換する。無ければ末尾に追記する。"""
+    header = section_header(item_idx, item_title)
+    body = body.rstrip("\n")
+    lines = md_text.splitlines() if md_text else []
+    b = _section_bounds(lines, item_idx)
+    if b is None:
+        # 新規追記
+        out = list(lines)
+        if out and out[-1].strip() != "":
+            out.append("")
+        out.append(header)
+        if body:
+            out.append(body)
+        out.append("")
+        return "\n".join(out).rstrip("\n") + "\n"
+    start, _body_start, end = b
+    new_block = [header]
+    if body:
+        new_block.append(body)
+    new_block.append("")  # セクション間の空行
+    out = lines[:start] + new_block + lines[end:]
+    return "\n".join(out).rstrip("\n") + "\n"
 
-    if chart_paths:
-        lines += ["## 進捗推移", "", f"![]({chart_paths[0]})", ""]
 
-    lines += ["## 見積 vs 実績（タスク別）", ""]
-    if chart_paths and len(chart_paths) > 1:
-        lines += [f"![]({chart_paths[1]})", ""]
-    lines += _ticket_table(data["tasks"], [
-        ("タスク",  lambda r: r["title"]),
-        ("見積(h)", lambda r: f"{r['estimated']:.2f}"),
-        ("実績(h)", lambda r: f"{r['actual']:.2f}"),
-        ("残(h)",   lambda r: f"{r['remaining']:.2f}"),
-        ("進捗率",  lambda r: f"{r['count_rate']:.1f}% "
-                              f"({r['done_count']}/{r['total_count']})"),
-    ])
-
-    lines += ["", "## スケジュール状況", ""]
-    lines += _ticket_table(data["tasks"], [
-        ("タスク",     lambda r: r["title"]),
-        ("開始可能日", lambda r: r["start_available"] or "-"),
-        ("納期",       lambda r: r["deadline"] or "-"),
-        ("状態",       lambda r: r["state"]),
-    ])
-
-    lines += ["", "## 課題・リスク（納期）", ""]
-    risk_rows = ([dict(r, _risk="超過") for r in data["overdue"]]
-                 + [dict(r, _risk="接近") for r in data["approaching"]])
-    lines += _ticket_table(risk_rows, [
-        ("区分",     lambda r: r["_risk"]),
-        ("チケット", lambda r: r["title"]),
-        ("タスク",   lambda r: r["task"]),
-        ("担当",     lambda r: r["assigned_to"]),
-        ("納期",     lambda r: r["deadline"]),
-    ])
-    return "\n".join(lines) + "\n"
+def extract_md_links(text: str):
+    """本文中の [label](target) を全て抽出して [(label, target), …] を返す（複数対応）。"""
+    if not text:
+        return []
+    return [(m.group(1).strip(), m.group(2).strip())
+            for m in re.finditer(r"\[([^\]]+)\]\(([^)]+)\)", text)]
 
 
 # ---------- ダッシュボード・個人振り返り用集計 ----------
