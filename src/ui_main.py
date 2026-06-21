@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QFrame, QStackedWidget, QSizePolicy, QToolBar, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QSpinBox, QCheckBox,
     QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu,
-    QApplication, QStyle,
+    QApplication, QStyle, QProgressBar, QGridLayout,
 )
 from pathlib import Path
 
@@ -2748,10 +2748,59 @@ class DetailPane(QWidget):
         "構成: 1) 成果サマリー 2) 進行中と見通し 3) 課題・リスク 4) 所感（叩き台）\n"
         "数値はデータのまま正確に使い、データにない事実は創作しないでください。")
 
+    # ── カード/バッジ表示用パレット ──
+    # 種別バッジ（RoadmapView と同系統の配色）
+    _TYPE_LABEL = {
+        "project1": "P1", "project2": "P2",
+        "project3": "P3", "project4": "P4",
+        "task": "Task",   "ticket":   "Ticket",
+    }
+    _TYPE_BG = {
+        "project1": "#E3F2FD", "project2": "#E8F5E9",
+        "project3": "#FFF9C4", "project4": "#F3E5F5",
+        "task":     "#ECEFF1", "ticket":   "#E0F7FA",
+    }
+    _TYPE_FG = {
+        "project1": "#1565C0", "project2": "#2E7D32",
+        "project3": "#F57F17", "project4": "#6A1B9A",
+        "task":     "#37474F", "ticket":   "#00838F",
+    }
+    # ステータスバッジ（ラベル, 背景色, 文字色）
+    _STATUS_INFO = {
+        "todo":      ("未着手", "#FFF3E0", "#E65100"),
+        "done":      ("完了",   "#E8F5E9", "#2E7D32"),
+        "cancel":    ("中止",   "#ECEFF1", "#616161"),
+        "regularly": ("定常",   "#E0F2F1", "#00695C"),
+        "deleted":   ("削除",   "#FFEBEE", "#C62828"),
+    }
+    # レポート操作ボタン（保存=青系 / LLM=紫系）
+    _STYLE_BTN_PRIMARY = (
+        "QPushButton { background:#1E88E5; color:white; border:1px solid #1565C0;"
+        " border-radius:4px; padding:4px 10px; font-weight:bold; }"
+        "QPushButton:hover { background:#1565C0; }"
+        "QPushButton:pressed { background:#0D47A1; }"
+        "QPushButton:disabled { background:#CFD8DC; color:#90A4AE;"
+        " border-color:#B0BEC5; }"
+    )
+    _STYLE_BTN_ACCENT = (
+        "QPushButton { background:#EDE7F6; color:#5E35B1; border:1px solid #B39DDB;"
+        " border-radius:4px; padding:4px 10px; font-weight:bold; }"
+        "QPushButton:hover { background:#D1C4E9; }"
+        "QPushButton:disabled { background:#F5F5F5; color:#B0BEC5;"
+        " border-color:#E0E0E0; }"
+    )
+
     def __init__(self, state):
         super().__init__()
         self.state = state
         self._node_idx: Optional[str] = None
+
+        # 詳細ペイン全体のトーン（淡い背景＋白カード）
+        self.setStyleSheet(
+            "QFrame#detailCard { background:#FFFFFF; border:1px solid #E0E0E0;"
+            " border-radius:8px; }"
+            "QWidget#detailFormHost { background:#F4F6F8; }"
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -2759,13 +2808,16 @@ class DetailPane(QWidget):
 
         vsplit = QSplitter(Qt.Orientation.Vertical)
 
-        # ── 上: ノード詳細フォーム ──
+        # ── 上: ノード詳細（カード表示）──
         self.form_area = QScrollArea()
         self.form_area.setWidgetResizable(True)
         self.form_area.setFrameShape(QFrame.Shape.NoFrame)
         form_widget = QWidget()
-        self.form = QFormLayout(form_widget)
-        self.form.setSpacing(4)
+        form_widget.setObjectName("detailFormHost")
+        self.form_box = QVBoxLayout(form_widget)
+        self.form_box.setContentsMargins(4, 4, 4, 4)
+        self.form_box.setSpacing(8)
+        self.form_box.addStretch()  # カードを上詰めにする
         self.form_area.setWidget(form_widget)
         vsplit.addWidget(self.form_area)
 
@@ -2780,6 +2832,9 @@ class DetailPane(QWidget):
 
         self.report_title_lbl = QLabel("📋 レポート")
         self.report_title_lbl.setWordWrap(True)
+        self.report_title_lbl.setStyleSheet(
+            "QLabel { background:#E3F2FD; color:#1565C0; border-radius:6px;"
+            " padding:6px 8px; font-weight:bold; font-size:9pt; }")
         rlay.addWidget(self.report_title_lbl)
 
         # 月ナビ ◀ [yyyy/mm] ▶
@@ -2790,6 +2845,8 @@ class DetailPane(QWidget):
         self.rep_prev_btn.setFixedWidth(28)
         self.rep_prev_btn.clicked.connect(lambda: self._rep_shift_month(-1))
         self.rep_month_lbl = QLabel("")
+        self.rep_month_lbl.setStyleSheet(
+            "QLabel { font-weight:bold; color:#37474F; padding:0 4px; }")
         self.rep_next_btn = QPushButton("▶")
         self.rep_next_btn.setStyleSheet(STYLE_BUTTON)
         self.rep_next_btn.setFixedWidth(28)
@@ -2812,11 +2869,11 @@ class DetailPane(QWidget):
         self.rep_insert_btn.setToolTip("選択アイテム配下の実績を集約して本文に差し込む")
         self.rep_insert_btn.clicked.connect(self._on_insert_actuals)
         self.rep_save_btn = QPushButton("💾 保存")
-        self.rep_save_btn.setStyleSheet(STYLE_BUTTON)
+        self.rep_save_btn.setStyleSheet(self._STYLE_BTN_PRIMARY)
         self.rep_save_btn.setToolTip("この月の P2 ファイルの該当セクションへ保存")
         self.rep_save_btn.clicked.connect(self._on_save_report)
         self.rep_llm_btn = QPushButton("🤖 LLM")
-        self.rep_llm_btn.setStyleSheet(STYLE_BUTTON)
+        self.rep_llm_btn.setStyleSheet(self._STYLE_BTN_ACCENT)
         self.rep_llm_btn.setToolTip("LLM 用プロンプト + 本文をクリップボードへコピー")
         self.rep_llm_btn.clicked.connect(self._on_copy_llm)
         tbar.addWidget(self.rep_insert_btn)
@@ -2827,13 +2884,19 @@ class DetailPane(QWidget):
 
         self.report_edit = QTextEdit()
         self.report_edit.setAcceptRichText(False)
+        self.report_edit.setStyleSheet(
+            "QTextEdit { border:1px solid #CFD8DC; border-radius:6px;"
+            " padding:6px; background:#FFFFFF; }")
         self.report_edit.setPlaceholderText(
             "このアイテムの当月レポート（自由記述。[名前](パス/URL) でリンクを貼れます）")
         self.report_edit.textChanged.connect(self._on_report_text_changed)
         rlay.addWidget(self.report_edit, stretch=1)
 
         # 🔗 抽出リンク一覧
-        rlay.addWidget(QLabel("🔗 リンク"))
+        _links_lbl = QLabel("🔗 リンク")
+        _links_lbl.setStyleSheet(
+            "QLabel { color:#546E7A; font-size:8pt; font-weight:bold; }")
+        rlay.addWidget(_links_lbl)
         self.links_area = QScrollArea()
         self.links_area.setWidgetResizable(True)
         self.links_area.setFrameShape(QFrame.Shape.NoFrame)
@@ -2865,32 +2928,200 @@ class DetailPane(QWidget):
             self._rebuild_form(self._node_idx)
             self._load_report()
 
+    # ── 詳細カード生成ヘルパー ──
+
+    @staticmethod
+    def _make_badge(text: str, bg: str, fg: str) -> QLabel:
+        """角丸ピル風のバッジラベルを生成する"""
+        lbl = QLabel(text)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        lbl.setStyleSheet(
+            f"QLabel {{ background:{bg}; color:{fg}; border-radius:9px;"
+            f" padding:2px 10px; font-size:9pt; font-weight:bold; }}")
+        return lbl
+
+    def _make_card(self, title: str = ""):
+        """白カード QFrame と、本文を積む QVBoxLayout を返す"""
+        card = QFrame()
+        card.setObjectName("detailCard")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(10, 8, 10, 10)
+        v.setSpacing(6)
+        if title:
+            head = QLabel(title)
+            head.setStyleSheet(
+                "QLabel { color:#90A4AE; font-size:8pt; font-weight:bold; }")
+            v.addWidget(head)
+        return card, v
+
+    @staticmethod
+    def _field_widget(caption: str, value: str) -> QWidget:
+        """小見出し(灰)＋値(太字) を縦に並べたミニ項目ウィジェット"""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(1)
+        cap = QLabel(caption)
+        cap.setStyleSheet("QLabel { color:#90A4AE; font-size:8pt; }")
+        val = QLabel(value if value else "—")
+        val.setWordWrap(True)
+        val.setStyleSheet(
+            "QLabel { color:#37474F; font-size:9pt; font-weight:bold; }")
+        v.addWidget(cap)
+        v.addWidget(val)
+        return w
+
+    def _fields_card(self, title: str, fields: list):
+        """(見出し, 値) のリストを2列グリッドで並べたカードを返す。
+        値が空の項目は省略し、表示項目が無ければ None を返す。"""
+        shown = [(c, v) for c, v in fields if v]
+        if not shown:
+            return None
+        card, v = self._make_card(title)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        for i, (cap, val) in enumerate(shown):
+            grid.addWidget(self._field_widget(cap, val), i // 2, i % 2)
+        v.addLayout(grid)
+        return card
+
+    def _progress_widget(self, actual: float, est: float) -> QWidget:
+        """実績/見積の進捗バー＋数値ラベル。見積が無い場合はバーを省く"""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(4)
+        if est and est > 0:
+            pct = int(round(min(actual / est, 1.0) * 100))
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(pct)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(10)
+            # 見積超過は橙、範囲内は緑
+            chunk = "#FB8C00" if actual > est else "#43A047"
+            bar.setStyleSheet(
+                "QProgressBar { background:#ECEFF1; border:none;"
+                " border-radius:5px; }"
+                f"QProgressBar::chunk {{ background:{chunk};"
+                " border-radius:5px; }")
+            cap = QLabel(f"実績 {actual:.1f} / 見積 {est:.1f} h　（{pct}%）")
+            v.addWidget(bar)
+            v.addWidget(cap)
+        else:
+            cap = QLabel(f"実績 {actual:.1f} h　（見積 未設定）")
+            v.addWidget(cap)
+        cap.setStyleSheet("QLabel { color:#546E7A; font-size:9pt; }")
+        return w
+
+    def _swatch(self, color_name: str) -> QWidget:
+        """表示色の丸チップ＋色名"""
+        hex_v = DB.COLOR_OPTIONS.get(color_name, "#BDBDBD")
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(5)
+        dot = QLabel()
+        dot.setFixedSize(14, 14)
+        dot.setStyleSheet(
+            f"QLabel {{ background:{hex_v}; border-radius:7px;"
+            " border:1px solid #B0BEC5; }")
+        name = QLabel(color_name or "—")
+        name.setStyleSheet("QLabel { color:#90A4AE; font-size:8pt; }")
+        h.addWidget(dot)
+        h.addWidget(name)
+        h.addStretch()
+        return w
+
     def _rebuild_form(self, idx: str) -> None:
-        """選択ノードのフィールドをフォームに表示する"""
-        while self.form.rowCount():
-            self.form.removeRow(0)
+        """選択ノードの詳細をカード形式で再構築する"""
+        # 既存カードを全削除
+        while self.form_box.count():
+            item = self.form_box.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
         if not idx or idx not in self.state.df_nodes.index:
+            self.form_box.addStretch()
             return
         row = self.state.df_nodes.loc[idx]
-        fields = [
-            ("種類",       row.get("node_type", "")),
-            ("タイトル",   row.get("title", "")),
-            ("ステータス", row.get("status", "")),
-            ("順序",       row.get("priority", "")),
-            ("担当者",     self.state.display_name(str(row.get("assigned_to", "")))),
-            ("見積工数(h)", row.get("estimated_hours", "")),
-            ("実績工数(h)", row.get("actual_hours", "")),
-            ("開始可能日", row.get("start_available", "")),
-            ("納期",       row.get("deadline", "")),
-            ("実績開始日", row.get("actual_start", "")),
-            ("実績完了日", row.get("actual_end", "")),
-            ("表示色",     row.get("color", "")),
-            ("メモ",       row.get("memo", "")),
-        ]
-        for label, val in fields:
-            lbl = QLabel(str(val) if val is not None else "")
-            lbl.setWordWrap(True)
-            self.form.addRow(f"{label}:", lbl)
+
+        def _s(key: str) -> str:
+            v = row.get(key, "")
+            return "" if v is None else str(v)
+
+        # 1) ヘッダーカード（種別バッジ＋ステータス＋タイトル＋表示色）
+        ntype = _s("node_type")
+        header, hv = self._make_card("")
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        top.addWidget(self._make_badge(
+            self._TYPE_LABEL.get(ntype, ntype or "—"),
+            self._TYPE_BG.get(ntype, "#ECEFF1"),
+            self._TYPE_FG.get(ntype, "#37474F")))
+        st = _s("status")
+        if st:
+            s_label, s_bg, s_fg = self._STATUS_INFO.get(
+                st, (st, "#ECEFF1", "#616161"))
+            top.addWidget(self._make_badge(s_label, s_bg, s_fg))
+        top.addStretch()
+        hv.addLayout(top)
+        title = QLabel(_s("title") or "（無題）")
+        title.setWordWrap(True)
+        title.setStyleSheet(
+            "QLabel { color:#263238; font-size:12pt; font-weight:bold; }")
+        hv.addWidget(title)
+        if _s("color"):
+            hv.addWidget(self._swatch(_s("color")))
+        self.form_box.addWidget(header)
+
+        # 2) 工数カード（進捗バー）
+        try:
+            est = float(row.get("estimated_hours") or 0)
+        except (TypeError, ValueError):
+            est = 0.0
+        try:
+            act = float(row.get("actual_hours") or 0)
+        except (TypeError, ValueError):
+            act = 0.0
+        prog_card, pv = self._make_card("工数")
+        pv.addWidget(self._progress_widget(act, est))
+        self.form_box.addWidget(prog_card)
+
+        # 3) 日程カード
+        sched = self._fields_card("日程", [
+            ("開始可能日", _s("start_available")),
+            ("納期",       _s("deadline")),
+            ("実績開始日", _s("actual_start")),
+            ("実績完了日", _s("actual_end")),
+        ])
+        if sched:
+            self.form_box.addWidget(sched)
+
+        # 4) 基本情報カード
+        assignee = (self.state.display_name(_s("assigned_to"))
+                    if _s("assigned_to") else "")
+        basic = self._fields_card("基本情報", [
+            ("担当者", assignee),
+            ("順序",   _s("priority")),
+        ])
+        if basic:
+            self.form_box.addWidget(basic)
+
+        # 5) メモカード
+        memo = _s("memo")
+        if memo:
+            memo_card, mv = self._make_card("メモ")
+            mlbl = QLabel(memo)
+            mlbl.setWordWrap(True)
+            mlbl.setStyleSheet("QLabel { color:#37474F; font-size:9pt; }")
+            mv.addWidget(mlbl)
+            self.form_box.addWidget(memo_card)
+
+        self.form_box.addStretch()
 
     def _open_link(self, link: str) -> None:
         """リンク先を OS の既定アプリで開く。URL とローカルパスの両方に対応。"""
@@ -2995,7 +3226,11 @@ class DetailPane(QWidget):
         for label, target in links:
             btn = QPushButton(f"[{label}]")
             btn.setToolTip(target)
-            btn.setStyleSheet(STYLE_BUTTON)
+            btn.setStyleSheet(
+                "QPushButton { background:#E8EAF6; color:#3949AB;"
+                " border:1px solid #C5CAE9; border-radius:10px;"
+                " padding:3px 10px; text-align:left; }"
+                "QPushButton:hover { background:#C5CAE9; }")
             btn.clicked.connect(lambda _=False, t=target: self._open_link(t))
             self.links_layout.addWidget(btn)
 
