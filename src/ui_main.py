@@ -37,10 +37,9 @@ IDX_SEARCH  = 4
 IDX_TEAM    = 5
 IDX_ASSIGN  = 6
 IDX_AIIMPORT = 7
-IDX_MEMO    = 8
-IDX_VERSION  = 9
-IDX_CONFIG   = 10
-IDX_TODAY    = 11
+IDX_VERSION  = 8
+IDX_CONFIG   = 9
+IDX_TODAY    = 10
 
 
 # ---------- 日次スケジュール用カスタムデリゲート ----------
@@ -867,18 +866,23 @@ class MainWindow(QMainWindow):
             ("🔍 Search",  IDX_SEARCH),
             ("📨 Request", IDX_ASSIGN),
             ("🤖 AI取込",  IDX_AIIMPORT),
-            ("📝 Memo",    IDX_MEMO),
             ("📈 Analyze", IDX_ANALYSIS),
             ("ℹ Version", IDX_VERSION),
             ("⚙ Config",  IDX_CONFIG),
         ]
         self._tab_style = _TAB_STYLE  # バッジリセット時に使用
         self._tab_btns: dict = {}
-        for label, view_idx in views:
-            btn = QPushButton(label)
+        # タブの並び順（一番左を1番として Ctrl+番号 と対応させる）
+        self._view_order = [view_idx for _, view_idx in views]
+        for n, (label, view_idx) in enumerate(views, start=1):
+            # 並び順に合わせて番号を付与（Ctrl+番号 のショートカットと一致）
+            num_label = f"{n} {label}" if n <= 9 else label
+            btn = QPushButton(num_label)
             btn.setCheckable(True)
             btn.setStyleSheet(_TAB_STYLE)
             btn.clicked.connect(lambda checked, vi=view_idx: self._switch_view(vi))
+            if n <= 9:
+                btn.setToolTip(f"Ctrl+{n} で切替")
             tb.addWidget(btn)
             self._tab_btns[view_idx] = btn
 
@@ -887,7 +891,7 @@ class MainWindow(QMainWindow):
         # 詳細ペイン表示トグル（main/plan/edit で右の詳細ペインを開閉）
         self.detail_toggle_btn = QPushButton("🔎 詳細")
         self.detail_toggle_btn.setCheckable(True)
-        self.detail_toggle_btn.setChecked(True)
+        self.detail_toggle_btn.setChecked(self.state.config.detail_pane_open)
         self.detail_toggle_btn.setStyleSheet(STYLE_BUTTON)
         self.detail_toggle_btn.setToolTip("右の詳細ペインの表示/非表示（main/plan/edit）")
         self.detail_toggle_btn.toggled.connect(self._on_toggle_detail)
@@ -965,7 +969,7 @@ class MainWindow(QMainWindow):
 
         # 右端の共通詳細ペイン（main/plan/edit で表示、トグルで開閉）
         self.detail_pane = DetailPane(self.state)
-        self._detail_visible = True  # トグルボタンの状態
+        self._detail_visible = self.state.config.detail_pane_open  # トグルボタンの状態
 
         # 外側スプリッター（左: 日次 / 中: スタック / 右: 詳細）
         outer = QSplitter(Qt.Orientation.Horizontal)
@@ -984,7 +988,6 @@ class MainWindow(QMainWindow):
         self.search_view = ui_sub.SearchView(self.state)
         self.team_view   = ui_sub.TeamLogView(self.state)
         self.assign_view = ui_sub.AssignmentView(self.state)
-        self.memo_view   = ui_sub.MemoView(self.state)
         self.ver_view    = ui_sub.VersionView(self.state, self.version)
         self.config_view     = ui_sub.ConfigView(self.state)
         self.ai_import_view  = ui_sub.AIImportView(self.state)
@@ -993,7 +996,7 @@ class MainWindow(QMainWindow):
         # 追加順は IDX_* 定数と一致させること（QStackedWidget のインデックス）
         for w in [self.main_pane, self.gantt_view, self.road_view,
                   self.anal_view, self.search_view, self.team_view,
-                  self.assign_view, self.ai_import_view, self.memo_view,
+                  self.assign_view, self.ai_import_view,
                   self.ver_view, self.config_view,
                   self.dashboard_view]:
             self.stack.addWidget(w)
@@ -1031,12 +1034,15 @@ class MainWindow(QMainWindow):
     # ---------- ショートカット ----------
 
     def _setup_shortcuts(self) -> None:
-        """キーボードショートカットを登録する（Ctrl+S: 保存、Ctrl+R: 読込、Ctrl+1〜9: ビュー切替）"""
+        """キーボードショートカットを登録する（Ctrl+S: 保存、Ctrl+R: 読込、Ctrl+1〜9: ビュー切替）
+
+        Ctrl+番号 はタブの並び順（一番左が1）に対応させる。
+        """
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._on_save)
         QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._on_load)
-        for i, vi in enumerate(range(1, 10)):
-            QShortcut(QKeySequence(f"Ctrl+{vi}"), self).activated.connect(
-                lambda checked=False, idx=i: self._switch_view(idx)
+        for n, view_idx in enumerate(self._view_order[:9], start=1):
+            QShortcut(QKeySequence(f"Ctrl+{n}"), self).activated.connect(
+                lambda checked=False, vi=view_idx: self._switch_view(vi)
             )
 
     # ---------- ビュー切替 ----------
@@ -2934,9 +2940,11 @@ class DetailPane(QWidget):
             return
 
         path_titles = LG.node_path_titles(self.state.df_nodes, idx)
-        breadcrumb = " / ".join(path_titles)
+        # 階層ごとに改行＆インデントして表示（横長で見切れるのを防ぐ）
+        breadcrumb = "\n".join(
+            f"{'　' * i}{t}" for i, t in enumerate(path_titles))
         self.report_title_lbl.setText(
-            f"📋 今月のレポート ({self._rep_month.strftime('%Y/%m')}): {breadcrumb}")
+            f"📋 今月のレポート ({self._rep_month.strftime('%Y/%m')})\n{breadcrumb}")
 
         self.report_edit.setEnabled(True)
         self.rep_insert_btn.setEnabled(True)

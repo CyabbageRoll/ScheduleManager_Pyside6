@@ -828,10 +828,10 @@ def test_daily_log_markdown(state):
 
 
 def test_daily_export(win):
-    """MemoView デイリーログ出力のテスト"""
+    """当日ログ出力（Main タブ＝GanttView へ移設）のテスト"""
     print("\n[18] デイリーログ出力 UI テスト")
     try:
-        mv = win.memo_view
+        mv = win.gantt_view
         with tempfile.TemporaryDirectory() as td:
             win.state.config.report_output_dir = td
             mv._on_export_daily()
@@ -1183,13 +1183,19 @@ def test_detail_pane_link(win):
 
     # トグルと、タブによる表示制御
     try:
+        # 既定では詳細ペインは閉じている（detail_pane_open=False）
+        win._on_toggle_detail(False)
         win._switch_view(IDX_GANTT)
-        assert win.detail_pane.isVisible(), "main で表示されるべき"
+        assert not win.detail_pane.isVisible(), "既定（トグルOFF）では非表示であるべき"
+        # トグル ON → main/plan で表示、team では非表示
+        win._on_toggle_detail(True)
+        win._switch_view(IDX_GANTT)
+        assert win.detail_pane.isVisible(), "トグルONの main で表示されるべき"
         win._switch_view(IDX_ROADMAP)
-        assert win.detail_pane.isVisible(), "plan で表示されるべき"
+        assert win.detail_pane.isVisible(), "トグルONの plan で表示されるべき"
         win._switch_view(IDX_TEAM)
         assert not win.detail_pane.isVisible(), "team では非表示であるべき"
-        # トグル OFF → main でも非表示
+        # main でトグル OFF → 非表示、ON → 再表示
         win._switch_view(IDX_MAIN)
         assert win.detail_pane.isVisible()
         win._on_toggle_detail(False)

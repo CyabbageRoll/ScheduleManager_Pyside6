@@ -118,6 +118,14 @@ class GanttView(QWidget):
         filter_row.addWidget(QLabel("〜"))
         filter_row.addWidget(self.to_btn)
         filter_row.addStretch()
+
+        # 当日ログ md 出力（旧 Memo タブから移設）
+        self.daily_export_btn = QPushButton("📅 当日ログをmd出力")
+        self.daily_export_btn.setStyleSheet(STYLE_BUTTON)
+        self.daily_export_btn.setToolTip(
+            "表示中の日付の作業ログ（スケジュール+日次ログ）を Markdown 出力する")
+        self.daily_export_btn.clicked.connect(self._on_export_daily)
+        filter_row.addWidget(self.daily_export_btn)
         layout.addLayout(filter_row)
 
         # シグナル接続
@@ -146,6 +154,42 @@ class GanttView(QWidget):
 
         self.info = InfoLabel()
         layout.addWidget(self.info)
+
+    def _on_export_daily(self) -> None:
+        """表示中の日付の作業ログ（スケジュール+日次ログ）を Markdown 出力する"""
+        date_str = self.state.current_date
+        md = LG.build_daily_log_markdown(
+            self.state.df_daily, self.state.df_nodes,
+            self.state.df_daily_log, date_str, self.state.user)
+        fname = f"{date_str}.md"
+        out_dir = (self.state.config.report_output_dir or "").strip()
+        if out_dir:
+            try:
+                daily_dir = Path(out_dir) / "daily"
+                daily_dir.mkdir(parents=True, exist_ok=True)
+                path = daily_dir / fname
+                if path.exists():
+                    ans = QMessageBox.question(
+                        self, "上書き確認",
+                        f"{path.name} は既に存在します。上書きしますか？")
+                    if ans != QMessageBox.StandardButton.Yes:
+                        return
+                path.write_text(md, encoding="utf-8")
+                self.info.set_info(f"作業ログを出力しました: {path}")
+                return
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "保存エラー",
+                    f"output_dir への保存に失敗しました:\n{e}\n保存先を選択してください")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "作業ログ保存", str(Path.home() / fname), "Markdown (*.md)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(md, encoding="utf-8")
+            self.info.set_info(f"作業ログを出力しました: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", str(e))
 
     def _get_status_filter(self) -> str:
         """選択中のステータスフィルターを返す（"all" or ステータス名）"""
@@ -1090,6 +1134,12 @@ class RoadmapView(QWidget):
             if item.data(0, Qt.ItemDataRole.UserRole) is not None
         }
         self._rebuild_table()
+        # 左の絞り込みツリーでクリックしたノードも詳細ペインの対象にする
+        cur = self.tree.currentItem()
+        if cur is not None:
+            cur_idx = cur.data(0, Qt.ItemDataRole.UserRole)
+            if cur_idx is not None:
+                self.node_selected.emit(cur_idx)
 
     def _on_filter_own_toggle(self, checked: bool) -> None:
         self._filter_own = checked
@@ -2992,83 +3042,6 @@ class AssignmentView(QWidget):
         self.refresh()
 
 
-# ---------- メモ ----------
-
-class MemoView(QWidget):
-    def __init__(self, state):
-        super().__init__()
-        self.state = state
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-
-        layout.addWidget(QLabel("📝 メモ（個人用）"))
-        layout.addWidget(Separator())
-
-        self.editor = QTextEdit()
-        self.editor.setFont(QFont("Courier New", 10))
-        self.editor.textChanged.connect(self._on_changed)
-        layout.addWidget(self.editor, stretch=1)
-
-        btn_row = ButtonRow([
-            ("保存", self._on_save),
-            ("📅 当日ログをmd出力", self._on_export_daily),
-        ])
-        layout.addWidget(btn_row)
-
-        self.info = InfoLabel()
-        layout.addWidget(self.info)
-
-    def refresh(self) -> None:
-        self.editor.blockSignals(True)
-        self.editor.setPlainText(self.state.memo_text)
-        self.editor.blockSignals(False)
-
-    def _on_export_daily(self) -> None:
-        """表示中の日付の作業ログ（スケジュール+日次ログ）を Markdown 出力する"""
-        date_str = self.state.current_date
-        md = LG.build_daily_log_markdown(
-            self.state.df_daily, self.state.df_nodes,
-            self.state.df_daily_log, date_str, self.state.user)
-        fname = f"{date_str}.md"
-        out_dir = (self.state.config.report_output_dir or "").strip()
-        if out_dir:
-            try:
-                daily_dir = Path(out_dir) / "daily"
-                daily_dir.mkdir(parents=True, exist_ok=True)
-                path = daily_dir / fname
-                if path.exists():
-                    ans = QMessageBox.question(
-                        self, "上書き確認",
-                        f"{path.name} は既に存在します。上書きしますか？")
-                    if ans != QMessageBox.StandardButton.Yes:
-                        return
-                path.write_text(md, encoding="utf-8")
-                self.info.set_info(f"作業ログを出力しました: {path}")
-                return
-            except Exception as e:
-                QMessageBox.warning(
-                    self, "保存エラー",
-                    f"output_dir への保存に失敗しました:\n{e}\n保存先を選択してください")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "作業ログ保存", str(Path.home() / fname), "Markdown (*.md)")
-        if not path:
-            return
-        try:
-            Path(path).write_text(md, encoding="utf-8")
-            self.info.set_info(f"作業ログを出力しました: {path}")
-        except Exception as e:
-            QMessageBox.critical(self, "保存エラー", str(e))
-
-    def _on_changed(self) -> None:
-        self.state.memo_text = self.editor.toPlainText()
-        self.state.schedule_modified = True
-        self.state.notify_dirty()
-
-    def _on_save(self) -> None:
-        self.state.db.save_memo(self.state.user, self.state.memo_text)
-        self.info.set_info("メモを保存しました")
-
-
 # ---------- バージョン・レポート ----------
 
 class VersionView(QWidget):
@@ -3315,6 +3288,9 @@ class ConfigView(QWidget):
         self._spin("gui_font_size",     cfg.font_size,     fl, "font_size:",     6, 24)
         self._text("gui_start_tab",     cfg.start_tab,     fl,
                    "start_tab (today/main/edit/plan):")
+        self._text("gui_detail_pane",
+                   "open" if cfg.detail_pane_open else "closed", fl,
+                   "detail_pane (open/closed):")
 
     def _build_section_schedule(self) -> None:
         cfg = self.state.config
@@ -3388,6 +3364,7 @@ class ConfigView(QWidget):
         _set("di_overwork",      ", ".join(cfg.overwork_options))
         _set("report_output_dir", cfg.report_output_dir)
         _set("gui_start_tab",    cfg.start_tab)
+        _set("gui_detail_pane",  "open" if cfg.detail_pane_open else "closed")
         _set("pomo_work",        cfg.pomodoro_work_minutes)
         _set("pomo_break",       cfg.pomodoro_break_minutes)
 
@@ -3432,6 +3409,7 @@ class ConfigView(QWidget):
         parser.set("GUI", "window_height", self._get("gui_window_height"))
         parser.set("GUI", "font_size",     self._get("gui_font_size"))
         parser.set("GUI", "start_tab",     self._get("gui_start_tab"))
+        parser.set("GUI", "detail_pane",   self._get("gui_detail_pane"))
 
         _ensure("Schedule")
         parser.set("Schedule", "daily_begin_time", self._get("sch_begin"))

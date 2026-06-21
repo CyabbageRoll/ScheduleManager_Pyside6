@@ -57,6 +57,8 @@ class AppConfig:
     font_size: int = 9
     # 起動時に表示するタブ（today / main / edit / plan）
     start_tab: str = "today"
+    # 詳細ペインを起動時に開くか（True=開く / False=閉じる）
+    detail_pane_open: bool = False
 
     # [Schedule]
     daily_begin_time: int = 6
@@ -130,6 +132,8 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
         cfg.window_height = parser.getint("GUI", "window_height", fallback=cfg.window_height)
         cfg.font_size     = parser.getint("GUI", "font_size",     fallback=cfg.font_size)
         cfg.start_tab     = parser.get("GUI", "start_tab", fallback=cfg.start_tab).strip().lower()
+        cfg.detail_pane_open = (parser.get("GUI", "detail_pane", fallback="closed")
+                                .strip().lower() == "open")
 
     # [Schedule]
     if parser.has_section("Schedule"):
