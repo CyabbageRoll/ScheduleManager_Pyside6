@@ -215,13 +215,18 @@
   <a href="#screen">画面の見かた</a>
 
   <div class="section-head">機能説明</div>
+  <a href="#today-tab">🏠 Today（ダッシュボード）</a>
   <a href="#main-tab">📊 Main（ガントチャート）</a>
   <a class="indent" href="#daily-schedule">日次スケジュール</a>
   <a class="indent" href="#gantt-view">ガント表示</a>
+  <a class="indent" href="#daily-export">当日ログmd出力</a>
+  <a href="#detail-pane">🔎 詳細ペイン（レポート）</a>
+  <a href="#pomodoro">🍅 ポモドーロタイマー</a>
   <a href="#plan-tab">🗺 Plan（ロードマップ）</a>
   <a href="#edit-tab">✏ Edit（データ編集）</a>
   <a class="indent" href="#edit-tree">階層ツリー</a>
   <a class="indent" href="#edit-table">チケット一覧テーブル</a>
+  <a class="indent" href="#edit-template">テンプレートから一括作成</a>
   <a class="indent" href="#edit-priority">優先順位（priority）</a>
   <a class="indent" href="#edit-save">保存のしくみ</a>
   <a href="#team-tab">👥 Team（チームログ）</a>
@@ -230,8 +235,8 @@
   <a class="indent" href="#request-send">依頼を送る</a>
   <a class="indent" href="#request-recv">受信した依頼を処理する</a>
   <a href="#ai-tab">🤖 AI取込</a>
-  <a href="#memo-tab">📝 Memo（メモ）</a>
   <a href="#analyze-tab">📈 Analyze（分析）</a>
+  <a class="indent" href="#analyze-personal">個人振り返り</a>
   <a href="#version-tab">ℹ Version</a>
   <a href="#config-tab">⚙ Config（設定）</a>
 
@@ -260,13 +265,16 @@
   <h4>主な機能</h4>
   <ul>
     <li><strong>階層管理</strong>: Project1〜Project4 → Task → Ticket の6階層でタスクを体系化</li>
+    <li><strong>ダッシュボード（Today）</strong>: 起動直後に「今日やること・気にすべきこと」を1画面に集約</li>
     <li><strong>ガントチャート（Main）</strong>: 誰がいつ何をするかを日単位で可視化</li>
     <li><strong>ロードマップ（Plan）</strong>: 日/週/月単位の長期スケジュール表示</li>
     <li><strong>日次スケジュール</strong>: 15分刻みでその日の作業を記録</li>
+    <li><strong>詳細ペイン・レポート（🔎 詳細）</strong>: ノード詳細の確認と、月次・Project2 単位の報告メモを編集</li>
+    <li><strong>ポモドーロタイマー（🍅）</strong>: 25分集中→実績を日次スケジュールへ自動記録</li>
     <li><strong>チームログ（Team）</strong>: メンバー全員の勤務状況・連絡事項を一覧表示</li>
     <li><strong>タスク依頼（Request）</strong>: 他メンバーへのタスク・チケット依頼</li>
-    <li><strong>AI取込</strong>: LLM（AI）の返答からタスクを自動作成</li>
-    <li><strong>工数分析（Analyze）</strong>: 見積vs実績の比較・超過アラート</li>
+    <li><strong>AI取込</strong>: LLM（AI）の返答からチケット・日次スケジュールを自動作成</li>
+    <li><strong>工数分析（Analyze）</strong>: 見積vs実績の比較・超過アラート・個人振り返り</li>
   </ul>
 </div>
 
@@ -283,8 +291,8 @@
 <ol class="steps">
   <li><code>src/schedule_app.py</code> を Python で実行します<br>
       <code>python schedule_app.py</code></li>
-  <li>同フォルダの <code>config.ini</code> が自動的に読み込まれます</li>
-  <li>メインウィンドウが表示されます（最初は <strong>Main</strong> タブが開きます）</li>
+  <li>同フォルダの <code>config.ini</code>（＋個人設定 <code>user_config.ini</code>）が自動的に読み込まれます</li>
+  <li>メインウィンドウが表示されます（最初は <strong>🏠 Today</strong> タブが開きます。<code>[GUI] start_tab</code> で変更可）</li>
 </ol>
 
 <h3>初期設定（config.ini）</h3>
@@ -297,7 +305,14 @@
   <tr><td><code>server_dir</code></td><td>DBファイルの保存先フォルダ</td><td><code>./db</code>（共有フォルダなら <code>//server/share/db</code>）</td></tr>
   <tr><td><code>daily_task_hour</code></td><td>1日の標準作業時間（時間）</td><td><code>5.0</code></td></tr>
   <tr><td><code>[DisplayNames]</code></td><td>ユーザー名→画面表示名のマッピング</td><td><code>yamada = 山田</code></td></tr>
+  <tr><td><code>output_dir</code></td><td>レポート・当日ログ等の Markdown 出力先フォルダ（<code>[Report]</code>）</td><td><code>//NAS/share/reports</code></td></tr>
 </table>
+
+<div class="card info">
+  <strong>💡 個人設定は user_config.ini に保存されます</strong><br>
+  Config タブでの変更は、共有の <code>config.ini</code> ではなく個人ごとの <code>user_config.ini</code> に書き込まれます。
+  表示名や出力先など、メンバーごとに異なる設定を安全に持てます。
+</div>
 
 <div class="card warn">
   <strong>⚠ 注意</strong>: Config タブで保存後、<strong>アプリを再起動</strong>することで設定が完全に反映されます。
@@ -317,23 +332,27 @@
   <tr><td><kbd>💾 保存 (Ctrl+S)</kbd></td><td>現在の編集内容をDBに保存</td></tr>
   <tr><td><kbd>🔄 読込 (Ctrl+R)</kbd></td><td>DBから最新データを読み込む</td></tr>
   <tr><td>タブボタン群</td><td>各機能タブへの切替（下記参照）</td></tr>
+  <tr><td><kbd>🔎 詳細</kbd></td><td>右側の詳細ペイン（ノード詳細＋レポート）の表示/非表示を切替（Main/Plan/Edit で有効）。<a href="#detail-pane">詳細</a></td></tr>
+  <tr><td><kbd>📖 Manual</kbd></td><td>このマニュアルをブラウザで開く</td></tr>
+  <tr><td><kbd>🍅 ポモドーロ</kbd></td><td>集中タイマー。終了時に実績を日次スケジュールへ自動記録。<a href="#pomodoro">詳細</a></td></tr>
 </table>
 
 <h3>タブボタン（1行目 右側）</h3>
 <p>
-  <span class="tab-btn active">📊 Main</span>
+  <span class="tab-btn active">🏠 Today</span>
+  <span class="tab-btn">📊 Main</span>
   <span class="tab-btn">🗺 Plan</span>
   <span class="tab-btn">✏ Edit</span>
   <span class="tab-btn">👥 Team</span>
   <span class="tab-btn">🔍 Search</span>
   <span class="tab-btn badge-red">📨 Request <small>3</small></span>
-  <span class="tab-btn">📝 Memo</span>
+  <span class="tab-btn">🤖 AI取込</span>
   <span class="tab-btn">📈 Analyze</span>
   <span class="tab-btn">ℹ Version</span>
   <span class="tab-btn">⚙ Config</span>
-  <span class="tab-btn">🤖 AI取込</span>
 </p>
 <p>未処理の Request が届いているとき、Request タブのボタンが<strong>赤背景</strong>で件数を表示します。</p>
+<p>各タブは <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> でも切り替えられます（左から順）。</p>
 
 <h3>メンバー切替ボタン（2行目）</h3>
 <p>ツールバー2行目に各メンバーのボタンが並びます。クリックすると表示対象メンバーが切り替わります。</p>
@@ -344,6 +363,29 @@
   ガントや日次スケジュールの <em>操作</em>（割り当て・編集・削除）は自分のデータのみ可能ですが、
   <em>表示</em> は2行目のボタンで他のメンバーに切り替えられます。
   Request の受信一覧も切替メンバーのものを閲覧できますが、<strong>承諾・拒否は自分宛の依頼のみ</strong>可能です。
+</div>
+
+<hr>
+
+<!-- ===================== Today タブ ===================== -->
+<h2 id="today-tab">🏠 Today タブ（ダッシュボード）</h2>
+<p>起動して最初に表示される画面です。「今日やること・気にすべきこと」を4つのカードに集約しています。</p>
+
+<table>
+  <tr><th>カード</th><th>内容</th><th>「→ 開く」の遷移先</th></tr>
+  <tr><td>📅 今日のスケジュール</td><td>当日の予定を時間帯ごとに表示＋合計時間</td><td>Main タブ</td></tr>
+  <tr><td>⏰ 納期アラート</td><td>自分担当の納期超過（赤）・7日以内（橙）チケット</td><td>Edit タブ</td></tr>
+  <tr><td>📨 未処理の依頼</td><td>自分宛の承諾待ち依頼</td><td>Request タブ</td></tr>
+  <tr><td>👥 チームの今日</td><td>メンバーの体調・勤務地（未入力者はグレー表示）</td><td>Team タブ</td></tr>
+</table>
+
+<div class="card tip">
+  <strong>✅ 件数バッジ</strong>: 各カードの件数がひと目で分かります。問題がなければ ✅ が表示されます。
+</div>
+
+<div class="card info">
+  <strong>💡 起動時のタブを変えるには</strong><br>
+  <a href="#config-tab">⚙ Config タブ</a> → <code>[GUI] start_tab</code> を <code>today / main / edit / plan</code> から選択（既定は <code>today</code>）。
 </div>
 
 <hr>
@@ -433,6 +475,83 @@
   🔨 の作業予定日はシステムが自動で計算します（EDF: Earliest Deadline First アルゴリズム）。
   見積工数・実績工数・開始可能日・納期をもとに、1日の標準作業時間内で無理のない順序に並べます。
   納期が設定されていないチケットには、親 Task の納期から逆算した仮納期が使われます。
+</div>
+
+<!-- ── 当日ログ md 出力 ── -->
+<h3 id="daily-export">📅 当日ログを md 出力</h3>
+<p>その日「何に何時間使ったか」を、日誌・週報の素材として Markdown 出力できます。ガントチャート上部のフィルター行右端の <strong>「📅 当日ログをmd出力」</strong> ボタンから実行します。</p>
+
+<ol class="steps">
+  <li>ツールバーの日付を出力したい日に合わせる（過去日も可）</li>
+  <li>「📅 当日ログをmd出力」をクリック</li>
+  <li><code>output_dir/daily/2026-06-11.md</code> に保存される（既存ファイルは上書き確認あり。<code>output_dir</code> 未設定時は保存先ダイアログ）</li>
+</ol>
+
+<h4>出力される内容</h4>
+<ul>
+  <li>勤務時間（開始〜終了・休憩・合計）</li>
+  <li>作業内訳: 15分スロットを「同じチケットの連続区間」にまとめた表（時間帯/チケット/タスク/時間）</li>
+  <li>体調・勤務地・連絡事項（Team の日次ログから）</li>
+</ul>
+
+<div class="card info">
+  <strong>💡 旧「📝 Memo」タブから移設しました</strong><br>
+  以前は Memo タブにあった機能です。Memo タブ（個人用メモ）は廃止し、当日ログ出力のみ Main タブへ移しています。
+</div>
+
+<hr>
+
+<!-- ===================== 詳細ペイン ===================== -->
+<h2 id="detail-pane">🔎 詳細ペイン（ノード詳細＋レポート）</h2>
+<p>Main / Plan / Edit の各画面で、ツールバーの <kbd>🔎 詳細</kbd> を押すと画面右側に詳細ペインが開きます。上段にノードの詳細、下段に<strong>レポート（報告メモ）</strong>を表示します。</p>
+
+<div class="card info">
+  <strong>💡 既定では閉じています</strong><br>
+  詳細ペインは起動時は閉じた状態です。常に開いておきたい場合は <a href="#config-tab">⚙ Config タブ</a> → <code>[GUI] detail_pane</code> を <code>open</code> に設定してください。
+</div>
+
+<h3>上段：ノード詳細</h3>
+<p>Plan のツリー・ガント・ロードマップなどでノードを選択すると、その種類・タイトル・ステータス・担当者・見積/実績工数・各種日付・メモが一覧表示されます（読み取り専用。編集は Edit タブで行います）。</p>
+
+<h3>下段：レポート（月次・Project2 単位）</h3>
+<p>レポートは <strong>月 × Project2 ごとに 1 つの Markdown ファイル</strong> に集約され、ファイル内はアイテムごとに <code>### IDX_…</code> セクションで区切られます。GUI は選択したアイテムのセクションだけを読み書きします。</p>
+
+<ol class="steps">
+  <li><strong>Project2 以下のノードを選ぶ</strong>（Project1 を選ぶとレポート欄は無効になります）</li>
+  <li>見出しに対象アイテムの階層パス（P1 / P2 / … / アイテム名）が表示される</li>
+  <li>テキスト欄に自由記述で書く（<code>[リンク名](パス/URL)</code> でリンクを埋め込み可）</li>
+  <li><strong>📊 実績を挿入</strong>（週報/月報）で、選択ノード配下の実績（完了・進行中・投入工数・納期リスク）を自動集約した Markdown を本文に差し込む</li>
+  <li><strong>💾 保存</strong> → <code>output_dir/reports/&lt;yyyymm&gt;_&lt;P2のIDX&gt;_&lt;P1名&gt;_&lt;P2名&gt;.md</code> の該当セクションに上書き保存</li>
+  <li><strong>🤖 LLM</strong> → 文章化プロンプト＋本文をクリップボードへコピー（社内 LLM に貼って報告文を生成）</li>
+</ol>
+
+<h4>月の切り替え・リンク</h4>
+<ul>
+  <li>月ナビ <kbd>◀</kbd> <code>[2026/06]</code> <kbd>▶</kbd> で前月・翌月の内容を閲覧/編集（移動前に未保存内容は自動保存）</li>
+  <li>本文に書いた <code>[仕様書](C:\share\spec.xlsx)</code> 等のリンクは、ペイン下部に <code>[仕様書]</code> ボタンとして自動表示され、クリックで OS の既定アプリが開きます（複数可）</li>
+</ul>
+
+<div class="card warn">
+  <strong>⚠ セクションの区切り</strong>: <code>#</code>〜<code>###</code>（H1〜H3）で始まる行はセクション境界として扱われます。本文内で小見出しを使う場合は <code>####</code> 以下（H4 以下）を使ってください。
+</div>
+
+<hr>
+
+<!-- ===================== ポモドーロ ===================== -->
+<h2 id="pomodoro">🍅 ポモドーロタイマー</h2>
+<p>ツールバー右側のタイマーで「集中して働く」と「実績入力」を同時に済ませられます。</p>
+
+<ol class="steps">
+  <li>Main または Edit で作業するチケットを選択（タイマーにチケット名が表示される）</li>
+  <li><strong>▶ 集中開始</strong> → 作業タイマー（既定25分）開始</li>
+  <li>終了（音が鳴る）→「実績を記録しますか？」→ <strong>はい</strong> で作業時間が当日の15分スロットに自動記録</li>
+  <li>続けて休憩タイマー（既定5分）→ 終了音 → 次のセッションへ</li>
+</ol>
+
+<div class="card tip">
+  <strong>✅ 記録の挙動</strong>: 途中で <strong>■ 停止</strong> しても経過分（15分単位に丸め）を記録します（15分未満は記録なし）。
+  既存予定があるスロットは上書き確認あり。記録は遅延保存なので <kbd>Ctrl+S</kbd> を忘れずに。
+  作業/休憩時間は <a href="#config-tab">⚙ Config</a> → <code>[Pomodoro]</code> で変更できます。
 </div>
 
 <hr>
@@ -542,6 +661,20 @@
 
 <div class="card tip">
   <strong>✅ 子ノードの追加制限</strong>: Ticket は最下位ノードのため、Ticket を選択した状態では子ノードを追加できません。
+</div>
+
+<h3 id="edit-template">テンプレートから Task/Ticket を一括作成</h3>
+<p>定型案件の立ち上げを数秒で行えます。</p>
+<ol class="steps">
+  <li>左ツリーで <strong>Project4 を右クリック</strong> → 「📋 テンプレートから作成」</li>
+  <li>テンプレートを選択（内容プレビュー付き）→ OK</li>
+  <li>Task と Ticket が一括生成される（各 Task に「詳細作成」「完了」チケットも自動付与）</li>
+  <li><kbd>Ctrl+S</kbd> で保存</li>
+</ol>
+<div class="card info">
+  <strong>💡 テンプレートの作り方</strong><br>
+  <code>src/documents/templates/</code> に <code>.txt</code> ファイルを置くと選択肢に表示されます（ファイル名＝テンプレート名）。
+  行頭 <code>&gt; 名前</code> が Task、その下の行が Ticket（<code>タイトル, 優先度, 見積h, 開始可能日, 納期, ステータス, メモ</code>）。
 </div>
 
 <h3 id="edit-priority">優先順位（priority）について</h3>
@@ -691,74 +824,59 @@
 
 <!-- ===================== AI取込 タブ ===================== -->
 <h2 id="ai-tab">🤖 AI取込タブ</h2>
-<p>LLM（AI）にタスク整理を依頼し、その回答をそのまま取り込んでアイテムを自動作成する機能です。</p>
+<p>LLM（AI）に依頼し、その回答を貼り付けて自動取り込みする機能です。<strong>①チケット作成</strong> と <strong>②日次スケジュール設定</strong> の2種類があります。</p>
 
-<h3>使い方の流れ</h3>
+<h3>使い方の流れ（共通）</h3>
 <div class="flow">
-  <div class="flow-step">① 指示メッセージ取得</div>
+  <div class="flow-step">① 📋 プロンプトをコピー</div>
   <div class="flow-arrow">→</div>
   <div class="flow-step">② AI（ChatGPT等）に貼り付け</div>
   <div class="flow-arrow">→</div>
-  <div class="flow-step">③ AI返答を貼り付け</div>
+  <div class="flow-step">③ AI返答をテキスト欄に貼り付け</div>
   <div class="flow-arrow">→</div>
-  <div class="flow-step">④ 取り込みボタン</div>
-  <div class="flow-arrow">→</div>
-  <div class="flow-step">⑤ Edit で確認</div>
+  <div class="flow-step">④ 📥 取り込み</div>
 </div>
 
+<h3>① チケット作成</h3>
 <ol class="steps">
-  <li>
-    <strong>📋 指示メッセージ取得</strong> ボタンをクリック<br>
-    テンプレート（指示内容）＋ 既存プロジェクト一覧がクリップボードにコピーされます
-  </li>
-  <li>
-    ChatGPT / Claude などの AI チャットを開き、コピーした内容を貼り付けて送信<br>
-    <em>その後に整理してほしいメール・指示文なども合わせて貼り付けてください</em>
-  </li>
-  <li>
-    AI の返答をコピーして、AI取込タブのテキストエリアに貼り付ける<br>
-    <code>```items ... ```</code> の形式を含む回答を認識します
-  </li>
-  <li>
-    <strong>📥 取り込み</strong> ボタンをクリック<br>
-    内容を解析して確認ダイアログが表示されます。「OK」で DB に登録されます
-  </li>
-  <li>
-    自動的に Edit タブに切り替わり、取り込まれたアイテムが選択表示されます<br>
-    <strong>次へ →</strong> ボタンで取り込まれた各アイテムを順番に確認できます
-  </li>
+  <li>「チケット作成：📋 プロンプトをコピー」→ テンプレート＋既存 Task 一覧がコピーされる</li>
+  <li>AI に貼り付け、整理したいメール・指示文も添えて送信</li>
+  <li>AI 返答をテキスト欄に貼り付け、「📥 取り込み」→ 確認ダイアログ → DB 登録</li>
+  <li>自動的に Edit タブへ切り替わり、登録チケットを確認できる</li>
 </ol>
-
 <div class="card info">
-  <strong>💡 AI返答のフォーマット</strong><br>
-  AI にはあらかじめフォーマットが指定されています。以下の形式で返答してもらいます：
-<pre>```items
-title: タスクタイトル
-parent_idx: 親アイテムのIDX（0=ルート）
-node_type: task または ticket
-assigned_to: 担当者のユーザー名
-deadline: YYYY-MM-DD
-memo: メモ
+  <strong>💡 チケット返答フォーマット</strong>（<code>---</code> 区切りで複数可。コードブロックで囲んでも可）：
+<pre>title: チケットタイトル
+parent_idx: 親Task の IDX（必須・種別 task のみ）
+deadline: YYYY-MM-DD（省略可）
+memo: メモ（省略可）
 ---
-title: 2つ目のアイテム
-...
-```</pre>
+title: 2つ目のチケット
+parent_idx: ...</pre>
+  作成されるのは <strong>Ticket</strong> で、親は <strong>Task</strong> である必要があります。
+</div>
+
+<h3>② 日次スケジュール設定</h3>
+<ol class="steps">
+  <li>「スケジュール設定：📋 プロンプトをコピー」→ テンプレート＋自分の未完了チケット一覧がコピーされる</li>
+  <li>AI に「この日の予定を組んで」と依頼</li>
+  <li>AI 返答を貼り付け、「📥 取り込み」→ 競合があれば上書き/スキップを確認 → 日次スケジュールへ反映</li>
+</ol>
+<div class="card info">
+  <strong>💡 スケジュール返答フォーマット</strong>：
+<pre>date: 2026-06-14
+---
+ticket_idx: &lt;IDX&gt;
+from: 09:00
+to: 11:00
+---
+ticket_idx: ...</pre>
 </div>
 
 <div class="card warn">
-  <strong>⚠ 注意</strong>: 取り込み後は内容を Edit タブで確認し、担当者・納期・優先順位を適切に調整してください。
-  取り込んだ内容は必ず <kbd>Ctrl+S</kbd> で保存してください。
+  <strong>⚠ 注意</strong>: 取り込み後は内容を確認し、必ず <kbd>Ctrl+S</kbd> で保存してください。
+  プロンプトのテンプレートは <code>src/documents/llm_msg.md</code> / <code>llm_schedule.md</code> を編集すると変更できます。
 </div>
-
-<hr>
-
-<!-- ===================== Memo タブ ===================== -->
-<h2 id="memo-tab">📝 Memo タブ（メモ）</h2>
-<p>個人用の自由メモ帳です。他のメンバーには見えません。</p>
-<ul>
-  <li>自由にテキストを記入し、「保存」ボタンでDBに保存</li>
-  <li>次回起動時も内容は保持されます</li>
-</ul>
 
 <hr>
 
@@ -766,7 +884,7 @@ title: 2つ目のアイテム
 <h2 id="analyze-tab">📈 Analyze タブ（工数分析）</h2>
 <p>指定期間の工数状況を集計・分析します。</p>
 
-<h4>分析内容</h4>
+<h4>分析内容（「集計」ボタン）</h4>
 <table>
   <tr><th>集計</th><th>説明</th></tr>
   <tr><td>担当者別 実績工数</td><td>誰がどれくらい作業したかを比較</td></tr>
@@ -775,6 +893,15 @@ title: 2つ目のアイテム
 </table>
 
 <p>期間は画面上部の日付入力で指定します（デフォルト: 当月1日〜今日）。</p>
+
+<h3 id="analyze-personal">🔍 個人振り返り</h3>
+<p>「🔍 個人振り返り」ボタンで、時間の使い方と見積精度を可視化します。<strong>集計対象は画面上部で選択中のメンバー</strong>です。</p>
+<ul>
+  <li><strong>週別投入工数</strong>（直近4週・Project1 別の積み上げ棒）: 時間配分の推移</li>
+  <li><strong>見積 vs 実績の散布図</strong>（完了チケット）: 対角線より上＝見積より時間がかかった</li>
+  <li>サマリー: 「実績÷見積 平均 1.25」のような指標</li>
+</ul>
+<p>「集計」ボタンを押せば従来の工数分析に戻ります。</p>
 
 <hr>
 
@@ -801,11 +928,17 @@ title: 2つ目のアイテム
   <tr><td>[Database]</td><td>DB 保存フォルダのパス</td></tr>
   <tr><td>[User]</td><td>自分のユーザー名、チームメンバー一覧</td></tr>
   <tr><td>[DisplayNames]</td><td>ユーザー名 → 画面表示名のマッピング</td></tr>
-  <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ</td></tr>
+  <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ、<code>start_tab</code>（起動時タブ: today/main/edit/plan）、<code>detail_pane</code>（詳細ペインの起動時開閉: open/closed）</td></tr>
   <tr><td>[Schedule]</td><td>営業時間（始業・終業）、1日の標準作業時間、休日</td></tr>
   <tr><td>[DailyInfoCombo]</td><td>健・場・安・残 の選択肢リスト</td></tr>
+  <tr><td>[Report]</td><td><code>output_dir</code>: レポート・当日ログの Markdown 出力先フォルダ</td></tr>
+  <tr><td>[Pomodoro]</td><td><code>work_minutes</code> / <code>break_minutes</code>: 作業・休憩時間（分）</td></tr>
   <tr><td>[Commands]</td><td>カスタムコマンドの登録</td></tr>
 </table>
+
+<div class="card info">
+  <strong>💡 反映タイミング</strong>: 保存先は個人の <code>user_config.ini</code> です。多くの設定は<strong>再起動後</strong>に反映されます。
+</div>
 
 <div class="card warn">
   <strong>⚠ スクロールホイール誤操作防止</strong>: 数値フィールドではマウスホイールによる値変更は無効化されています。
@@ -824,6 +957,7 @@ title: 2つ目のアイテム
   <tr><th>ショートカット</th><th>動作</th></tr>
   <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>保存（Edit タブの変更を DB に書き込む）</td></tr>
   <tr><td><kbd>Ctrl</kbd>+<kbd>R</kbd></td><td>最新データを読み込み（未保存変更は破棄）</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd></td><td>タブを切り替え（タブボタンの左から順）</td></tr>
 </table>
 
 <h3>Edit タブ（テーブル操作）</h3>
@@ -954,10 +1088,10 @@ title: 2つ目のアイテム
 <h3>Q. AI取込でうまく取り込めません</h3>
 <p>以下を確認してください。</p>
 <ul>
-  <li>AI の返答に <code>```items</code> と <code>```</code> のコードブロックが含まれているか</li>
-  <li><code>title:</code> と <code>parent_idx:</code> が必須項目として含まれているか</li>
-  <li><code>parent_idx</code> に指定した IDX が既存アイテム一覧に存在するか</li>
-  <li>「指示メッセージ取得」で取得したメッセージを AI に渡してから依頼しているか</li>
+  <li>チケット作成は <code>title:</code> と <code>parent_idx:</code> が必須。<code>parent_idx</code> は<strong>既存の Task の IDX</strong>であること（複数は <code>---</code> 区切り）</li>
+  <li>日次スケジュールは先頭に <code>date:</code>、各エントリに <code>ticket_idx:</code> / <code>from:</code> / <code>to:</code> があること</li>
+  <li>「📋 プロンプトをコピー」で取得した内容を AI に渡してから依頼しているか</li>
+  <li>返答はコードブロック（```）で囲まれていても認識します</li>
 </ul>
 
 <h3>Q. Edit で編集した内容が消えました</h3>
@@ -970,7 +1104,7 @@ title: 2つ目のアイテム
 <hr>
 
 <p style="text-align:center; color:#78909C; font-size:12px; margin-top:32px; padding-bottom:40px;">
-  Schedule Manager v3 操作マニュアル &nbsp;|&nbsp; 最終更新: 2026年4月
+  Schedule Manager v3 操作マニュアル &nbsp;|&nbsp; 最終更新: 2026年6月（Today/詳細ペイン・レポート/ポモドーロ/AI日次取込 対応）
 </p>
 
 </main>
