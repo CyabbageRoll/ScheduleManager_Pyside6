@@ -1477,6 +1477,40 @@ def test_team_log_export(win):
         state.config.report_output_dir = orig_dir
 
 
+def test_assignment_view_multi_rows(win, ticket_idx):
+    """Request タブ（AssignmentView）に複数の依頼があるとき、
+    ソート常時有効テーブルへの直接挿入で行がズレて空欄になる回帰を防ぐ"""
+    print("\n[29] AssignmentView 複数依頼テスト")
+    state = win.state
+    orig_member = state.current_member
+    try:
+        to_user = "yamada@email.com"
+        messages = ["message-0", "message-1", "message-2"]
+        for i, msg in enumerate(messages):
+            state.db.create_assignment(
+                ticket_idx, f"sender{i}@email.com", to_user, msg)
+        state.reload_daily()
+        state.current_member = to_user
+        win.assign_view.refresh()
+
+        table = win.assign_view.recv_table
+        assert table.rowCount() == len(messages), \
+            f"rowCount={table.rowCount()}"
+        msg_col = 7  # RECV_COLS: [...,"依頼者","メッセージ","状態","日時"]
+        seen = set()
+        for r in range(table.rowCount()):
+            item = table.item(r, msg_col)
+            text = item.text() if item else ""
+            assert text, f"行{r}のメッセージ列が空白（行ズレのバグ再発の疑い）"
+            seen.add(text)
+        assert seen == set(messages), f"seen={seen}"
+        ok(f"複数依頼（{len(messages)}件）が行ズレなく表示される OK")
+    except Exception as e:
+        ng("AssignmentView 複数依頼", e)
+    finally:
+        state.current_member = orig_member
+
+
 def test_save_load(state):
     """save() → load() のラウンドトリップ確認"""
     print("\n[8] save / load ラウンドトリップテスト")
@@ -1535,6 +1569,7 @@ def main():
             test_pomodoro_overwrite(win)
             test_personal_review_member(win)
             test_team_log_export(win)
+            test_assignment_view_multi_rows(win, ticket_idx)
             test_save_load(state)
 
     print("\n" + "=" * 55)

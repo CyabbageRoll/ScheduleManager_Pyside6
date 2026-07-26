@@ -2765,6 +2765,9 @@ class AssignmentView(QWidget):
         ]
         _GRAY = QColor("#BDBDBD")
         _MINE_BG = QColor("#E3F2FD")  # 自分宛の行は薄青で強調
+        # 挿入中はソートを一時停止（有効のままだと行途中の setItem で
+        # 再ソートが走り、行位置がズレて空欄になるため）
+        self.recv_table.setSortingEnabled(False)
         for asgn_idx, asgn_row in visible.iterrows():
             t_idx = asgn_row.get("ticket_id", "")
             hier_titles, hier_grayed = self._node_hierarchy_row(t_idx)
@@ -2788,6 +2791,7 @@ class AssignmentView(QWidget):
                 elif is_mine:
                     item.setBackground(_MINE_BG)
                 self.recv_table.setItem(r, c, item)
+        self.recv_table.setSortingEnabled(True)  # 挿入完了後にソート再有効化
 
     def _on_req_item_clicked(self, clicked_item: QTreeWidgetItem) -> None:
         """ツリーアイテムクリック時に task以上 と ticket の同時選択を禁止する"""
