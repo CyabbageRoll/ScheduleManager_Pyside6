@@ -3616,7 +3616,7 @@ class AIImportView(QWidget):
     AI取込タブ：LLMにクリップボード経由で指示を渡し、返答を取り込む。
 
     【チケット取り込み】
-    ① チケット作成プロンプト: テンプレート + Task一覧をクリップボードにコピー
+    ① チケット作成プロンプト: テンプレート + Task一覧（既存チケット付き）をクリップボードにコピー
     ② チケット取り込み: $$$items ブロックをパース → 確認ダイアログ → DB登録
 
     【日次スケジュール取り込み】
@@ -3646,7 +3646,7 @@ class AIImportView(QWidget):
         btn_grid.addWidget(QLabel("チケット作成："), 0, 0)
         btn_ticket_prompt = QPushButton("📋 プロンプトをコピー")
         btn_ticket_prompt.setStyleSheet(STYLE_BUTTON)
-        btn_ticket_prompt.setToolTip("テンプレート + Task一覧をクリップボードにコピー")
+        btn_ticket_prompt.setToolTip("テンプレート + Task一覧（既存チケット付き）をクリップボードにコピー")
         btn_ticket_prompt.clicked.connect(self._on_get_ticket_prompt)
         btn_grid.addWidget(btn_ticket_prompt, 0, 1)
 
@@ -3690,7 +3690,7 @@ class AIImportView(QWidget):
     # ── チケット作成プロンプト ──
 
     def _on_get_ticket_prompt(self) -> None:
-        """テンプレートに Task 一覧を付加してクリップボードにコピーする"""
+        """テンプレートに Task 一覧（既存チケット付き）を付加してクリップボードにコピーする"""
         try:
             template = self._TEMPLATE_PATH.read_text(encoding="utf-8")
         except Exception as e:
@@ -3702,7 +3702,12 @@ class AIImportView(QWidget):
         self.info.set_info("チケット作成プロンプトをクリップボードにコピーしました")
 
     def _build_task_list(self) -> str:
-        """Task一覧（IDX | タイトル | 階層パス）を文字列化する"""
+        """Task一覧（IDX | タイトル | 階層パス | memo）を文字列化する
+
+        各Task行の直下に、そのTaskに既に存在するチケット（自分の未完了分）を
+        インデント付きで列挙する。既に作成済みのチケットをLLMに知らせ、
+        重複したチケットが提案されるのを防ぐため。
+        """
         df = self.state.df_nodes
         if df.empty:
             return "【Task一覧】\n（Taskなし）"
@@ -3713,7 +3718,22 @@ class AIImportView(QWidget):
         if tasks.empty:
             return "【Task一覧】\n（Taskなし）"
 
-        lines = ["【Task一覧（IDX | タイトル | 階層パス | memo）】"]
+        # 自分の未完了チケットを親TaskのIDXごとにまとめる
+        tickets_by_parent: dict = {}
+        tickets = df[
+            (df["node_type"] == "ticket") &
+            (~df["status"].isin(["deleted", "done", "cancel"])) &
+            (df["assigned_to"] == self.state.user)
+        ]
+        for t_idx, t_row in tickets.iterrows():
+            parent = str(t_row.get("parent_id", ""))
+            tickets_by_parent.setdefault(parent, []).append((str(t_idx), t_row))
+
+        lines = [
+            "【Task一覧（IDX | タイトル | 階層パス | memo）】",
+            "  ※ 「- 」で始まる行は、そのTaskに既に存在するチケット"
+            "（自分の未完了分 / IDX | タイトル | 期限 | memo）です",
+        ]
 
         def _path(idx: str) -> str:
             parts = []
@@ -3729,6 +3749,14 @@ class AIImportView(QWidget):
             memo = str(row.get("memo", "") or "").strip()
             memo_str = f" | {memo}" if memo else ""
             lines.append(f"  {idx} | {title} | {path}{memo_str}")
+
+            for t_idx, t_row in tickets_by_parent.get(str(idx), []):
+                t_title = str(t_row.get("title", ""))
+                t_deadline = str(t_row.get("deadline", "") or "").strip()
+                t_memo = str(t_row.get("memo", "") or "").strip()
+                dl_str = f" | 期限 {t_deadline}" if t_deadline else ""
+                t_memo_str = f" | {t_memo}" if t_memo else ""
+                lines.append(f"    - {t_idx} | {t_title}{dl_str}{t_memo_str}")
 
         return "\n".join(lines)
 
