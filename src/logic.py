@@ -2,9 +2,12 @@
 logic.py - スケジューリング・テキストパーサー・検索・エクスポート
 """
 import datetime
+import calendar
 import csv
+import math
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import List, Optional
 
@@ -13,6 +16,7 @@ import pandas as pd
 from db import (
     NODE_TYPES, STATUS_LIST, DAILY_TIME_COLS,
     create_initial_node, generate_idx, build_auto_children, daily_sch_idx,
+    INBOX_PARENT,
 )
 
 
@@ -512,6 +516,80 @@ def check_auto_done(df_nodes: pd.DataFrame, changed_idx: str) -> List[str]:
     return to_done
 
 
+# 未完了とみなすステータス（仕様 2.3 の判定に使用）
+_OPEN_STATUSES = ("todo", "regularly")
+
+
+def status_change_error(df_nodes: pd.DataFrame, idx: str,
+                        new_status: str) -> Optional[str]:
+    """
+    仕様 2.3 のステータス変更制約を判定する。変更不可なら理由、可なら None を返す。
+      - 未完了（todo/regularly）の子ノードがある親は done にできない
+      - 親ノードが done のとき、子ノードを todo/regularly に戻せない
+      - Inbox（Task 未設定）のチケットは done / regularly にできない（振り分けが先）
+    """
+    if idx not in df_nodes.index:
+        return None
+    if (str(df_nodes.loc[idx, "parent_id"]) == INBOX_PARENT
+            and new_status in ("done", "regularly")):
+        return "Inbox のチケットは Task へ振り分けてから変更してください"
+    if new_status == "done":
+        open_children = df_nodes[(df_nodes["parent_id"] == idx)
+                                 & (df_nodes["status"].isin(_OPEN_STATUSES))]
+        if not open_children.empty:
+            return "未完了の子ノードがあるため done にできません（子を先に完了させてください）"
+    elif new_status in _OPEN_STATUSES:
+        pid = str(df_nodes.loc[idx, "parent_id"] or "")
+        if pid in df_nodes.index and str(df_nodes.loc[pid, "status"]) == "done":
+            return "親ノードが done のため todo / regularly に戻せません"
+    return None
+
+
+def delete_block_reason(df_nodes: pd.DataFrame, idx: str, user: str) -> Optional[str]:
+    """論理削除できない理由を返す（削除可能なら None）。仕様 2.3 の削除制約。"""
+    if idx not in df_nodes.index:
+        return "対象ノードが見つかりません"
+    if str(df_nodes.loc[idx, "assigned_to"]) != user:
+        return "他ユーザーのデータは削除できません"
+    if float(df_nodes.loc[idx, "actual_hours"] or 0) > 0:
+        return "実績工数が記録されているため削除できません"
+    # 論理削除済みの子は「存在しない」ものとして扱う
+    children = df_nodes[(df_nodes["parent_id"] == idx)
+                        & (df_nodes["status"] != "deleted")]
+    if not children.empty:
+        return "子ノードが存在するため削除できません"
+    return None
+
+
+def apply_status(df_nodes: pd.DataFrame, idx: str, new_status: str) -> List[str]:
+    """
+    ステータスを変更し、付随処理をまとめて行う（df_nodes をその場で更新）。
+      - done にしたら actual_end（実績完了日）に当日を設定、done 以外に戻したらクリア
+      - 「完了」チケットが done になり兄弟が全て完了なら親も自動 done（仕様 2.2）
+    戻り値: ステータスを変更した IDX のリスト（自動 done の親を含む）
+    """
+    today = datetime.date.today().isoformat()
+    changed: List[str] = []
+
+    def _set(i: str, s: str) -> None:
+        df_nodes.loc[i, "status"] = s
+        df_nodes.loc[i, "updated_at"] = today
+        if s == "done":
+            if not _date_str(df_nodes.loc[i, "actual_end"]):
+                df_nodes.loc[i, "actual_end"] = today
+        else:
+            df_nodes.loc[i, "actual_end"] = None
+        changed.append(i)
+
+    if idx not in df_nodes.index:
+        return changed
+    _set(idx, new_status)
+    for pid in check_auto_done(df_nodes, idx):
+        if str(df_nodes.loc[pid, "status"]) != "done":
+            _set(pid, "done")
+    return changed
+
+
 # ---------- 検索・フィルタ ----------
 
 def filter_nodes(df: pd.DataFrame,
@@ -532,10 +610,13 @@ def filter_nodes(df: pd.DataFrame,
 
     if keyword:
         # タイトルまたはメモにキーワードが含まれる行を抽出（大文字小文字を区別しない）
+        # regex=False: 「(」「.」等を正規表現ではなく文字として扱う
         kw = keyword.lower()
         mask = (
-            result.get("title", pd.Series(dtype=str)).fillna("").str.lower().str.contains(kw)
-            | result.get("memo", pd.Series(dtype=str)).fillna("").str.lower().str.contains(kw)
+            result.get("title", pd.Series(dtype=str)).fillna("").str.lower()
+            .str.contains(kw, regex=False)
+            | result.get("memo", pd.Series(dtype=str)).fillna("").str.lower()
+            .str.contains(kw, regex=False)
         )
         result = result[mask]
 
@@ -1026,7 +1107,8 @@ def find_deadline_alerts(df_nodes: pd.DataFrame, user: str = "",
         row = {
             "ticket_idx": idx,
             "title":      str(r.get("title", "")),
-            "task":       str(df_nodes.loc[pid, "title"]) if pid in df_nodes.index else "",
+            "task":       (str(df_nodes.loc[pid, "title"]) if pid in df_nodes.index
+                           else "📥Inbox" if pid == INBOX_PARENT else ""),
             "deadline":   deadline,
         }
         if deadline < today_s:
@@ -1111,3 +1193,315 @@ def calc_estimate_accuracy(df_nodes: pd.DataFrame, user: str) -> List[dict]:
                 "ratio": round(act / est, 2),
             })
     return res
+
+
+# ---------- クイック追加（Ctrl+N）・Inbox ----------
+
+_WEEKDAY_MAP = {
+    "月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6,
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+_DAY_ABBR = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+_RELATIVE_DAYS = {"今日": 0, "きょう": 0, "本日": 0, "明日": 1, "あした": 1, "あす": 1,
+                  "明後日": 2, "あさって": 2}
+# 月日指定（9/10 等）が過去日のとき、この日数以内なら今年、超えたら翌年とみなす
+_PAST_KEEP_DAYS = 60
+
+
+def _nfkc(s: str) -> str:
+    """全角英数・記号を半角へ揃える（NFKC 正規化）"""
+    return unicodedata.normalize("NFKC", str(s))
+
+
+def norm_key(s: str) -> str:
+    """照合用キー: NFKC・小文字化・空白除去"""
+    return re.sub(r"\s+", "", _nfkc(s).lower())
+
+
+def _parse_hours_token(t: str) -> Optional[float]:
+    """正規化済みの語を工数(h)として解釈する。該当しなければ None。"""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?|\.\d+)(?:h|hr|hrs|時間)", t)
+    if m:
+        return float(m.group(1))
+    m = re.fullmatch(r"(\d+)(?:m|min|分)", t)
+    if m:
+        return int(m.group(1)) / 60
+    m = re.fullmatch(r"(\d+)(?:h|時間)(\d+)(?:m|min|分)", t)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / 60
+    m = re.fullmatch(r"(\d+)時間半", t)
+    if m:
+        return int(m.group(1)) + 0.5
+    # 小数点付きの数字は単位なしでも工数とみなす（整数のみはタイトル扱い）
+    if re.fullmatch(r"\d*\.\d+", t):
+        return float(t)
+    return None
+
+
+def _last_business_day(d_from: datetime.date, d_to: datetime.date,
+                       holidays) -> Optional[datetime.date]:
+    """[d_from, d_to] の中で最後の営業日（休日設定を除く）を返す。無ければ None。"""
+    d = d_to
+    while d >= d_from:
+        if _DAY_ABBR[d.weekday()] not in holidays:
+            return d
+        d -= datetime.timedelta(days=1)
+    return None
+
+
+def _month_day_date(month: int, day: int,
+                    today: datetime.date) -> Optional[datetime.date]:
+    """年を省いた月日を日付にする。過去 60 日より前なら翌年とみなす。"""
+    try:
+        d = datetime.date(today.year, month, day)
+    except ValueError:
+        return None
+    if d < today - datetime.timedelta(days=_PAST_KEEP_DAYS):
+        try:
+            d = datetime.date(today.year + 1, month, day)
+        except ValueError:
+            return None
+    return d
+
+
+def _parse_date_token(t: str, today: datetime.date,
+                      holidays) -> Optional[datetime.date]:
+    """正規化済みの語を日付として解釈する。該当しなければ None。"""
+    if t in _RELATIVE_DAYS:
+        return today + datetime.timedelta(days=_RELATIVE_DAYS[t])
+    m = re.fullmatch(r"(\d+)日後", t)
+    if m:
+        return today + datetime.timedelta(days=int(m.group(1)))
+    # 曜日: 水 / 水曜 / 水曜日 / (水) / wed / 来週水 / 来週の水曜
+    m = re.fullmatch(r"(来週の?)?\(?([月火水木金土日]|[a-z]+?)(?:曜日|曜)?\)?", t)
+    if m and m.group(2) in _WEEKDAY_MAP:
+        target = _WEEKDAY_MAP[m.group(2)]
+        if m.group(1):
+            next_monday = today + datetime.timedelta(days=7 - today.weekday())
+            return next_monday + datetime.timedelta(days=target)
+        return today + datetime.timedelta(days=(target - today.weekday()) % 7)
+    if t in ("今週", "今週中", "今週末"):
+        sunday = today + datetime.timedelta(days=6 - today.weekday())
+        return _last_business_day(today, sunday, holidays) or today
+    if t == "月末":
+        last = today.replace(day=calendar.monthrange(today.year, today.month)[1])
+        return _last_business_day(today, last, holidays) or today
+    m = re.fullmatch(r"(\d{1,2})日", t)
+    if m:
+        day = int(m.group(1))
+        y, mo = today.year, today.month
+        for _ in range(13):  # 今日以降で最も近い「その日」
+            if day <= calendar.monthrange(y, mo)[1]:
+                d = datetime.date(y, mo, day)
+                if d >= today:
+                    return d
+            y, mo = (y + 1, 1) if mo == 12 else (y, mo + 1)
+        return None
+    m = (re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", t)
+         or re.fullmatch(r"(\d{4})年(\d{1,2})月(\d{1,2})日", t))
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = (re.fullmatch(r"(\d{1,2})/(\d{1,2})", t)
+         or re.fullmatch(r"(\d{1,2})月(\d{1,2})日", t))
+    if m:
+        return _month_day_date(int(m.group(1)), int(m.group(2)), today)
+    return None
+
+
+def _parse_date_range(t: str, today: datetime.date, holidays):
+    """「9/28〜10/2」等の範囲を (開始, 終了) で返す。範囲でなければ None。"""
+    for sep in ("〜", "~", "-"):
+        if sep in t:
+            a, _, b = t.partition(sep)
+            da = _parse_date_token(a, today, holidays)
+            db_ = _parse_date_token(b, today, holidays)
+            if da and db_:
+                return da, db_
+    return None
+
+
+def parse_quick_add(text: str, today: Optional[datetime.date] = None,
+                    holidays=("SAT", "SUN")) -> dict:
+    """
+    クイック追加の 1 行入力を解析する（ルールは 06_B2 仕様書の表のとおり）。
+      - 空白（半角/全角）区切りの語ごとに 工数 / 日付 / @Task を判定。順不同
+      - 空白直後の # / ＃ から行末はメモ（解析しない）。「…」内は必ずタイトル
+      - どれにも当たらない語はタイトル
+    戻り値: {"title", "hours", "hours_rounded", "deadline", "start",
+             "task_query"(None=指定なし), "memo", "warnings": [], "hints": []}
+    """
+    today = today or datetime.date.today()
+    holidays = {h.upper() for h in holidays}
+    res = {"title": "", "hours": None, "hours_rounded": False,
+           "deadline": None, "start": None, "task_query": None, "memo": "",
+           "warnings": [], "hints": []}
+
+    # メモ: 空白直後（または先頭）の # から行末まで
+    body = text
+    m = re.search(r"(?:^|\s)[#＃]", text)
+    if m:
+        res["memo"] = text[m.end():].strip()
+        body = text[:m.start()]
+
+    # 「…」/ "…" で囲んだ部分はそのままタイトルの語にする
+    items = []  # (quoted, 語)
+    pos = 0
+    for q in re.finditer(r"「([^」]*)」|\"([^\"]*)\"", body):
+        items += [(False, w) for w in body[pos:q.start()].split()]
+        items.append((True, q.group(1) if q.group(1) is not None else q.group(2)))
+        pos = q.end()
+    items += [(False, w) for w in body[pos:].split()]
+
+    title_words = []
+    for quoted, raw in items:
+        if quoted:
+            title_words.append(raw)
+            continue
+        t = _nfkc(raw).lower()
+        if t.startswith("@"):
+            if res["task_query"] is not None:
+                res["warnings"].append("@Task が 2 つあります（後を採用）")
+            res["task_query"] = _nfkc(raw)[1:]
+            continue
+        h = _parse_hours_token(t)
+        if h is not None and h > 0:
+            if res["hours"] is not None:
+                res["warnings"].append("工数が 2 つあります（後を採用）")
+            rounded = math.ceil(h * 4 - 1e-9) / 4  # 15 分単位に切上げ
+            res["hours"] = rounded
+            res["hours_rounded"] = abs(rounded - h) > 1e-9
+            continue
+        rng = _parse_date_range(t, today, holidays)
+        d = None if rng else _parse_date_token(t, today, holidays)
+        if rng or d:
+            if res["deadline"] is not None:
+                res["warnings"].append("日付が 2 つあります（後を採用）")
+            if rng:
+                res["start"], res["deadline"] = rng
+                if rng[0] > rng[1]:
+                    res["warnings"].append("開始可能日が納期より後です")
+            else:
+                res["deadline"] = d
+            continue
+        if re.fullmatch(r"\d+", t):
+            res["hints"].append(f"工数なら「{t}h」と入力してください")
+        title_words.append(raw)
+
+    res["title"] = " ".join(title_words).strip()
+    if res["deadline"] is not None and res["deadline"] < today:
+        res["warnings"].append("納期が過去日です")
+    return res
+
+
+def _open_tasks(df_nodes: pd.DataFrame) -> pd.DataFrame:
+    return df_nodes[(df_nodes["node_type"] == "task")
+                    & (~df_nodes["status"].isin(["done", "cancel", "deleted"]))]
+
+
+def quick_add_task_candidates(df_nodes: pd.DataFrame, query: str, user: str = "",
+                              recent=(), limit: int = 10) -> List[tuple]:
+    """
+    @指定の Task 候補を [(task_idx, 階層パス), ...] で順位順に返す。
+    順位: タイトル完全一致 → 前方一致 → 部分一致 → パス一致。
+    同順位は最近使った Task・自分担当・パス順。完了/中止 Task は除外。
+    """
+    if df_nodes.empty:
+        return []
+    q = norm_key(query or "")
+    recent = list(recent)
+    scored = []
+    for idx, r in _open_tasks(df_nodes).iterrows():
+        title_k = norm_key(r.get("title", ""))
+        path = " ＞ ".join(node_path_titles(df_nodes, idx))
+        if not q:
+            score = 3
+        elif title_k == q:
+            score = 0
+        elif title_k.startswith(q):
+            score = 1
+        elif q in title_k:
+            score = 2
+        elif q in norm_key(path):
+            score = 3
+        else:
+            continue
+        rec = recent.index(idx) if idx in recent else len(recent)
+        own = 0 if str(r.get("assigned_to", "")) == user else 1
+        scored.append(((score, rec, own, path), idx, path))
+    scored.sort(key=lambda x: x[0])
+    return [(idx, path) for _, idx, path in scored[:limit]]
+
+
+def resolve_task_query(df_nodes: pd.DataFrame, query: str, user: str = "",
+                       recent=()) -> tuple:
+    """@指定を 1 つの Task に確定する。(task_idx or None, 候補数) を返す。
+    候補が 1 件、またはタイトル完全一致が 1 件なら確定する。"""
+    cands = quick_add_task_candidates(df_nodes, query, user, recent, limit=1000)
+    if len(cands) == 1:
+        return cands[0][0], 1
+    q = norm_key(query or "")
+    exact = [i for i, _ in cands if norm_key(df_nodes.loc[i, "title"]) == q]
+    if q and len(exact) == 1:
+        return exact[0], len(cands)
+    return None, len(cands)
+
+
+def inbox_tickets(df_nodes: pd.DataFrame, user: str) -> pd.DataFrame:
+    """ユーザーの Inbox（Task 未設定）チケットを作成日順で返す"""
+    if df_nodes.empty:
+        return df_nodes
+    df = df_nodes[(df_nodes["parent_id"] == INBOX_PARENT)
+                  & (df_nodes["assigned_to"] == user)
+                  & (df_nodes["status"] != "deleted")]
+    return df.sort_values("created_at")
+
+
+def inbox_summary(df_nodes: pd.DataFrame, user: str, max_items: int,
+                  stale_days: int, today: Optional[datetime.date] = None) -> dict:
+    """Inbox の件数・最古の経過日数と、上限到達 / 滞留の判定を返す"""
+    today = today or datetime.date.today()
+    df = inbox_tickets(df_nodes, user)
+    oldest = 0
+    for v in df.get("created_at", []):
+        try:
+            oldest = max(oldest, (today - datetime.date.fromisoformat(str(v)[:10])).days)
+        except ValueError:
+            pass
+    count = len(df)
+    return {"count": count, "oldest_days": oldest,
+            "over": count >= max_items, "stale": count > 0 and oldest > stale_days}
+
+
+def _bigrams(s: str) -> set:
+    k = norm_key(s)
+    return {k[i:i + 2] for i in range(len(k) - 1)} or ({k} if k else set())
+
+
+def suggest_task(df_nodes: pd.DataFrame, title: str, memo: str = "",
+                 user: str = "", threshold: float = 0.3) -> Optional[str]:
+    """
+    Inbox チケットの移動先 Task を推定する。
+    チケット名+メモと「Task 名 + 階層パス + 配下チケット名」の文字 2-gram 一致率が
+    最も高い Task を返す（閾値未満なら None）。同点は自分担当を優先。
+    """
+    src = _bigrams(f"{title}{memo}")
+    if not src or df_nodes.empty:
+        return None
+    tickets = df_nodes[df_nodes["node_type"] == "ticket"]
+    kids = tickets.groupby("parent_id")["title"].apply(
+        lambda s: " ".join(map(str, s))) if not tickets.empty else {}
+    best, best_key = None, None
+    for idx, r in _open_tasks(df_nodes).iterrows():
+        text = " ".join(node_path_titles(df_nodes, idx)) + " " + str(kids.get(idx, ""))
+        score = len(src & _bigrams(text)) / len(src)
+        if score < threshold:
+            continue
+        key = (score, 1 if str(r.get("assigned_to", "")) == user else 0)
+        if best_key is None or key > best_key:
+            best, best_key = idx, key
+    return best

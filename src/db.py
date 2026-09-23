@@ -2,8 +2,8 @@
 db.py - データベース接続・CRUD・工数集計・IDX生成
 """
 import sqlite3
-import hashlib
-import random
+import os
+import secrets
 import datetime
 import time
 from pathlib import Path
@@ -17,6 +17,8 @@ import datetime
 NODE_TYPES = ["project1", "project2", "project3", "project4", "task", "ticket"]
 # ステータスの選択肢（deleted は論理削除用）
 STATUS_LIST = ["todo", "done", "cancel", "regularly", "deleted"]
+# Task 未設定チケット（Inbox）の parent_id。列を増やさず特別な親 ID で表す
+INBOX_PARENT = "inbox"
 # 各ノード種別の直下子種別マッピング（Ticketはキー無し → 子作成不可）
 CHILD_TYPE = {
     "project1": "project2",
@@ -64,12 +66,19 @@ DEFAULT_COLORS_BY_TYPE = {
 
 
 # --- IDX ユーティリティ ---
+_ISSUED_IDX: set = set()  # このプロセスで発行済みの IDX（同一セッション内の重複防止）
+
+
 def generate_idx(owner: str) -> str:
-    """YYMMDD_HH + MD5[:6] 形式の TEXT IDX を生成する。重複しにくいランダム文字列を付与。"""
+    """YYMMDD_HH + 16進6桁 形式の TEXT IDX を生成する。
+    乱数は secrets で 16^6（約1677万）通りから取り、同一プロセス内の重複は再生成で回避する。
+    owner は従来互換のため引数として残す。"""
     n = datetime.datetime.now().strftime("%y%m%d%H")
-    rn = str(random.randint(0, 99999))
-    suffix = hashlib.md5((rn + owner).encode()).hexdigest()[:6]
-    return f"{n[:6]}_{n[6:]}{suffix}"
+    while True:
+        idx = f"{n[:6]}_{n[6:]}{secrets.token_hex(3)}"
+        if idx not in _ISSUED_IDX:
+            _ISSUED_IDX.add(idx)
+            return idx
 
 
 def daily_sch_idx(date_str: str, username: str) -> str:
@@ -260,6 +269,10 @@ class Database:
         if self.logger:
             self.logger.warning(msg)
 
+    def _loge(self, msg: str) -> None:
+        if self.logger:
+            self.logger.error(msg)
+
     # ロックファイルの有効期限（秒）
     _LOCK_EXPIRE_SEC = 300
 
@@ -276,32 +289,59 @@ class Database:
         return conn
 
     def acquire_lock(self) -> bool:
-        """保存用ロックファイルを取得する。5分以上古いロックは無効とみなす。"""
+        """保存用ロックファイルを取得する。5分以上古いロックは無効とみなす。
+        O_EXCL で作成するため、同時に取得しようとしても成功するのは 1 人だけ。"""
         lock_path = self.db_dir / "schedule.lock"
         now = time.time()
-        if lock_path.exists():
+        # 内容: "作成時刻 識別子"（先頭の作成時刻で期限切れを判定、識別子で自分のロックを判別）
+        token = f"{now} {os.getpid()}-{secrets.token_hex(4)}"
+        for _ in range(2):
             try:
-                lock_time = float(lock_path.read_text().strip())
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    lock_time = float(lock_path.read_text().split()[0])
+                except Exception:
+                    # 作成直後で未書き込み等の場合はファイル更新時刻で判定する
+                    try:
+                        lock_time = lock_path.stat().st_mtime
+                    except FileNotFoundError:
+                        continue  # 相手が解放済み → 再試行
                 elapsed = now - lock_time
                 if elapsed < self._LOCK_EXPIRE_SEC:
                     self._logw(f"[DB] ロック取得失敗 - 他ユーザーが保存中 (ロック作成から{elapsed:.0f}秒)")
                     return False
-                # 有効期限切れは強制解除して取得
+                # 有効期限切れは強制解除して再取得
                 self._logw(f"[DB] 期限切れロックを強制解除して取得 (経過={elapsed:.0f}秒)")
-            except Exception:
-                self._logw("[DB] ロックファイル読み取り失敗 - 強制上書き")
-        try:
-            lock_path.write_text(str(now))
-        except Exception as e:
-            self._log(f"ロックファイル作成失敗: {e}")
-            return False
-        return True
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except Exception as e:
+                    self._logw(f"[DB] 期限切れロックの削除失敗: {e}")
+                    return False
+                continue
+            except Exception as e:
+                self._logw(f"[DB] ロックファイル作成失敗: {e}")
+                return False
+            with os.fdopen(fd, "w") as f:
+                f.write(token)
+            self._lock_token = token
+            return True
+        return False
 
     def release_lock(self) -> None:
-        """保存用ロックファイルを解放する"""
+        """自分が取得した保存用ロックファイルのみ解放する（他人のロックは消さない）"""
+        token = getattr(self, "_lock_token", None)
+        if token is None:
+            return
+        self._lock_token = None
         lock_path = self.db_dir / "schedule.lock"
         try:
-            lock_path.unlink(missing_ok=True)
+            if lock_path.read_text().strip() == token:
+                lock_path.unlink(missing_ok=True)
+            else:
+                self._logw("[DB] ロックが他ユーザーに取得し直されていたため削除しません")
+        except FileNotFoundError:
+            pass
         except Exception as e:
             self._log(f"ロックファイル削除失敗: {e}")
 
@@ -392,7 +432,8 @@ class Database:
             conn.commit()
             self._log(f"upsert_node: {ds.name} ({ds.get('title', '')})")
         except Exception as e:
-            self._log(f"upsert_node エラー: {e}")
+            self._loge(f"[DB] upsert_node エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 
@@ -418,22 +459,52 @@ class Database:
             conn.commit()
             self._log(f"upsert_nodes_bulk: {len(series_list)} 件")
         except Exception as e:
-            self._log(f"upsert_nodes_bulk エラー: {e}")
+            self._loge(f"[DB] upsert_nodes_bulk エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 
-    def save_nodes(self, df: pd.DataFrame, user: str) -> None:
-        """ユーザー自身が担当するノードを DB に保存する"""
-        if df.empty:
+    def reassign_nodes_bulk(self, idxs: list, user: str) -> None:
+        """担当者のみを変更する（他列は DB の最新値を保持し、古いメモリ内容で上書きしない）"""
+        if not idxs:
             return
+        today = datetime.date.today().isoformat()
+        conn = self._connect()
+        try:
+            for idx in idxs:
+                conn.execute(
+                    "UPDATE nodes SET assigned_to=?, updated_at=? WHERE IDX=?",
+                    [user, today, idx],
+                )
+            conn.commit()
+            self._log(f"reassign_nodes_bulk: {len(idxs)} 件 → {user}")
+        except Exception as e:
+            self._loge(f"[DB] reassign_nodes_bulk エラー: {e}")
+            raise
+        finally:
+            conn.close()
+
+    def save_nodes(self, df: pd.DataFrame, user: str) -> dict:
+        """ユーザー自身が担当するノードを DB に保存する。
+        DB 上で既に他ユーザーへ担当が移っている行（Request 承諾による移管）は
+        古い内容で巻き戻さないよう保存しない。
+        戻り値: 保存しなかった行の {IDX: DB 上の担当者}"""
+        skipped: dict = {}
+        if df.empty:
+            return skipped
         # 自分が担当するノードのみ保存対象とする（2日フィルター廃止）
         mask = df.get("assigned_to", pd.Series(dtype=str)) == user
         target = df[mask]
         if target.empty:
-            return
+            return skipped
         conn = self._connect()
         try:
             for idx in target.index:
+                cur = conn.execute(
+                    "SELECT assigned_to FROM nodes WHERE IDX=?", [idx]).fetchone()
+                if cur is not None and cur[0] != user:
+                    skipped[idx] = cur[0]
+                    continue
                 conn.execute("DELETE FROM nodes WHERE IDX=?", [idx])
                 row = {c: _to_sql_value(target.loc[idx, c] if c in target.columns else None)
                        for c in NODE_COLUMNS[1:]}
@@ -445,11 +516,15 @@ class Database:
                     vals,
                 )
             conn.commit()
-            self._logi(f"[DB] save_nodes: {len(target)} 件保存 user={user}")
+            self._logi(f"[DB] save_nodes: {len(target) - len(skipped)} 件保存 user={user}")
+            if skipped:
+                self._logw(f"[DB] save_nodes: 担当移管済みのため保存しない {skipped}")
         except Exception as e:
-            self._log(f"save_nodes エラー: {e}")
+            self._loge(f"[DB] save_nodes エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
+        return skipped
 
     # ---------- daily_schedule ----------
 
@@ -489,7 +564,8 @@ class Database:
             conn.commit()
             self._logi(f"[DB] save_daily_schedule: {len(target)} 件保存 user={user}")
         except Exception as e:
-            self._log(f"save_daily_schedule エラー: {e}")
+            self._loge(f"[DB] save_daily_schedule エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 
@@ -526,7 +602,8 @@ class Database:
             conn.commit()
             self._logi(f"[DB] save_daily_log: {len(target)} 件保存 user={user}")
         except Exception as e:
-            self._log(f"save_daily_log エラー: {e}")
+            self._loge(f"[DB] save_daily_log エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 
@@ -588,7 +665,8 @@ class Database:
             conn.commit()
             self._log(f"respond_assignments_bulk: {len(assignment_idxs)} 件 → {response}")
         except Exception as e:
-            self._log(f"respond_assignments_bulk エラー: {e}")
+            self._loge(f"[DB] respond_assignments_bulk エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 

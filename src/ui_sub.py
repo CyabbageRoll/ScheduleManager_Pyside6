@@ -77,6 +77,7 @@ class GanttView(QWidget):
         super().__init__()
         self.state = state
         self._date_range: list = []   # 表示日付リスト (datetime.date)
+        self._initial_pj: str = ""    # 前回終了時の Project 選択（初回 refresh で適用）
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
@@ -378,7 +379,8 @@ class GanttView(QWidget):
         df = self.state.df_nodes
         # Project1 コンボ更新
         self.pj_combo.blockSignals(True)
-        cur = self.pj_combo.currentData()
+        cur = self.pj_combo.currentData() or self._initial_pj
+        self._initial_pj = ""
         self.pj_combo.clear()
         self.pj_combo.addItem("（全て）", userData="")
         for idx, row in df[df["node_type"] == "project1"].iterrows():
@@ -778,18 +780,29 @@ class GanttView(QWidget):
                 self.state.refresh()
 
         def _set_status(s: str) -> None:
-            self.state.df_nodes.loc[idx, "status"] = s
-            self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
-            # DB 書き込みはユーザー保存（Ctrl+S）時のみ行う
+            err = LG.status_change_error(self.state.df_nodes, idx, s)
+            if err:
+                QMessageBox.warning(self, "ステータス変更不可", err)
+                return
+            # 実績完了日・親の自動 done を含めて反映（DB 書き込みは Ctrl+S 時）
+            LG.apply_status(self.state.df_nodes, idx, s)
             self.state.nodes_modified = True
             self.state.refresh()
 
         def _delete_ticket() -> None:
+            # Edit タブと同じ削除制約（実績工数・子ノード）を適用する
+            reason = LG.delete_block_reason(self.state.df_nodes, idx, self.state.user)
+            if reason:
+                QMessageBox.warning(self, "削除不可", reason)
+                return
             title = self.state.df_nodes.loc[idx, "title"]
             ans = QMessageBox.question(self, "削除確認",
                                        f"「{title}」を論理削除しますか？")
             if ans == QMessageBox.StandardButton.Yes:
-                _set_status("deleted")
+                self.state.df_nodes.loc[idx, "status"] = "deleted"
+                self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+                self.state.nodes_modified = True
+                self.state.refresh()
 
         # 自分のチケット: 全メニューを表示
         menu = QMenu(self)
@@ -1053,6 +1066,25 @@ class RoadmapView(QWidget):
         self.info = InfoLabel()
         layout.addWidget(self.info)
 
+    def apply_saved_view(self, level: str, unit: str, filter_own: bool,
+                         col_extra: int) -> None:
+        """前回終了時の表示設定を反映する（起動時用。再描画は表示時の refresh に任せる）"""
+        if level in self._lvl_btns:
+            self._current_level = level
+            for lbl, btn in self._lvl_btns.items():
+                btn.setChecked(lbl == level)
+        if unit in self._unit_btns:
+            self._cell_unit = unit
+            for u, btn in self._unit_btns.items():
+                btn.setChecked(u == unit)
+        self._date_col_extra = max(-40, min(100, int(col_extra)))
+        self._filter_own = bool(filter_own)
+        self._filter_own_btn.blockSignals(True)
+        self._filter_own_btn.setChecked(self._filter_own)
+        self._filter_own_btn.setText(
+            "👤 選択中メンバーのみ ✓" if self._filter_own else "👤 選択中メンバーのみ")
+        self._filter_own_btn.blockSignals(False)
+
     # ── レベル / 単位ボタン ──
 
     def _on_level_btn(self, label: str) -> None:
@@ -1222,7 +1254,9 @@ class RoadmapView(QWidget):
             d_to = datetime.date(y6, m6, min(today.day, d6_max))
         elif name == "Next01y":
             d_from = today
-            d_to   = datetime.date(today.year + 1, today.month, today.day)
+            # 2/29 起点で翌年に同日が無い場合は月末日に丸める
+            d1_max = calendar.monthrange(today.year + 1, today.month)[1]
+            d_to   = datetime.date(today.year + 1, today.month, min(today.day, d1_max))
         else:
             return
 
@@ -1311,8 +1345,12 @@ class RoadmapView(QWidget):
 
         def _set_status(s: str) -> None:
             """ステータスを変更する（インメモリのみ、Ctrl+S で保存）"""
-            df.loc[idx, "status"] = s
-            df.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+            err = LG.status_change_error(df, idx, s)
+            if err:
+                QMessageBox.warning(self, "ステータス変更不可", err)
+                return
+            # 実績完了日・親の自動 done を含めて反映
+            LG.apply_status(df, idx, s)
             self.state.nodes_modified = True
             self.state.notify_dirty()
             self._rebuild_table()
@@ -1987,25 +2025,21 @@ class AnalysisView(QWidget):
             for idx, row in groups.iterrows()
         }
 
-        if user_set is None:
-            # 全員: ノード自身の集計値をそのまま使用
-            for idx in list(agg.keys()):
-                row = df.loc[idx]
-                agg[idx]["actual"] = float(row.get("actual_hours", 0) or 0)
-                agg[idx]["est"]    = float(row.get("estimated_hours", 0) or 0)
-        else:
-            # 特定ユーザーのみ: チケットを走査して積み上げ
-            tickets = df[(df["node_type"] == "ticket") &
-                         (df["assigned_to"].isin(user_set))]
-            if scope_idxs:
-                tickets = tickets[tickets.index.map(
-                    lambda i: self._is_in_scope(str(i), scope_idxs, df)
-                )]
-            for t_idx, t_row in tickets.iterrows():
-                anc = self._find_ancestor_at_type(str(t_idx), level)
-                if anc and anc in agg:
-                    agg[anc]["actual"] += float(t_row.get("actual_hours", 0) or 0)
-                    agg[anc]["est"]    += float(t_row.get("estimated_hours", 0) or 0)
+        # チケットを走査して集計レベルの祖先へ積み上げる
+        # （見積は上位ノードへ集計されないため、全員の場合もチケットから合算する）
+        tickets = df[(df["node_type"] == "ticket")
+                     & (~df["status"].isin(["cancel", "deleted"]))]
+        if user_set is not None:
+            tickets = tickets[tickets["assigned_to"].isin(user_set)]
+        if scope_idxs:
+            tickets = tickets[tickets.index.map(
+                lambda i: self._is_in_scope(str(i), scope_idxs, df)
+            )]
+        for t_idx, t_row in tickets.iterrows():
+            anc = self._find_ancestor_at_type(str(t_idx), level)
+            if anc and anc in agg:
+                agg[anc]["actual"] += float(t_row.get("actual_hours", 0) or 0)
+                agg[anc]["est"]    += float(t_row.get("estimated_hours", 0) or 0)
 
         # ── 棒グラフ描画 ──────────────────────────────────
         # 個人振り返り（2分割描画）の後でも正しく描けるよう Figure ごと再生成する
@@ -2062,11 +2096,14 @@ class AnalysisView(QWidget):
             al_ids.append(str(t_idx))
         self.alert_table.blockSignals(True)
         self.alert_table.set_rows(al_rows, row_ids=al_ids)
-        # メモ列のみ編集可能フラグを追加
+        # メモ列のみ編集可能フラグを追加（自分のチケットのみ。他人の分は保存されないため）
         for row_i in range(self.alert_table.rowCount()):
             memo_item = self.alert_table.item(row_i, self._AL_COL_MEMO)
             if memo_item:
-                memo_item.setFlags(memo_item.flags() | Qt.ItemFlag.ItemIsEditable)
+                t_idx = memo_item.data(Qt.ItemDataRole.UserRole)
+                if (t_idx in df.index
+                        and str(df.loc[t_idx, "assigned_to"]) == self.state.user):
+                    memo_item.setFlags(memo_item.flags() | Qt.ItemFlag.ItemIsEditable)
         self.alert_table.blockSignals(False)
         self.info.set_info(
             f"集計: {len(agg)} ノード / 超過チケット: {len(al_rows)}"
@@ -2129,10 +2166,13 @@ class AnalysisView(QWidget):
         idx = item.data(Qt.ItemDataRole.UserRole)
         if not idx or idx not in self.state.df_nodes.index:
             return
+        if str(self.state.df_nodes.loc[idx, "assigned_to"]) != self.state.user:
+            return  # 他ユーザーのチケットは編集不可
         new_memo = item.text()
         self.state.df_nodes.loc[idx, "memo"] = new_memo
         self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
         self.state.nodes_modified = True
+        self.state.notify_dirty()
 
 
 # ---------- 検索 ----------
@@ -2288,7 +2328,6 @@ class SearchView(QWidget):
             date_to="",
             node_types=["ticket"],
         )
-        self._last_result = result
         # 期間内実績工数を一括計算（日付範囲指定時のみ）
         period_hours = self._calc_period_hours_batch(
             list(result.index), date_from, date_to
@@ -2296,6 +2335,8 @@ class SearchView(QWidget):
         # 期間指定時は期間内工数が 0 のアイテムを除外する
         if date_from or date_to:
             result = result[result.index.map(lambda i: period_hours.get(i, 0) > 0)]
+        # CSV 出力は画面に表示した結果と一致させる（期間フィルタ後）
+        self._last_result = result
         rows = []
         for idx, r in result.iterrows():
             anc = self._get_ancestors(idx)
@@ -2620,6 +2661,7 @@ class AssignmentView(QWidget):
 
         # 左:右 = 1:2 の初期幅
         splitter.setSizes([300, 600])
+        self._splitter = splitter  # 画面状態の記憶用
 
         self.info = InfoLabel()
         layout.addWidget(self.info)
@@ -2991,6 +3033,7 @@ class AssignmentView(QWidget):
             return
         today = datetime.date.today().isoformat()
         nodes_to_upsert: list = []
+        nodes_to_reassign: list = []
 
         for asgn_idx in asgn_ids:
             t_idx = self.state.df_assignments.loc[asgn_idx, "ticket_id"]
@@ -3009,19 +3052,32 @@ class AssignmentView(QWidget):
                 self.state.df_nodes.loc[new_idx] = new_row
                 nodes_to_upsert.append(self.state.df_nodes.loc[new_idx])
             else:
-                # ticket 以外（task / project）は担当者を変更
-                self.state.df_nodes.loc[t_idx, "assigned_to"] = self.state.user
-                self.state.df_nodes.loc[t_idx, "updated_at"] = today
-                nodes_to_upsert.append(self.state.df_nodes.loc[t_idx])
+                # ticket 以外（task / project）は担当者のみ変更する
+                # （手元の古い行で DB を丸ごと上書きしないよう UPDATE で行う）
+                nodes_to_reassign.append(t_idx)
 
         # DB 書き込みを 1 トランザクションにまとめて処理（複数承諾時の速度改善）
-        if nodes_to_upsert:
-            self.state.db.upsert_nodes_bulk(nodes_to_upsert)
-        self.state.db.respond_assignments_bulk(asgn_ids, "accepted")
+        try:
+            if nodes_to_upsert:
+                self.state.db.upsert_nodes_bulk(nodes_to_upsert)
+            if nodes_to_reassign:
+                self.state.db.reassign_nodes_bulk(nodes_to_reassign, self.state.user)
+            self.state.db.respond_assignments_bulk(asgn_ids, "accepted")
+        except Exception as e:
+            QMessageBox.critical(self, "承諾エラー", f"DB への書き込みに失敗しました:\n{e}")
+            return
+        # 移管したノードは DB の最新内容（元担当者の保存済み内容）をメモリへ取り込む
+        if nodes_to_reassign:
+            fresh = self.state.db.read_nodes()
+            for t_idx in nodes_to_reassign:
+                if t_idx in fresh.index:
+                    self.state.df_nodes.loc[t_idx] = fresh.loc[t_idx]
         if self.state.logger:
             self.state.logger.info(f"[Request] 承諾 user={self.state.user} 件数={len(asgn_ids)} ids={asgn_ids}")
 
         self.state.df_assignments = self.state.db.read_assignments()
+        # DB へ直接反映したノード変更は元に戻せないため、ここを Undo の起点にする
+        self.state.reset_undo()
         self.refresh()
         count = len(asgn_ids)
         msg = "承諾しました" if count == 1 else f"{count}件をまとめて承諾しました"
@@ -3195,6 +3251,7 @@ class ConfigView(QWidget):
         self._build_section_daily_info()
         self._build_section_report()
         self._build_section_pomodoro()
+        self._build_section_inbox()
         self._build_section_commands()
 
         self._form_layout.addStretch()
@@ -3291,7 +3348,7 @@ class ConfigView(QWidget):
         self._spin("gui_window_height", cfg.window_height, fl, "window_height:", 400, 2160)
         self._spin("gui_font_size",     cfg.font_size,     fl, "font_size:",     6, 24)
         self._text("gui_start_tab",     cfg.start_tab,     fl,
-                   "start_tab (today/main/edit/plan):")
+                   "start_tab (today/main/edit/plan/last):")
         self._text("gui_detail_pane",
                    "open" if cfg.detail_pane_open else "closed", fl,
                    "detail_pane (open/closed):")
@@ -3326,6 +3383,14 @@ class ConfigView(QWidget):
                    "work_minutes (作業時間/分):", 1, 120)
         self._spin("pomo_break", cfg.pomodoro_break_minutes, fl,
                    "break_minutes (休憩時間/分):", 1, 60)
+
+    def _build_section_inbox(self) -> None:
+        cfg = self.state.config
+        fl = self._group("[Inbox]")
+        self._spin("inbox_max", cfg.inbox_max_items, fl,
+                   "max_items (Inbox 上限件数):", 1, 999)
+        self._spin("inbox_stale", cfg.inbox_stale_days, fl,
+                   "stale_days (滞留とみなす日数):", 1, 365)
 
     def _build_section_commands(self) -> None:
         cfg = self.state.config
@@ -3371,6 +3436,8 @@ class ConfigView(QWidget):
         _set("gui_detail_pane",  "open" if cfg.detail_pane_open else "closed")
         _set("pomo_work",        cfg.pomodoro_work_minutes)
         _set("pomo_break",       cfg.pomodoro_break_minutes)
+        _set("inbox_max",        cfg.inbox_max_items)
+        _set("inbox_stale",      cfg.inbox_stale_days)
 
     # ── 保存 ──
 
@@ -3384,7 +3451,9 @@ class ConfigView(QWidget):
 
     def _on_save(self) -> None:
         """フォーム値を user_config.ini に書き込む（config.ini は上書きしない）"""
-        parser = configparser.ConfigParser()
+        # 読込側（load_config）と同じく % を解釈せず、キーの大文字小文字を保持する
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.optionxform = str
         # 既存の user_config.ini を読んで保持（なければ config.ini をベースにする）
         if self._USER_CONFIG_PATH.exists():
             parser.read(str(self._USER_CONFIG_PATH), encoding="utf-8")
@@ -3434,6 +3503,10 @@ class ConfigView(QWidget):
         parser.set("Pomodoro", "work_minutes",  self._get("pomo_work"))
         parser.set("Pomodoro", "break_minutes", self._get("pomo_break"))
 
+        _ensure("Inbox")
+        parser.set("Inbox", "max_items",  self._get("inbox_max"))
+        parser.set("Inbox", "stale_days", self._get("inbox_stale"))
+
         # Commands は既存エントリをそのまま保持（フォームに表示した分のみ更新）
         _ensure("Commands")
         cfg = self.state.config
@@ -3457,7 +3530,7 @@ class DashboardView(QWidget):
     """今日のダッシュボード（今日やること・気にすべきことを 1 画面に集約）"""
 
     # カードの「開く」クリック → MainWindow がタブ遷移する
-    navigate_requested = Signal(str)  # "schedule" / "edit" / "request" / "team"
+    navigate_requested = Signal(str)  # "schedule" / "edit" / "request" / "team" / "inbox"
 
     def __init__(self, state):
         super().__init__()
@@ -3470,6 +3543,23 @@ class DashboardView(QWidget):
         self.header_lbl = QLabel("🏠 Today")
         layout.addWidget(self.header_lbl)
         layout.addWidget(Separator())
+
+        # 📥 Inbox バナー（Task 未設定チケットがあるときだけ表示）
+        self.inbox_banner = QFrame()
+        self.inbox_banner.setStyleSheet(
+            "QFrame { background:#F3E5F5; border:1px solid #CE93D8; border-radius:6px; }")
+        _bl = QHBoxLayout(self.inbox_banner)
+        _bl.setContentsMargins(8, 4, 8, 4)
+        self.inbox_lbl = QLabel("")
+        self.inbox_lbl.setStyleSheet("QLabel { color:#6A1B9A; font-weight:bold; border:none; }")
+        _bl.addWidget(self.inbox_lbl)
+        _bl.addStretch()
+        _inbox_btn = QPushButton("振り分ける")
+        _inbox_btn.setStyleSheet(STYLE_BUTTON)
+        _inbox_btn.clicked.connect(lambda: self.navigate_requested.emit("inbox"))
+        _bl.addWidget(_inbox_btn)
+        self.inbox_banner.setVisible(False)
+        layout.addWidget(self.inbox_banner)
 
         grid = QGridLayout()
         grid.setSpacing(8)
@@ -3530,6 +3620,16 @@ class DashboardView(QWidget):
         df_nodes = self.state.df_nodes
         self.header_lbl.setText(
             f"🏠 Today {today}  [{self.state.display_name(user)}]")
+
+        # 0. Inbox バナー
+        cfg = self.state.config
+        ib = LG.inbox_summary(df_nodes, user, cfg.inbox_max_items, cfg.inbox_stale_days)
+        self.inbox_banner.setVisible(ib["count"] > 0)
+        if ib["count"]:
+            warn = ("　⚠ 上限に達しています" if ib["over"]
+                    else "　⚠ 滞留しています" if ib["stale"] else "")
+            self.inbox_lbl.setText(
+                f"📥 Inbox {ib['count']} 件（最古 {ib['oldest_days']} 日前）{warn}")
 
         # 1. 今日のスケジュール（連続区間にまとめて表示）
         lst = self._cards["schedule"]["list"]
@@ -3758,39 +3858,68 @@ class AIImportView(QWidget):
                 t_memo_str = f" | {t_memo}" if t_memo else ""
                 lines.append(f"    - {t_idx} | {t_title}{dl_str}{t_memo_str}")
 
+        # Task 未設定（Inbox）のチケット: AI に振り分け先を判断させる
+        inbox = LG.inbox_tickets(df, self.state.user)
+        if not inbox.empty:
+            lines += ["", "【Task未設定Ticket（Inbox）（IDX | チケット名 | 見積 | 納期 | memo）】",
+                      "  ※ 各チケットに最適な親Taskを Task一覧 から選んでください"]
+            for t_idx, t_row in inbox.iterrows():
+                est = float(t_row.get("estimated_hours") or 0)
+                dl = str(t_row.get("deadline") or "").strip() or "-"
+                memo = str(t_row.get("memo") or "").strip()
+                lines.append(f"  {t_idx} | {t_row.get('title', '')} | "
+                             f"{f'{est:g}h' if est else '-'} | {dl} | {memo}")
+
         return "\n".join(lines)
 
     # ── チケット取り込み ──
 
     def _on_import_tickets(self) -> None:
-        """テキストエリアの LLM 返答をパースし、チケットを DB へ登録する"""
+        """テキストエリアの LLM 返答をパースし、新規チケットの DB 登録と
+        Inbox チケットの振り分け（移動。新規作成はしない）を行う"""
         text = self.text_edit.toPlainText().strip()
         if not text:
             self.info.set_error("テキストが空です")
             return
 
-        items, errors = self._parse_llm_response(text)
+        items, errors, skipped = self._parse_llm_response(text)
         if errors:
             self.info.set_error("パースエラー: " + " / ".join(errors))
             return
         if not items:
-            self.info.set_error("取り込める内容が見つかりませんでした")
+            self.info.set_error("取り込める内容が見つかりませんでした"
+                                + (f"（スキップ: {' / '.join(skipped)}）" if skipped else ""))
             return
 
-        preview = "\n".join(
-            f"{i}. {it['title']}  (Task: {it['parent_idx']})"
-            for i, it in enumerate(items, 1)
-        )
+        df = self.state.df_nodes
+
+        def _task_title(t_idx: str) -> str:
+            return str(df.loc[t_idx, "title"]) if t_idx in df.index else t_idx
+
+        moves = [it for it in items if it["kind"] == "move"]
+        news = [it for it in items if it["kind"] == "new"]
+        lines = []
+        if moves:
+            lines.append(f"■ Inbox から移動 {len(moves)} 件（新規作成しません）")
+            lines += [f"  {it['title']} → {_task_title(it['parent_idx'])}"
+                      + (f"  ※{it['note']}" if it.get("note") else "") for it in moves]
+        if news:
+            lines.append(f"■ 新規作成 {len(news)} 件")
+            lines += [f"  {it['title']} → {_task_title(it['parent_idx'])}" for it in news]
+        if skipped:
+            lines.append(f"■ スキップ {len(skipped)} 件")
+            lines += [f"  {m}" for m in skipped]
         reply = QMessageBox.question(
             self, "チケット取り込み確認",
-            f"{len(items)} 件のチケットを取り込みます。よろしいですか？\n\n{preview}",
+            "以下の内容で取り込みます。よろしいですか？\n\n" + "\n".join(lines),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        # 1) 新規チケット: 従来どおり DB へ直接登録
         imported_idxs = []
-        for it in items:
+        for it in news:
             ds = DB.create_initial_node(
                 owner=self.state.user,
                 node_type="ticket",
@@ -3802,16 +3931,47 @@ class AIImportView(QWidget):
             if it.get("memo"):
                 ds["memo"] = it["memo"]
 
-            self.state.db.upsert_node(ds)
+            try:
+                self.state.db.upsert_node(ds)
+            except Exception as e:
+                QMessageBox.critical(self, "取り込みエラー",
+                                     f"DB への登録に失敗しました: {it['title']}\n{e}")
+                break
+            # DB 全件の再読込はせず、取り込んだ行だけをメモリへ追加する
+            # （再読込すると他の未保存の編集が失われるため）
+            self.state.df_nodes.loc[ds.name] = ds
             imported_idxs.append(str(ds.name))
+        if imported_idxs:
+            # DB へ直接登録した行はメモリから戻すと食い違うため、ここを Undo の起点にする
+            self.state.reset_undo()
 
-        self.state.df_nodes = self.state.db.read_nodes()
+        # 2) Inbox の移動: インメモリ（Ctrl+Z で取り消し可・Ctrl+S で保存）
+        moved_idxs = []
+        today = datetime.date.today().isoformat()
+        for it in moves:
+            siblings = df[df["parent_id"] == it["parent_idx"]]
+            df.loc[it["idx"], "parent_id"] = it["parent_idx"]
+            df.loc[it["idx"], "priority"] = (int(siblings["priority"].max()) + 1
+                                             if not siblings.empty else 1)
+            df.loc[it["idx"], "updated_at"] = today
+            moved_idxs.append(it["idx"])
+        if moved_idxs:
+            self.state.nodes_modified = True
+            self.state.notify_dirty()
+
+        if not imported_idxs and not moved_idxs:
+            return
         self.state.refresh()
 
         if self.state.logger:
-            self.state.logger.info(f"[AI取込] チケット {len(imported_idxs)} 件登録 user={self.state.user} ids={imported_idxs}")
-        self.info.set_info(f"{len(imported_idxs)} 件を取り込みました")
-        self.import_done.emit(imported_idxs)
+            self.state.logger.info(
+                f"[AI取込] 新規 {len(imported_idxs)} 件 / Inbox 移動 {len(moved_idxs)} 件"
+                f" user={self.state.user} new={imported_idxs} moved={moved_idxs}")
+        msg = f"新規 {len(imported_idxs)} 件を取り込み、Inbox から {len(moved_idxs)} 件を振り分けました"
+        if moved_idxs:
+            msg += "（振り分けは Ctrl+S で保存）"
+        self.info.set_info(msg)
+        self.import_done.emit(imported_idxs + moved_idxs)
 
     @staticmethod
     def _strip_code_fences(text: str) -> str:
@@ -3823,17 +3983,23 @@ class AIImportView(QWidget):
         LLM 返答からチケットリストをパースする。
 
         フォーマット:
-            title: タイトル（必須）
+            title: タイトル（新規作成時は必須）
             parent_idx: 親Task の IDX（必須）
             deadline: YYYY-MM-DD（省略可）
             memo: メモ（省略可）
             ---
-            （複数チケットは --- で区切る）
+            idx: Inbox チケットの IDX（振り分け時。title 不要）
+            parent_idx: 親Task の IDX
+            （複数エントリは --- で区切る）
 
         後方互換: $$$items ... $$$ ブロックがあればその中身を抽出する。
+        戻り値: (items, errors, skipped)
+            items: [{"kind": "new"|"move", "title", "parent_idx", ...}]
+            skipped: 取り込まない理由のメッセージ（エラーではない）
         """
         items: list = []
         errors: list = []
+        skipped: list = []
         df = self.state.df_nodes
 
         text = self._strip_code_fences(text)
@@ -3842,10 +4008,13 @@ class AIImportView(QWidget):
         match = re.search(r"\$\$\$items\s*(.*?)\$\$\$", text, re.DOTALL)
         block = match.group(1).strip() if match else text.strip()
 
-        # 構文チェック: title キーが1つも無ければエラー
-        if "title:" not in block:
-            errors.append("title: が見つかりません。フォーマットを確認してください")
-            return items, errors
+        # 構文チェック: title / idx キーが 1 つも無ければエラー（parent_idx は数えない）
+        if not re.search(r"(?m)^\s*(title|idx)\s*:", block):
+            errors.append("title: / idx: が見つかりません。フォーマットを確認してください")
+            return items, errors, skipped
+
+        inbox = LG.inbox_tickets(df, self.state.user)
+        used_inbox: set = set()  # 同じ Inbox チケットを二重に移動しない
 
         entries = [e.strip() for e in block.split("---") if e.strip()]
 
@@ -3856,9 +4025,34 @@ class AIImportView(QWidget):
                     key, _, val = line.partition(":")
                     item[key.strip()] = val.strip()
 
-            if not item.get("title"):
+            inbox_idx = item.get("idx", "")
+            if not inbox_idx and not item.get("title"):
                 errors.append("title が空のエントリがあります")
                 continue
+
+            # --- Inbox チケットの振り分け（idx 指定）---
+            if inbox_idx:
+                if inbox_idx not in df.index:
+                    skipped.append(f"IDX が見つかりません: {inbox_idx}")
+                    continue
+                title = str(df.loc[inbox_idx, "title"])
+                if (str(df.loc[inbox_idx, "parent_id"]) != DB.INBOX_PARENT
+                        or inbox_idx not in inbox.index):
+                    skipped.append(f"振り分け済み（Inbox にありません）: {title}")
+                    continue
+                if inbox_idx in used_inbox:
+                    skipped.append(f"同じチケットが重複しています: {title}")
+                    continue
+                parent_idx = item.get("parent_idx", "")
+                if parent_idx not in df.index or str(df.loc[parent_idx, "node_type"]) != "task":
+                    skipped.append(f"移動先の Task がありません: {title}")
+                    continue
+                used_inbox.add(inbox_idx)
+                items.append({"kind": "move", "idx": inbox_idx, "title": title,
+                              "parent_idx": parent_idx})
+                continue
+
+            # --- 新規（従来形式）---
             if not item.get("parent_idx"):
                 errors.append(f"parent_idx が空: {item.get('title', '?')}")
                 continue
@@ -3871,9 +4065,22 @@ class AIImportView(QWidget):
                 errors.append(f"parent_idx の種別が task ではありません: {parent_idx} (title: {item.get('title')})")
                 continue
 
+            # idx の付け忘れ: タイトルが Inbox チケットと完全一致（1 件）なら移動扱い
+            key = LG.norm_key(item["title"])
+            same = [i for i in inbox.index
+                    if i not in used_inbox and LG.norm_key(inbox.loc[i, "title"]) == key]
+            if len(same) == 1:
+                used_inbox.add(same[0])
+                items.append({"kind": "move", "idx": same[0],
+                              "title": str(inbox.loc[same[0], "title"]),
+                              "parent_idx": parent_idx,
+                              "note": "IDX 指定なし・同名の Inbox チケットと判断"})
+                continue
+
+            item["kind"] = "new"
             items.append(item)
 
-        return items, errors
+        return items, errors, skipped
 
     # ── 日次スケジュール作成プロンプト ──
 
@@ -3943,6 +4150,19 @@ class AIImportView(QWidget):
         df_nodes = self.state.df_nodes
         sch_idx = DB.daily_sch_idx(date_str, self.state.user)
 
+        # 割り当て可能なのは自分担当のチケットのみ（手動割り当てと同じ制約）
+        invalid = []
+        for it in items:
+            t = it["ticket_idx"]
+            if t not in df_nodes.index:
+                invalid.append(f"ticket_idx が見つかりません: {t}")
+            elif (str(df_nodes.loc[t, "node_type"]) != "ticket"
+                  or str(df_nodes.loc[t, "assigned_to"]) != self.state.user):
+                invalid.append(f"自分のチケットではありません: {t}")
+        if invalid:
+            self.info.set_error("取り込み不可: " + " / ".join(invalid))
+            return
+
         # 日付行が存在しなければ作成
         if self.state.df_daily.empty or sch_idx not in self.state.df_daily.index:
             new_row = {c: "" for c in DB.DAILY_SCH_COLS[1:]}
@@ -3955,10 +4175,6 @@ class AIImportView(QWidget):
             ticket_idx = it["ticket_idx"]
             from_col = it["from_col"]
             to_col = it["to_col"]
-
-            if ticket_idx not in df_nodes.index:
-                self.info.set_error(f"ticket_idx が見つかりません: {ticket_idx}")
-                continue
 
             from_i = DB.DAILY_TIME_COLS.index(from_col)
             to_i = DB.DAILY_TIME_COLS.index(to_col)
@@ -4095,6 +4311,11 @@ class AIImportView(QWidget):
         if not date_str:
             errors.append("date が見つかりません（先頭に date: YYYY-MM-DD を記載してください）")
             return date_str, items, errors
+        try:
+            date_str = datetime.date.fromisoformat(date_str).isoformat()
+        except ValueError:
+            errors.append(f"date の形式が不正です（YYYY-MM-DD）: {date_str}")
+            return "", items, errors
 
         # 以降のセクションをスケジュールアイテムとして解析
         for section in sections[1:]:

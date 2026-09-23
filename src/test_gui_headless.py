@@ -1532,6 +1532,367 @@ def test_save_load(state):
 # -------------------------------------------------------
 # メイン
 # -------------------------------------------------------
+def test_undo_redo(win, task_idx, ticket_idx):
+    """B6: Ctrl+Z（元に戻す）/ Ctrl+Y（やり直し）"""
+    print("\n[B6] 元に戻す / やり直しテスト")
+    from PySide6.QtCore import Qt
+    import db as DB
+    state = win.state
+    tp = win.main_pane.table_pane
+
+    def row_of(idx):
+        for r in range(tp.table.rowCount()):
+            it = tp.table.item(r, 0)
+            if it and it.data(Qt.ItemDataRole.UserRole) == idx:
+                return r
+        return -1
+
+    try:
+        # 起点: 保存直後（履歴なし・未保存なし）
+        win._on_save()
+        assert not win._undo.can_undo(), "保存直後に戻せる履歴がある"
+        tp.update_for_parent(task_idx)
+        orig = str(state.df_nodes.loc[ticket_idx, "title"])
+        tp.table.item(row_of(ticket_idx), 0).setText("Undo確認用タイトル")
+        assert state.df_nodes.loc[ticket_idx, "title"] == "Undo確認用タイトル"
+        win._on_undo()
+        assert state.df_nodes.loc[ticket_idx, "title"] == orig, "タイトルが戻らない"
+        assert not state.nodes_modified, "起点まで戻ったのに未保存扱い"
+        win._on_redo()
+        assert state.df_nodes.loc[ticket_idx, "title"] == "Undo確認用タイトル", "やり直せない"
+        assert state.nodes_modified
+        win._on_undo()
+        ok("表の編集 → Ctrl+Z で戻り、Ctrl+Y でやり直せる（起点では未保存フラグも戻る）")
+    except Exception as e:
+        ng("表の編集の Undo/Redo", e)
+
+    try:
+        # 1 操作内の複数変更（連番化 + 追加 + 自動チケット）は 1 回で戻る
+        n_before = len(state.df_nodes)
+        tp.update_for_parent(task_idx)
+        tp._add_from_blank_row("Undo一括確認")
+        assert len(state.df_nodes) == n_before + 1
+        win._on_undo()
+        assert len(state.df_nodes) == n_before, "1 回の Undo で追加が消えない"
+        ok("1 操作内の複数変更は 1 回の Ctrl+Z で戻る")
+    except Exception as e:
+        ng("1 操作単位の Undo", e)
+
+    try:
+        # 日次スケジュールの割り当ても戻る（実績工数も連動）
+        state.current_member = state.user
+        panel = win.schedule_panel
+        act_before = float(state.df_nodes.loc[ticket_idx, "actual_hours"] or 0)
+        panel._update_schedule_slots([40, 41], ticket_idx)
+        assert float(state.df_nodes.loc[ticket_idx, "actual_hours"]) == act_before + 0.5
+        win._on_undo()
+        sch_idx = DB.daily_sch_idx(state.current_date, state.user)
+        slot_empty = (sch_idx not in state.df_daily.index
+                      or not state.df_daily.loc[sch_idx, "C1000"])
+        assert slot_empty, "スロット割り当てが戻らない"
+        assert float(state.df_nodes.loc[ticket_idx, "actual_hours"] or 0) == act_before
+        ok("スケジュール割り当ての Ctrl+Z で実績工数も元に戻る")
+    except Exception as e:
+        ng("スケジュールの Undo", e)
+
+    try:
+        # 保存すると起点が更新され、それより前には戻れない
+        tp.update_for_parent(task_idx)
+        tp.table.item(row_of(ticket_idx), 1).setText("7")
+        win._on_save()
+        win._on_undo()
+        assert int(state.df_nodes.loc[ticket_idx, "priority"]) == 7, "保存前の状態に戻ってしまった"
+        assert not state.nodes_modified
+        ok("保存後は保存前の状態へ戻らない（保存時点が起点）")
+    except Exception as e:
+        ng("保存時の Undo 起点", e)
+
+
+def test_quick_add_parse():
+    """B2: クイック追加の解析ルール（06_B2 仕様書の表）"""
+    print("\n[B2] クイック追加の解析テスト")
+    import logic as LG
+    T = datetime.date(2026, 9, 23)  # 水曜日
+    D = lambda m, d, y=2026: datetime.date(y, m, d)
+    cases = [
+        ("水の入れ替え　1.５　明日", dict(title="水の入れ替え", hours=1.5, deadline=D(9, 24))),
+        ("a ２ｈ", dict(hours=2.0)), ("a 2.5", dict(hours=2.5)), ("a 30分", dict(hours=0.5)),
+        ("a 1時間半", dict(hours=1.5)), ("a 20分", dict(hours=0.5, hours_rounded=True)),
+        ("Phase 3", dict(title="Phase 3", hours=None)),
+        ("a 水", dict(deadline=D(9, 23))), ("a 来週水", dict(deadline=D(9, 30))),
+        ("a 今週中", dict(deadline=D(9, 25))), ("a 月末", dict(deadline=D(9, 30))),
+        ("a 5日", dict(deadline=D(10, 5))), ("a ９／３０", dict(deadline=D(9, 30))),
+        ("a 1/10", dict(deadline=D(1, 10, 2027))), ("a 9/10", dict(deadline=D(9, 10))),
+        ("a 9/28〜10/2", dict(start=D(9, 28), deadline=D(10, 2))),
+        ("レビュー2h", dict(title="レビュー2h", hours=None)),
+        ("「水」 交換", dict(title="水 交換", deadline=None)),
+        ("見積 2h 金曜 @設計書", dict(title="見積", task_query="設計書", deadline=D(9, 25))),
+        ("x 明日 #明日までに鍵", dict(title="x", memo="明日までに鍵", deadline=D(9, 24))),
+        ("Issue#123 対応", dict(title="Issue#123 対応", memo="")),
+    ]
+    bad = []
+    for text, exp in cases:
+        r = LG.parse_quick_add(text, today=T)
+        diff = {k: (r[k], v) for k, v in exp.items() if r[k] != v}
+        if diff:
+            bad.append((text, diff))
+    if bad:
+        ng(f"解析ルール {len(cases) - len(bad)}/{len(cases)}", Exception(str(bad)))
+    else:
+        ok(f"解析ルール {len(cases)} 例がすべて仕様どおり")
+    try:
+        r = LG.parse_quick_add("a 3", today=T)
+        assert r["hints"] and r["title"] == "a 3"
+        r = LG.parse_quick_add("a 9/10", today=T)
+        assert any("過去日" in w for w in r["warnings"])
+        ok("整数のみはヒント表示、過去日は警告")
+    except Exception as e:
+        ng("ヒント・警告", e)
+
+
+def test_quick_add_inbox(win, task_idx, tmpdir):
+    """B2: クイック追加・Inbox・振り分け・AI 取込"""
+    print("\n[B2] クイック追加 / Inbox テスト")
+    import logic as LG
+    import db as DB
+    import ui_main
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QDialog, QMessageBox
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, tmpdir)
+    state = win.state
+    cfg = state.config
+    cfg.inbox_max_items, cfg.inbox_stale_days = 10, 3
+    task_title = str(state.df_nodes.loc[task_idx, "title"])
+
+    try:
+        dlg = ui_main.QuickAddDialog(state)
+        dlg.edit.setText("Inbox確認 1.5 明日 #給湯室の件")
+        dlg._on_create()
+        r = dlg.result_data
+        assert r and r["parent"] == DB.INBOX_PARENT and r["hours"] == 1.5 \
+            and r["memo"] == "給湯室の件", r
+        ds = win._create_quick_ticket(r)
+        assert state.df_nodes.loc[ds.name, "parent_id"] == DB.INBOX_PARENT
+        inbox_idx = ds.name
+        ok("@ なしは Inbox に作成（工数・メモも反映）")
+    except Exception as e:
+        ng("Inbox への作成", e)
+        return
+
+    try:
+        dlg = ui_main.QuickAddDialog(state)
+        dlg.edit.setText(f"Task指定確認 @{task_title}")
+        dlg._on_create()
+        assert dlg.result_data and dlg.result_data["parent"] == task_idx, dlg.result_data
+        dlg = ui_main.QuickAddDialog(state)
+        dlg.edit.setText("該当なし確認 @存在しないTask名xyz")
+        dlg._on_create()
+        assert dlg.result_data is None
+        ok("@Task は候補から確定、該当なしは作成しない")
+    except Exception as e:
+        ng("@Task 指定", e)
+
+    try:
+        # 朝のスロット連携: 4 スロット選択 → 工数 1.0h・割り当て
+        state.current_member = state.user
+        orig_exec = ui_main.QuickAddDialog.exec
+
+        def fake_exec(self):
+            self.edit.setText(f"朝の割当確認 @{task_title}")
+            self._on_create()
+            return QDialog.DialogCode.Accepted if self.result_data else QDialog.DialogCode.Rejected
+        ui_main.QuickAddDialog.exec = fake_exec
+        try:
+            win._on_quick_add(rows=[36, 37, 38, 39])
+        finally:
+            ui_main.QuickAddDialog.exec = orig_exec
+        new = state.df_nodes[state.df_nodes["title"] == "朝の割当確認"]
+        assert len(new) == 1
+        n_idx = new.index[0]
+        assert float(new.loc[n_idx, "estimated_hours"]) == 1.0
+        sch_idx = DB.daily_sch_idx(state.current_date, state.user)
+        assert state.df_daily.loc[sch_idx, "C0900"] == n_idx
+        assert state.df_daily.loc[sch_idx, "C0945"] == n_idx
+        ok("スロット選択中の作成: 工数=スロット時間、同時に割り当て")
+    except Exception as e:
+        ng("スロット連携", e)
+
+    try:
+        assert LG.status_change_error(state.df_nodes, inbox_idx, "done")
+        assert LG.status_change_error(state.df_nodes, inbox_idx, "regularly")
+        assert LG.status_change_error(state.df_nodes, inbox_idx, "cancel") is None
+        ok("Inbox チケットは done / regularly 不可（cancel は可）")
+    except Exception as e:
+        ng("Inbox のステータス制約", e)
+
+    try:
+        cnt = LG.inbox_summary(state.df_nodes, state.user, 99, 3)["count"]
+        cfg.inbox_max_items = cnt
+        dlg = ui_main.QuickAddDialog(state)
+        dlg.edit.setText("上限確認")
+        dlg._on_create()
+        assert dlg.result_data is None, "上限なのに Inbox へ作成できた"
+        dlg.edit.setText(f"上限確認 @{task_title}")
+        dlg._on_create()
+        assert dlg.result_data is not None, "@ 指定でも作成できない"
+        cfg.inbox_max_items = 10
+        ok("Inbox 上限到達後は @Task 指定が必須")
+    except Exception as e:
+        cfg.inbox_max_items = 10
+        ng("Inbox 上限", e)
+
+    try:
+        tp = win.main_pane.tree_pane
+        tp.refresh()
+        item = tp._find_item(tp.tree.invisibleRootItem(), DB.INBOX_PARENT)
+        assert item is not None and item.childCount() >= 1 and "Inbox" in item.text(0)
+        ok("Edit ツリーに 📥 Inbox とチケットが表示される")
+    except Exception as e:
+        ng("Inbox のツリー表示", e)
+
+    try:
+        # AI 取込: idx 指定 → 移動（新規作成しない）、同名 → 移動、不明 IDX → スキップ
+        extra = win._create_quick_ticket({"title": "AI同名確認", "hours": 0, "deadline": None,
+                                          "start": None, "memo": "", "parent": DB.INBOX_PARENT})
+        view = win.ai_import_view
+        prompt = view._build_task_list()
+        assert "【Task未設定Ticket" in prompt and inbox_idx in prompt
+        text = (f"idx: {inbox_idx}\nparent_idx: {task_idx}\n---\n"
+                f"title: AI同名確認\nparent_idx: {task_idx}\n---\n"
+                f"idx: 999999_99zzzzzz\nparent_idx: {task_idx}\n---\n"
+                f"title: AI新規確認\nparent_idx: {task_idx}\n")
+        items, errors, skipped = view._parse_llm_response(text)
+        kinds = [(it["kind"], it.get("idx")) for it in items]
+        assert not errors and len(skipped) == 1, (errors, skipped)
+        assert kinds[0] == ("move", inbox_idx) and kinds[1] == ("move", extra.name) \
+            and kinds[2][0] == "new", kinds
+        n_before = len(state.df_nodes)
+        view.text_edit.setPlainText(text)
+        orig_q = QMessageBox.question
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+        try:
+            view._on_import_tickets()
+        finally:
+            QMessageBox.question = orig_q
+        df = state.df_nodes
+        assert df.loc[inbox_idx, "parent_id"] == task_idx
+        assert df.loc[extra.name, "parent_id"] == task_idx
+        assert (df["title"] == "AI同名確認").sum() == 1, "同名チケットが二重作成された"
+        assert len(df) == n_before + 1, "新規は 1 件のみのはず"
+        ok("AI 取込: Inbox は移動（二重作成なし）、不明 IDX はスキップ、新規は作成")
+    except Exception as e:
+        ng("AI 取込の Inbox 振り分け", e)
+
+    try:
+        # 振り分け画面: 移動先を選んで移動
+        t = win._create_quick_ticket({"title": "振り分け画面確認", "hours": 0, "deadline": None,
+                                      "start": None, "memo": "", "parent": DB.INBOX_PARENT})
+        dlg = ui_main.InboxTriageDialog(state)
+        row = next(r for r in range(dlg.table.rowCount()) if dlg._row_idx(r) == t.name)
+        combo = dlg.table.cellWidget(row, 5)
+        combo.setCurrentIndex(combo.findData(task_idx))
+        dlg._on_move()
+        assert state.df_nodes.loc[t.name, "parent_id"] == task_idx
+        ok("振り分け画面で Task へ移動できる")
+    except Exception as e:
+        ng("振り分け画面", e)
+
+    try:
+        # 起動時表示: 上限/滞留時のみ・1 日 1 回
+        calls = []
+        orig_open = win._open_inbox_triage
+        win._open_inbox_triage = lambda: calls.append(1)
+        try:
+            win._create_quick_ticket({"title": "起動時確認", "hours": 0, "deadline": None,
+                                      "start": None, "memo": "", "parent": DB.INBOX_PARENT})
+            cfg.inbox_max_items = 99
+            win.maybe_prompt_inbox()
+            assert calls == [], "条件外なのに表示された"
+            cfg.inbox_max_items = 1
+            win.maybe_prompt_inbox()
+            win.maybe_prompt_inbox()
+            assert calls == [1], f"表示回数 {len(calls)}"
+        finally:
+            win._open_inbox_triage = orig_open
+            cfg.inbox_max_items = 10
+        ok("起動時の振り分け表示は上限/滞留時のみ・1 日 1 回")
+    except Exception as e:
+        ng("起動時の振り分け表示", e)
+    state.nodes_modified = False
+    state.schedule_modified = False
+
+
+def test_ui_state(state, version, win, tmpdir):
+    """D3: 画面状態（ウィンドウ・分割・フィルタ・ツリー開閉・前回タブ）の記憶"""
+    print("\n[D3] 画面状態の記憶テスト")
+    from PySide6.QtCore import QSettings, Qt
+    from ui_main import MainWindow, IDX_ROADMAP
+    # 実ユーザーの ui_state.ini を汚さないよう保存先を一時フォルダへ
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, tmpdir)
+    try:
+        tp = win.main_pane.tree_pane
+        tp.refresh()
+        root = tp._find_item(tp.tree.invisibleRootItem(), "0")  # P0（先頭は Inbox）
+        first = root.child(0)                          # 先頭の P1
+        first_idx = first.data(0, Qt.ItemDataRole.UserRole)
+        first.setExpanded(False)
+        tp.refresh()
+        again = tp._find_item(tp.tree.invisibleRootItem(), first_idx)
+        assert again is not None and not again.isExpanded(), "再描画で全展開に戻った"
+        ok("Edit ツリーで閉じたノードは再描画後も閉じたまま")
+    except Exception as e:
+        ng("ツリー開閉の保持", e)
+        return
+
+    try:
+        state.config.start_tab = "last"
+        win.gantt_view._status_radios["all"].setChecked(True)
+        win.road_view.apply_saved_view("Task", "月", True, 15)
+        tp.filter_btn.setChecked(False)
+        win.detail_toggle_btn.setChecked(True)
+        win._switch_view(IDX_ROADMAP)
+        win.main_pane.splitter.setSizes([400, 800])
+        edit_sizes = win.main_pane.splitter.sizes()
+        state.nodes_modified = False
+        state.schedule_modified = False
+        win.save_ui_state()
+
+        win2 = MainWindow(state, version)
+        win2.resize(1500, 900)
+        win2.restore_ui_state()
+        win2.show()
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()
+        assert win2.stack.currentIndex() == IDX_ROADMAP, "前回のタブで開かない"
+        assert win2.detail_toggle_btn.isChecked(), "詳細ペインの開閉が戻らない"
+        assert win2.gantt_view._get_status_filter() == "all"
+        rv = win2.road_view
+        assert (rv._current_level, rv._cell_unit, rv._filter_own, rv._date_col_extra) \
+            == ("Task", "月", True, 15), "Plan の表示設定が戻らない"
+        tp2 = win2.main_pane.tree_pane
+        assert not tp2._filter_own, "Edit の『選択中メンバーのみ』が戻らない"
+        assert first_idx in tp2._collapsed, "ツリーの開閉が戻らない"
+        # 分割位置は Edit タブを表示してから比率で比較（ウィンドウ幅が異なるため）
+        from ui_main import IDX_MAIN
+        win2._switch_view(IDX_MAIN)
+        QApplication.processEvents()
+        s2 = win2.main_pane.splitter.sizes()
+        r1, r2 = edit_sizes[0] / sum(edit_sizes), s2[0] / sum(s2)
+        assert abs(r1 - r2) < 0.02, f"分割位置が戻らない {s2} vs {edit_sizes}"
+        ok("終了時の画面状態が次回起動時に復元される（start_tab=last）")
+        state.config.start_tab = "today"
+        win3 = MainWindow(state, version)
+        win3.restore_ui_state()
+        from ui_main import IDX_TODAY
+        assert win3.stack.currentIndex() == IDX_TODAY, "start_tab=today なのに前回タブで開いた"
+        ok("start_tab が last 以外なら config のタブで起動する")
+        for w in (win2, win3):
+            w.hide()
+            w.deleteLater()
+    except Exception as e:
+        ng("画面状態の保存・復元", e)
+
+
 def main():
     print("=" * 55)
     print("  ヘッドレス GUI テスト (QT_QPA_PLATFORM=offscreen)")
@@ -1570,7 +1931,11 @@ def main():
             test_personal_review_member(win)
             test_team_log_export(win)
             test_assignment_view_multi_rows(win, ticket_idx)
+            test_undo_redo(win, task_idx, ticket_idx)
+            test_quick_add_parse()
+            test_quick_add_inbox(win, task_idx, tmpdir)
             test_save_load(state)
+            test_ui_state(state, version, win, tmpdir)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")
