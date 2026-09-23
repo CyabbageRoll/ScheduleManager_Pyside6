@@ -457,18 +457,47 @@ class Database:
         finally:
             conn.close()
 
-    def save_nodes(self, df: pd.DataFrame, user: str) -> None:
-        """ユーザー自身が担当するノードを DB に保存する"""
-        if df.empty:
+    def reassign_nodes_bulk(self, idxs: list, user: str) -> None:
+        """担当者のみを変更する（他列は DB の最新値を保持し、古いメモリ内容で上書きしない）"""
+        if not idxs:
             return
+        today = datetime.date.today().isoformat()
+        conn = self._connect()
+        try:
+            for idx in idxs:
+                conn.execute(
+                    "UPDATE nodes SET assigned_to=?, updated_at=? WHERE IDX=?",
+                    [user, today, idx],
+                )
+            conn.commit()
+            self._log(f"reassign_nodes_bulk: {len(idxs)} 件 → {user}")
+        except Exception as e:
+            self._loge(f"[DB] reassign_nodes_bulk エラー: {e}")
+            raise
+        finally:
+            conn.close()
+
+    def save_nodes(self, df: pd.DataFrame, user: str) -> dict:
+        """ユーザー自身が担当するノードを DB に保存する。
+        DB 上で既に他ユーザーへ担当が移っている行（Request 承諾による移管）は
+        古い内容で巻き戻さないよう保存しない。
+        戻り値: 保存しなかった行の {IDX: DB 上の担当者}"""
+        skipped: dict = {}
+        if df.empty:
+            return skipped
         # 自分が担当するノードのみ保存対象とする（2日フィルター廃止）
         mask = df.get("assigned_to", pd.Series(dtype=str)) == user
         target = df[mask]
         if target.empty:
-            return
+            return skipped
         conn = self._connect()
         try:
             for idx in target.index:
+                cur = conn.execute(
+                    "SELECT assigned_to FROM nodes WHERE IDX=?", [idx]).fetchone()
+                if cur is not None and cur[0] != user:
+                    skipped[idx] = cur[0]
+                    continue
                 conn.execute("DELETE FROM nodes WHERE IDX=?", [idx])
                 row = {c: _to_sql_value(target.loc[idx, c] if c in target.columns else None)
                        for c in NODE_COLUMNS[1:]}
@@ -480,12 +509,15 @@ class Database:
                     vals,
                 )
             conn.commit()
-            self._logi(f"[DB] save_nodes: {len(target)} 件保存 user={user}")
+            self._logi(f"[DB] save_nodes: {len(target) - len(skipped)} 件保存 user={user}")
+            if skipped:
+                self._logw(f"[DB] save_nodes: 担当移管済みのため保存しない {skipped}")
         except Exception as e:
             self._loge(f"[DB] save_nodes エラー: {e}")
             raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
+        return skipped
 
     # ---------- daily_schedule ----------
 

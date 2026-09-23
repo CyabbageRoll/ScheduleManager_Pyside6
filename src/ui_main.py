@@ -542,6 +542,15 @@ class DailyScheduleWidget(QWidget):
             "notes":         self.f_notes.text(),
             "Last_Update":   today,
         }
+        # 値が変わっていなければ何もしない（フォーカス移動だけで未保存扱いにしない）
+        fields = ["health_status", "work_place", "safety", "overwork", "notes"]
+        df_log = self.state.df_daily_log
+        if idx in df_log.index:
+            old = df_log.loc[idx]
+            if all(str(old.get(k, "") or "") == row[k] for k in fields):
+                return
+        elif not any(row[k] for k in fields):
+            return
         self.state.df_daily_log.loc[idx] = row
         self.state.schedule_modified = True
         self.state.notify_dirty()
@@ -1086,10 +1095,12 @@ class MainWindow(QMainWindow):
     # ---------- スロット ----------
 
     def _on_date_changed(self, date_str: str) -> None:
+        self._commit_pending_edits()  # 切替前に入力中の日次ログを確定
         self.state.current_date = date_str
         self.refresh()
 
     def _on_prev_day(self) -> None:
+        self._commit_pending_edits()  # 切替前に入力中の日次ログを確定
         d = datetime.date.fromisoformat(self.state.current_date)
         new_date = (d - datetime.timedelta(days=1)).isoformat()
         self.state.current_date = new_date
@@ -1097,6 +1108,7 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def _on_next_day(self) -> None:
+        self._commit_pending_edits()  # 切替前に入力中の日次ログを確定
         d = datetime.date.fromisoformat(self.state.current_date)
         new_date = (d + datetime.timedelta(days=1)).isoformat()
         self.state.current_date = new_date
@@ -1104,6 +1116,7 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def _on_today(self) -> None:
+        self._commit_pending_edits()  # 切替前に入力中の日次ログを確定
         new_date = datetime.date.today().isoformat()
         self.state.current_date = new_date
         self.date_btn.set_date(new_date)
@@ -1207,6 +1220,7 @@ class MainWindow(QMainWindow):
 
     def _on_member_changed(self, member: str) -> None:
         """項目7: メンバー選択時にボタンのチェック状態を更新"""
+        self._commit_pending_edits()  # 切替前に入力中の日次ログを確定
         self.state.current_member = member
         # ボタンのチェック状態を更新
         for m, btn in getattr(self, "_member_btns", {}).items():
@@ -1230,7 +1244,45 @@ class MainWindow(QMainWindow):
         else:
             self._save_btn.setStyleSheet("")  # デフォルトに戻す
 
+    def _commit_pending_edits(self) -> None:
+        """入力中（フォーカス中）の欄の編集を確定させる。
+        日次ログ等は editingFinished で反映されるため、Ctrl+S・日付切替・終了の前に
+        フォーカスを外して取りこぼしを防ぐ。"""
+        fw = QApplication.focusWidget()
+        if fw is not None and self.isAncestorOf(fw):
+            fw.clearFocus()
+
+    def _is_dirty(self) -> bool:
+        return bool(self.state.nodes_modified or self.state.schedule_modified)
+
+    def _confirm_unsaved(self, action: str) -> bool:
+        """未保存の変更があれば 保存/破棄/キャンセル を確認する。続行してよければ True。"""
+        self._commit_pending_edits()
+        if not self._is_dirty():
+            return True
+        ans = QMessageBox.question(
+            self, "未保存の変更",
+            f"未保存の変更があります。{action}前に保存しますか？",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if ans == QMessageBox.StandardButton.Save:
+            self._on_save()
+            return not self._is_dirty()  # 保存失敗時は中止
+        return ans == QMessageBox.StandardButton.Discard
+
+    def closeEvent(self, event) -> None:
+        """終了時に未保存の変更・未保存のレポートを確認する"""
+        if self.detail_pane._rep_dirty:
+            self.detail_pane._on_save_report()
+        if self._confirm_unsaved("終了する"):
+            event.accept()
+        else:
+            event.ignore()
+
     def _on_save(self) -> None:
+        self._commit_pending_edits()
         self.statusBar().showMessage("保存中...")
         QApplication.processEvents()
         try:
@@ -1238,6 +1290,13 @@ class MainWindow(QMainWindow):
             self.main_pane.table_pane._update_dirty_indicator()
             self._update_save_btn_style()
             self.main_pane.tree_pane.refresh()
+            skipped = getattr(self.state, "save_skipped", {})
+            if skipped:
+                # 他ユーザーへ移管済みのノードは巻き戻さず保存対象外にした旨を通知
+                self.statusBar().showMessage(
+                    f"保存しました（{len(skipped)} 件は他ユーザーへ移管済みのため保存対象外）", 8000)
+                self.refresh()
+                return
             self.statusBar().showMessage("保存しました")
             QTimer.singleShot(500, lambda: self.statusBar().clearMessage())
         except Exception as e:
@@ -1255,6 +1314,8 @@ class MainWindow(QMainWindow):
             self._update_save_btn_style()
 
     def _on_load(self) -> None:
+        if not self._confirm_unsaved("再読込する"):
+            return
         try:
             self.state.load()
             self.state.nodes_modified = False     # 再読込後は未保存フラグをリセット
@@ -2926,7 +2987,9 @@ class DetailPane(QWidget):
     def refresh(self) -> None:
         if self._node_idx:
             self._rebuild_form(self._node_idx)
-            self._load_report()
+            # 編集中（未保存）のレポート本文はファイル内容で上書きしない
+            if not self._rep_dirty:
+                self._load_report()
 
     # ── 詳細カード生成ヘルパー ──
 

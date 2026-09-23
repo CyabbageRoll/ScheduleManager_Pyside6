@@ -2991,6 +2991,7 @@ class AssignmentView(QWidget):
             return
         today = datetime.date.today().isoformat()
         nodes_to_upsert: list = []
+        nodes_to_reassign: list = []
 
         for asgn_idx in asgn_ids:
             t_idx = self.state.df_assignments.loc[asgn_idx, "ticket_id"]
@@ -3009,15 +3010,26 @@ class AssignmentView(QWidget):
                 self.state.df_nodes.loc[new_idx] = new_row
                 nodes_to_upsert.append(self.state.df_nodes.loc[new_idx])
             else:
-                # ticket 以外（task / project）は担当者を変更
-                self.state.df_nodes.loc[t_idx, "assigned_to"] = self.state.user
-                self.state.df_nodes.loc[t_idx, "updated_at"] = today
-                nodes_to_upsert.append(self.state.df_nodes.loc[t_idx])
+                # ticket 以外（task / project）は担当者のみ変更する
+                # （手元の古い行で DB を丸ごと上書きしないよう UPDATE で行う）
+                nodes_to_reassign.append(t_idx)
 
         # DB 書き込みを 1 トランザクションにまとめて処理（複数承諾時の速度改善）
-        if nodes_to_upsert:
-            self.state.db.upsert_nodes_bulk(nodes_to_upsert)
-        self.state.db.respond_assignments_bulk(asgn_ids, "accepted")
+        try:
+            if nodes_to_upsert:
+                self.state.db.upsert_nodes_bulk(nodes_to_upsert)
+            if nodes_to_reassign:
+                self.state.db.reassign_nodes_bulk(nodes_to_reassign, self.state.user)
+            self.state.db.respond_assignments_bulk(asgn_ids, "accepted")
+        except Exception as e:
+            QMessageBox.critical(self, "承諾エラー", f"DB への書き込みに失敗しました:\n{e}")
+            return
+        # 移管したノードは DB の最新内容（元担当者の保存済み内容）をメモリへ取り込む
+        if nodes_to_reassign:
+            fresh = self.state.db.read_nodes()
+            for t_idx in nodes_to_reassign:
+                if t_idx in fresh.index:
+                    self.state.df_nodes.loc[t_idx] = fresh.loc[t_idx]
         if self.state.logger:
             self.state.logger.info(f"[Request] 承諾 user={self.state.user} 件数={len(asgn_ids)} ids={asgn_ids}")
 
@@ -3802,10 +3814,19 @@ class AIImportView(QWidget):
             if it.get("memo"):
                 ds["memo"] = it["memo"]
 
-            self.state.db.upsert_node(ds)
+            try:
+                self.state.db.upsert_node(ds)
+            except Exception as e:
+                QMessageBox.critical(self, "取り込みエラー",
+                                     f"DB への登録に失敗しました: {it['title']}\n{e}")
+                break
+            # DB 全件の再読込はせず、取り込んだ行だけをメモリへ追加する
+            # （再読込すると他の未保存の編集が失われるため）
+            self.state.df_nodes.loc[ds.name] = ds
             imported_idxs.append(str(ds.name))
 
-        self.state.df_nodes = self.state.db.read_nodes()
+        if not imported_idxs:
+            return
         self.state.refresh()
 
         if self.state.logger:

@@ -218,6 +218,7 @@ class AppState:
     nodes_modified: bool = False     # ノード変更フラグ（Ctrl+S 保存前に True になる）
     schedule_modified: bool = False  # 日次スケジュール/ログ/メモ変更フラグ
     recent_tickets: List[str] = field(default_factory=list)  # 最近割り当てたチケット IDX（MRU、セッション内）
+    save_skipped: Dict[str, str] = field(default_factory=dict)  # 直近の保存で移管済みのため保存しなかった {IDX: 担当者}
 
     def __post_init__(self):
         if not self.login_user:
@@ -296,10 +297,15 @@ class AppState:
         if not self.db.acquire_lock():
             self._log("warning", "[保存] ロック取得失敗 - 他ユーザーが保存中の可能性")
             raise RuntimeError("dbが利用中です。しばらく時間をおいて実行してください")
+        self.save_skipped = {}
         try:
             # nodes_modified が True のときのみ save_nodes を呼ぶ（DB アクセス最小化）
             if self.nodes_modified:
-                self.db.save_nodes(self.df_nodes, self.login_user)
+                self.save_skipped = self.db.save_nodes(self.df_nodes, self.login_user) or {}
+                # 他ユーザーへ移管済みの行はメモリ上の担当者も DB に合わせる
+                for idx, owner in self.save_skipped.items():
+                    if idx in self.df_nodes.index:
+                        self.df_nodes.loc[idx, "assigned_to"] = owner
             self.db.save_daily_schedule(self.df_daily, self.login_user)
             self.db.save_daily_log(self.df_daily_log, self.login_user)
             self.db.save_memo(self.login_user, self.memo_text)
