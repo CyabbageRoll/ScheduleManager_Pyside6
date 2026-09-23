@@ -512,6 +512,60 @@ def check_auto_done(df_nodes: pd.DataFrame, changed_idx: str) -> List[str]:
     return to_done
 
 
+# 未完了とみなすステータス（仕様 2.3 の判定に使用）
+_OPEN_STATUSES = ("todo", "regularly")
+
+
+def status_change_error(df_nodes: pd.DataFrame, idx: str,
+                        new_status: str) -> Optional[str]:
+    """
+    仕様 2.3 のステータス変更制約を判定する。変更不可なら理由、可なら None を返す。
+      - 未完了（todo/regularly）の子ノードがある親は done にできない
+      - 親ノードが done のとき、子ノードを todo/regularly に戻せない
+    """
+    if idx not in df_nodes.index:
+        return None
+    if new_status == "done":
+        open_children = df_nodes[(df_nodes["parent_id"] == idx)
+                                 & (df_nodes["status"].isin(_OPEN_STATUSES))]
+        if not open_children.empty:
+            return "未完了の子ノードがあるため done にできません（子を先に完了させてください）"
+    elif new_status in _OPEN_STATUSES:
+        pid = str(df_nodes.loc[idx, "parent_id"] or "")
+        if pid in df_nodes.index and str(df_nodes.loc[pid, "status"]) == "done":
+            return "親ノードが done のため todo / regularly に戻せません"
+    return None
+
+
+def apply_status(df_nodes: pd.DataFrame, idx: str, new_status: str) -> List[str]:
+    """
+    ステータスを変更し、付随処理をまとめて行う（df_nodes をその場で更新）。
+      - done にしたら actual_end（実績完了日）に当日を設定、done 以外に戻したらクリア
+      - 「完了」チケットが done になり兄弟が全て完了なら親も自動 done（仕様 2.2）
+    戻り値: ステータスを変更した IDX のリスト（自動 done の親を含む）
+    """
+    today = datetime.date.today().isoformat()
+    changed: List[str] = []
+
+    def _set(i: str, s: str) -> None:
+        df_nodes.loc[i, "status"] = s
+        df_nodes.loc[i, "updated_at"] = today
+        if s == "done":
+            if not _date_str(df_nodes.loc[i, "actual_end"]):
+                df_nodes.loc[i, "actual_end"] = today
+        else:
+            df_nodes.loc[i, "actual_end"] = None
+        changed.append(i)
+
+    if idx not in df_nodes.index:
+        return changed
+    _set(idx, new_status)
+    for pid in check_auto_done(df_nodes, idx):
+        if str(df_nodes.loc[pid, "status"]) != "done":
+            _set(pid, "done")
+    return changed
+
+
 # ---------- 検索・フィルタ ----------
 
 def filter_nodes(df: pd.DataFrame,

@@ -1360,8 +1360,7 @@ class MainWindow(QMainWindow):
             state=self.state, edit_idx=idx, parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            ds = dlg.get_series()
-            self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新のみ（DB書き込みはCtrl+S）
+            dlg.apply_to_state()  # インメモリ更新のみ（DB書き込みはCtrl+S）
             self.state.nodes_modified = True
             self._update_save_btn_style()
             self.state.refresh()
@@ -1942,8 +1941,7 @@ class TreePane(QWidget):
             parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            ds = dlg.get_series()
-            self.state.df_nodes.loc[ds.name] = ds
+            ds = dlg.apply_to_state()
             # 親ノード（task 以上）には「詳細作成」「完了」チケットを自動生成（インメモリのみ）
             if child_type != "ticket":
                 for _child in DB.build_auto_children(ds, self.state.user):
@@ -2376,8 +2374,24 @@ class TablePane(QWidget):
                 item.setText(str(orig) if orig != "" else "")
                 self.table.blockSignals(False)
             return
-        self.state.df_nodes.loc[idx, field] = value
-        self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+        if field == "status":
+            cur_status = str(self.state.df_nodes.loc[idx, "status"])
+            if value == cur_status:
+                return
+            err = LG.status_change_error(self.state.df_nodes, idx, value)
+            if err:
+                # 仕様 2.3 違反: セルを元に戻して警告（編集確定処理の後に表示する）
+                self.table.blockSignals(True)
+                item.setText(cur_status)
+                self.table.blockSignals(False)
+                QTimer.singleShot(0, lambda: QMessageBox.warning(
+                    self, "ステータス変更不可", err))
+                return
+            # 実績完了日の設定・「完了」チケットによる親の自動 done を含めて反映
+            LG.apply_status(self.state.df_nodes, idx, value)
+        else:
+            self.state.df_nodes.loc[idx, field] = value
+            self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
         self._mark_dirty()
         # status/color 変更はテーブル外観（背景色等）を再描画
         if field in ("status", "color"):
@@ -2466,8 +2480,7 @@ class TablePane(QWidget):
             parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            ds = dlg.get_series()
-            self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
+            ds = dlg.apply_to_state()  # インメモリ更新
             self._mark_dirty()
             self.state.refresh()
 
@@ -2486,8 +2499,7 @@ class TablePane(QWidget):
             parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            ds = dlg.get_series()
-            self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
+            dlg.apply_to_state()  # インメモリ更新
             self._mark_dirty()
             self.state.refresh()
 
@@ -3510,7 +3522,28 @@ class _NodeEditDialog(QDialog):
         if not self.f_title.text().strip():
             QMessageBox.warning(self, "入力エラー", "タイトルを入力してください")
             return
+        # 編集時のステータス変更は仕様 2.3 の制約を確認する
+        df = self.state.df_nodes
+        new_status = self.f_status.currentText()
+        if (self._edit_idx and self._edit_idx in df.index
+                and new_status != str(df.loc[self._edit_idx, "status"])):
+            err = LG.status_change_error(df, self._edit_idx, new_status)
+            if err:
+                QMessageBox.warning(self, "ステータス変更不可", err)
+                return
         self.accept()
+
+    def apply_to_state(self) -> pd.Series:
+        """入力値をインメモリの df_nodes に反映して返す（DB 書き込みは Ctrl+S）。
+        ステータスが変わった場合は実績完了日の設定・親の自動 done も行う。"""
+        df = self.state.df_nodes
+        old_status = (str(df.loc[self._edit_idx, "status"])
+                      if self._edit_idx and self._edit_idx in df.index else "todo")
+        ds = self.get_series()
+        df.loc[ds.name] = ds
+        if str(ds["status"]) != old_status:
+            LG.apply_status(df, ds.name, str(ds["status"]))
+        return ds
 
     def get_series(self) -> pd.Series:
         """ダイアログの入力値から pd.Series を返す"""

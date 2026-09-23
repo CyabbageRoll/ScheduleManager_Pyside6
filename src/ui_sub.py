@@ -778,9 +778,12 @@ class GanttView(QWidget):
                 self.state.refresh()
 
         def _set_status(s: str) -> None:
-            self.state.df_nodes.loc[idx, "status"] = s
-            self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
-            # DB 書き込みはユーザー保存（Ctrl+S）時のみ行う
+            err = LG.status_change_error(self.state.df_nodes, idx, s)
+            if err:
+                QMessageBox.warning(self, "ステータス変更不可", err)
+                return
+            # 実績完了日・親の自動 done を含めて反映（DB 書き込みは Ctrl+S 時）
+            LG.apply_status(self.state.df_nodes, idx, s)
             self.state.nodes_modified = True
             self.state.refresh()
 
@@ -1311,8 +1314,12 @@ class RoadmapView(QWidget):
 
         def _set_status(s: str) -> None:
             """ステータスを変更する（インメモリのみ、Ctrl+S で保存）"""
-            df.loc[idx, "status"] = s
-            df.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+            err = LG.status_change_error(df, idx, s)
+            if err:
+                QMessageBox.warning(self, "ステータス変更不可", err)
+                return
+            # 実績完了日・親の自動 done を含めて反映
+            LG.apply_status(df, idx, s)
             self.state.nodes_modified = True
             self.state.notify_dirty()
             self._rebuild_table()
