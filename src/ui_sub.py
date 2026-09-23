@@ -788,11 +788,19 @@ class GanttView(QWidget):
             self.state.refresh()
 
         def _delete_ticket() -> None:
+            # Edit タブと同じ削除制約（実績工数・子ノード）を適用する
+            reason = LG.delete_block_reason(self.state.df_nodes, idx, self.state.user)
+            if reason:
+                QMessageBox.warning(self, "削除不可", reason)
+                return
             title = self.state.df_nodes.loc[idx, "title"]
             ans = QMessageBox.question(self, "削除確認",
                                        f"「{title}」を論理削除しますか？")
             if ans == QMessageBox.StandardButton.Yes:
-                _set_status("deleted")
+                self.state.df_nodes.loc[idx, "status"] = "deleted"
+                self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+                self.state.nodes_modified = True
+                self.state.refresh()
 
         # 自分のチケット: 全メニューを表示
         menu = QMenu(self)
@@ -2069,11 +2077,14 @@ class AnalysisView(QWidget):
             al_ids.append(str(t_idx))
         self.alert_table.blockSignals(True)
         self.alert_table.set_rows(al_rows, row_ids=al_ids)
-        # メモ列のみ編集可能フラグを追加
+        # メモ列のみ編集可能フラグを追加（自分のチケットのみ。他人の分は保存されないため）
         for row_i in range(self.alert_table.rowCount()):
             memo_item = self.alert_table.item(row_i, self._AL_COL_MEMO)
             if memo_item:
-                memo_item.setFlags(memo_item.flags() | Qt.ItemFlag.ItemIsEditable)
+                t_idx = memo_item.data(Qt.ItemDataRole.UserRole)
+                if (t_idx in df.index
+                        and str(df.loc[t_idx, "assigned_to"]) == self.state.user):
+                    memo_item.setFlags(memo_item.flags() | Qt.ItemFlag.ItemIsEditable)
         self.alert_table.blockSignals(False)
         self.info.set_info(
             f"集計: {len(agg)} ノード / 超過チケット: {len(al_rows)}"
@@ -2136,10 +2147,13 @@ class AnalysisView(QWidget):
         idx = item.data(Qt.ItemDataRole.UserRole)
         if not idx or idx not in self.state.df_nodes.index:
             return
+        if str(self.state.df_nodes.loc[idx, "assigned_to"]) != self.state.user:
+            return  # 他ユーザーのチケットは編集不可
         new_memo = item.text()
         self.state.df_nodes.loc[idx, "memo"] = new_memo
         self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
         self.state.nodes_modified = True
+        self.state.notify_dirty()
 
 
 # ---------- 検索 ----------

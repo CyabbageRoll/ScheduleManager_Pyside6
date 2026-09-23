@@ -537,6 +537,22 @@ def status_change_error(df_nodes: pd.DataFrame, idx: str,
     return None
 
 
+def delete_block_reason(df_nodes: pd.DataFrame, idx: str, user: str) -> Optional[str]:
+    """論理削除できない理由を返す（削除可能なら None）。仕様 2.3 の削除制約。"""
+    if idx not in df_nodes.index:
+        return "対象ノードが見つかりません"
+    if str(df_nodes.loc[idx, "assigned_to"]) != user:
+        return "他ユーザーのデータは削除できません"
+    if float(df_nodes.loc[idx, "actual_hours"] or 0) > 0:
+        return "実績工数が記録されているため削除できません"
+    # 論理削除済みの子は「存在しない」ものとして扱う
+    children = df_nodes[(df_nodes["parent_id"] == idx)
+                        & (df_nodes["status"] != "deleted")]
+    if not children.empty:
+        return "子ノードが存在するため削除できません"
+    return None
+
+
 def apply_status(df_nodes: pd.DataFrame, idx: str, new_status: str) -> List[str]:
     """
     ステータスを変更し、付随処理をまとめて行う（df_nodes をその場で更新）。

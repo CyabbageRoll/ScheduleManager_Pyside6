@@ -1125,15 +1125,21 @@ class MainWindow(QMainWindow):
     # ---------- ポモドーロ ----------
 
     def _on_pomodoro_ticket(self, idx: str) -> None:
-        """選択ノードがチケットならポモドーロタイマーの対象にする"""
+        """選択ノードが自分のチケットならポモドーロタイマーの対象にする
+        （他人のチケットはスケジュールへ割り当てられないため対象外）"""
         df = self.state.df_nodes
-        if idx and idx in df.index and str(df.loc[idx, "node_type"]) == "ticket":
+        if (idx and idx in df.index and str(df.loc[idx, "node_type"]) == "ticket"
+                and str(df.loc[idx, "assigned_to"]) == self.state.login_user):
             self.pomodoro.set_ticket(idx, str(df.loc[idx, "title"]))
 
     def _on_pomodoro_finished(self, ticket_idx: str, start_dt, end_dt) -> None:
-        """ポモドーロ終了時: 経過時間を15分スロットに丸めて当日の実績に記録する"""
+        """ポモドーロ終了時: 経過時間を15分スロットに丸めて開始日の実績に記録する"""
         df = self.state.df_nodes
         if not ticket_idx or ticket_idx not in df.index:
+            return
+        if str(df.loc[ticket_idx, "assigned_to"]) != self.state.login_user:
+            QMessageBox.information(self, "ポモドーロ",
+                                    "自分のチケットではないため実績は記録しません")
             return
         elapsed_min = (end_dt - start_dt).total_seconds() / 60
         n_slots = int(round(elapsed_min / 15))
@@ -1143,8 +1149,8 @@ class MainWindow(QMainWindow):
         start_slot = start_dt.hour * 4 + start_dt.minute // 15
         slots = list(range(start_slot, min(start_slot + n_slots,
                                            len(DB.DAILY_TIME_COLS))))
-        today = datetime.date.today().isoformat()
-        sch_idx = DB.daily_sch_idx(today, self.state.login_user)
+        # スロットは開始時刻基準のため、日付も開始日を使う（日付またぎ対策）
+        sch_idx = DB.daily_sch_idx(start_dt.date().isoformat(), self.state.login_user)
         df_daily = self.state.df_daily
         # 既入力(occupied)と空き(free)に分割
         free, occupied = [], []
@@ -1842,6 +1848,11 @@ class TreePane(QWidget):
 
         dragged_type = str(df.loc[dragged_idx, "node_type"])
 
+        # 他ユーザーのノードは移動不可（保存対象外のため変更が失われる）
+        if str(df.loc[dragged_idx, "assigned_to"]) != self.state.user:
+            QMessageBox.warning(self, "移動不可", "他ユーザーのデータは移動できません")
+            return
+
         # 新しい親の種別バリデーション
         if new_parent_idx == "0":
             if dragged_type != "project1":
@@ -1892,6 +1903,7 @@ class TreePane(QWidget):
 
         # インメモリ更新・dirty フラグ・ツリー再構築
         df.loc[dragged_idx, "parent_id"] = new_parent_idx
+        df.loc[dragged_idx, "updated_at"] = datetime.date.today().isoformat()
         self._selected_idx = dragged_idx
         self.state.nodes_modified = True
         self.state.notify_dirty()
@@ -1956,17 +1968,10 @@ class TreePane(QWidget):
         df = self.state.df_nodes
         if idx not in df.index:
             return
-        # 他ユーザーのノードは削除不可
-        if str(df.loc[idx, "assigned_to"]) != self.state.user:
-            QMessageBox.warning(self, "削除不可", "他ユーザーのデータは削除できません")
-            return
-        # 実績工数がある場合は削除不可
-        if float(df.loc[idx, "actual_hours"] or 0) > 0:
-            QMessageBox.warning(self, "削除不可", "実績工数が記録されているため削除できません")
-            return
-        # 子ノードがある場合は削除不可
-        if not df[df["parent_id"] == idx].empty:
-            QMessageBox.warning(self, "削除不可", "子ノードが存在するため削除できません")
+        # 他ユーザー・実績工数あり・子ノードありは削除不可
+        reason = LG.delete_block_reason(df, idx, self.state.user)
+        if reason:
+            QMessageBox.warning(self, "削除不可", reason)
             return
         ans = QMessageBox.question(self, "削除確認",
                                    f"「{df.loc[idx, 'title']}」を論理削除しますか？")
@@ -2224,6 +2229,9 @@ class TablePane(QWidget):
         changed = False
         for i, idx in enumerate(children.index):
             expected = i + 1
+            # 他ユーザーのノードは保存されないため変更しない
+            if str(children.at[idx, "assigned_to"]) != self.state.user:
+                continue
             if int(children.at[idx, "priority"]) != expected:
                 self.state.df_nodes.loc[idx, "priority"] = expected
                 self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
@@ -2510,15 +2518,10 @@ class TablePane(QWidget):
         df = self.state.df_nodes
         if idx not in df.index:
             return
-        # 他ユーザーのノードは削除不可
-        if str(df.loc[idx, "assigned_to"]) != self.state.user:
-            QMessageBox.warning(self, "削除不可", "他ユーザーのデータは削除できません")
-            return
-        if float(df.loc[idx, "actual_hours"] or 0) > 0:
-            QMessageBox.warning(self, "削除不可", "実績工数が記録されているため削除できません")
-            return
-        if not df[df["parent_id"] == idx].empty:
-            QMessageBox.warning(self, "削除不可", "子ノードが存在するため削除できません")
+        # 他ユーザー・実績工数あり・子ノードありは削除不可
+        reason = LG.delete_block_reason(df, idx, self.state.user)
+        if reason:
+            QMessageBox.warning(self, "削除不可", reason)
             return
         ans = QMessageBox.question(self, "削除確認",
                                    f"「{df.loc[idx, 'title']}」を論理削除しますか？")
@@ -2598,6 +2601,12 @@ class TablePane(QWidget):
         if not idx_cur or not idx_adj:
             return
         if idx_cur not in self.state.df_nodes.index or idx_adj not in self.state.df_nodes.index:
+            return
+        # 入れ替え相手が他ユーザーのノードだと片方の priority しか保存されないため不可
+        user = self.state.user
+        if (str(self.state.df_nodes.loc[idx_cur, "assigned_to"]) != user
+                or str(self.state.df_nodes.loc[idx_adj, "assigned_to"]) != user):
+            self.info.set_info("⚠ 他ユーザーのノードとは順序を入れ替えできません")
             return
 
         # priority を入れ替えて DB に即時保存（state.refresh で巻き戻らないようにする）
