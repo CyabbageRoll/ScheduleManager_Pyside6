@@ -3,7 +3,9 @@ db.py - データベース接続・CRUD・工数集計・IDX生成
 """
 import sqlite3
 import hashlib
+import os
 import random
+import secrets
 import datetime
 import time
 from pathlib import Path
@@ -260,6 +262,10 @@ class Database:
         if self.logger:
             self.logger.warning(msg)
 
+    def _loge(self, msg: str) -> None:
+        if self.logger:
+            self.logger.error(msg)
+
     # ロックファイルの有効期限（秒）
     _LOCK_EXPIRE_SEC = 300
 
@@ -276,32 +282,59 @@ class Database:
         return conn
 
     def acquire_lock(self) -> bool:
-        """保存用ロックファイルを取得する。5分以上古いロックは無効とみなす。"""
+        """保存用ロックファイルを取得する。5分以上古いロックは無効とみなす。
+        O_EXCL で作成するため、同時に取得しようとしても成功するのは 1 人だけ。"""
         lock_path = self.db_dir / "schedule.lock"
         now = time.time()
-        if lock_path.exists():
+        # 内容: "作成時刻 識別子"（先頭の作成時刻で期限切れを判定、識別子で自分のロックを判別）
+        token = f"{now} {os.getpid()}-{secrets.token_hex(4)}"
+        for _ in range(2):
             try:
-                lock_time = float(lock_path.read_text().strip())
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    lock_time = float(lock_path.read_text().split()[0])
+                except Exception:
+                    # 作成直後で未書き込み等の場合はファイル更新時刻で判定する
+                    try:
+                        lock_time = lock_path.stat().st_mtime
+                    except FileNotFoundError:
+                        continue  # 相手が解放済み → 再試行
                 elapsed = now - lock_time
                 if elapsed < self._LOCK_EXPIRE_SEC:
                     self._logw(f"[DB] ロック取得失敗 - 他ユーザーが保存中 (ロック作成から{elapsed:.0f}秒)")
                     return False
-                # 有効期限切れは強制解除して取得
+                # 有効期限切れは強制解除して再取得
                 self._logw(f"[DB] 期限切れロックを強制解除して取得 (経過={elapsed:.0f}秒)")
-            except Exception:
-                self._logw("[DB] ロックファイル読み取り失敗 - 強制上書き")
-        try:
-            lock_path.write_text(str(now))
-        except Exception as e:
-            self._log(f"ロックファイル作成失敗: {e}")
-            return False
-        return True
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except Exception as e:
+                    self._logw(f"[DB] 期限切れロックの削除失敗: {e}")
+                    return False
+                continue
+            except Exception as e:
+                self._logw(f"[DB] ロックファイル作成失敗: {e}")
+                return False
+            with os.fdopen(fd, "w") as f:
+                f.write(token)
+            self._lock_token = token
+            return True
+        return False
 
     def release_lock(self) -> None:
-        """保存用ロックファイルを解放する"""
+        """自分が取得した保存用ロックファイルのみ解放する（他人のロックは消さない）"""
+        token = getattr(self, "_lock_token", None)
+        if token is None:
+            return
+        self._lock_token = None
         lock_path = self.db_dir / "schedule.lock"
         try:
-            lock_path.unlink(missing_ok=True)
+            if lock_path.read_text().strip() == token:
+                lock_path.unlink(missing_ok=True)
+            else:
+                self._logw("[DB] ロックが他ユーザーに取得し直されていたため削除しません")
+        except FileNotFoundError:
+            pass
         except Exception as e:
             self._log(f"ロックファイル削除失敗: {e}")
 
@@ -392,7 +425,8 @@ class Database:
             conn.commit()
             self._log(f"upsert_node: {ds.name} ({ds.get('title', '')})")
         except Exception as e:
-            self._log(f"upsert_node エラー: {e}")
+            self._loge(f"[DB] upsert_node エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 
@@ -418,7 +452,8 @@ class Database:
             conn.commit()
             self._log(f"upsert_nodes_bulk: {len(series_list)} 件")
         except Exception as e:
-            self._log(f"upsert_nodes_bulk エラー: {e}")
+            self._loge(f"[DB] upsert_nodes_bulk エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 
@@ -447,7 +482,8 @@ class Database:
             conn.commit()
             self._logi(f"[DB] save_nodes: {len(target)} 件保存 user={user}")
         except Exception as e:
-            self._log(f"save_nodes エラー: {e}")
+            self._loge(f"[DB] save_nodes エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 
@@ -489,7 +525,8 @@ class Database:
             conn.commit()
             self._logi(f"[DB] save_daily_schedule: {len(target)} 件保存 user={user}")
         except Exception as e:
-            self._log(f"save_daily_schedule エラー: {e}")
+            self._loge(f"[DB] save_daily_schedule エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 
@@ -526,7 +563,8 @@ class Database:
             conn.commit()
             self._logi(f"[DB] save_daily_log: {len(target)} 件保存 user={user}")
         except Exception as e:
-            self._log(f"save_daily_log エラー: {e}")
+            self._loge(f"[DB] save_daily_log エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 
@@ -588,7 +626,8 @@ class Database:
             conn.commit()
             self._log(f"respond_assignments_bulk: {len(assignment_idxs)} 件 → {response}")
         except Exception as e:
-            self._log(f"respond_assignments_bulk エラー: {e}")
+            self._loge(f"[DB] respond_assignments_bulk エラー: {e}")
+            raise  # 呼び出し元で保存失敗を検知できるよう再送出
         finally:
             conn.close()
 
