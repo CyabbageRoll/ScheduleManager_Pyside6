@@ -17,11 +17,12 @@ from PySide6.QtWidgets import (
 )
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QDate, Signal, QEvent, QTimer, QUrl, QRect
+from PySide6.QtCore import Qt, QDate, Signal, QEvent, QTimer, QUrl, QRect, QSettings
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QAction, QPen, QDesktopServices
 
 import db as DB
 import logic as LG
+from schedule_app import UndoHistory
 from ui_widgets import (
     DateButton, UserCombo, ColorCombo, ButtonRow, InfoLabel,
     AutoCombo, ScrollableTable, Separator, PomodoroWidget,
@@ -789,6 +790,13 @@ class MainWindow(QMainWindow):
         state.refresh_func = self.refresh
         state.dirty_changed_func = self._update_save_btn_style
 
+        # 元に戻す / やり直し（編集のたびに状態を記録。1 操作内の複数変更は 1 回にまとめる）
+        self._undo = UndoHistory()
+        self._undo_pending = False
+        self._undo.reset(state)
+        state.modified_func = self._schedule_undo_snapshot
+        state.undo_reset_func = self._reset_undo
+
         # 初期表示タブ（config の start_tab で変更可）
         start_map = {"today": IDX_TODAY, "main": IDX_GANTT,
                      "edit": IDX_MAIN, "plan": IDX_ROADMAP}
@@ -988,6 +996,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.stack)
         outer.addWidget(self.detail_pane)
         outer.setSizes([400, 900, 320])
+        self._outer_splitter = outer  # 画面状態の記憶用
 
         self.setCentralWidget(outer)
 
@@ -1051,6 +1060,10 @@ class MainWindow(QMainWindow):
         """
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._on_save)
         QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._on_load)
+        # 入力欄の編集中は各欄の文字単位の Undo が優先される（Qt の標準動作）
+        QShortcut(QKeySequence("Ctrl+Z"), self).activated.connect(self._on_undo)
+        for seq in ("Ctrl+Shift+Z", "Ctrl+Y"):
+            QShortcut(QKeySequence(seq), self).activated.connect(self._on_redo)
         for n, view_idx in enumerate(self._view_order[:9], start=1):
             QShortcut(QKeySequence(f"Ctrl+{n}"), self).activated.connect(
                 lambda checked=False, vi=view_idx: self._switch_view(vi)
@@ -1252,6 +1265,41 @@ class MainWindow(QMainWindow):
         else:
             self._save_btn.setStyleSheet("")  # デフォルトに戻す
 
+    # ---------- 元に戻す / やり直し ----------
+
+    def _schedule_undo_snapshot(self) -> None:
+        """変更フラグが立ったら、その操作の処理が終わった時点の状態を記録する"""
+        if not self._undo_pending:
+            self._undo_pending = True
+            QTimer.singleShot(0, self._take_undo_snapshot)
+
+    def _reset_undo(self) -> None:
+        """現在の状態を起点に履歴を初期化する（保存・再読込・DB 直接書き込みの後）"""
+        self._undo_pending = False
+        self._undo.reset(self.state)
+
+    def _take_undo_snapshot(self) -> None:
+        if self._undo_pending:
+            self._undo_pending = False
+            self._undo.push(self.state)
+
+    def _on_undo(self) -> None:
+        self._apply_history(self._undo.undo, "元に戻しました", "元に戻せる操作はありません")
+
+    def _on_redo(self) -> None:
+        self._apply_history(self._undo.redo, "やり直しました", "やり直せる操作はありません")
+
+    def _apply_history(self, step, done_msg: str, none_msg: str) -> None:
+        self._commit_pending_edits()
+        self._take_undo_snapshot()  # 未記録の直前の編集を先に記録する
+        if not step(self.state):
+            self.statusBar().showMessage(none_msg, 3000)
+            return
+        self.refresh()
+        if self.detail_pane.isVisible():
+            self.detail_pane.refresh()
+        self.statusBar().showMessage(f"{done_msg}（保存前の操作のみ対象）", 3000)
+
     def _commit_pending_edits(self) -> None:
         """入力中（フォーカス中）の欄の編集を確定させる。
         日次ログ等は editingFinished で反映されるため、Ctrl+S・日付切替・終了の前に
@@ -1285,9 +1333,87 @@ class MainWindow(QMainWindow):
         if self.detail_pane._rep_dirty:
             self.detail_pane._on_save_report()
         if self._confirm_unsaved("終了する"):
+            self.save_ui_state()
             event.accept()
         else:
             event.ignore()
+
+    # ---------- 画面状態の記憶（ウィンドウ・分割位置・フィルタ等） ----------
+
+    @staticmethod
+    def _ui_settings() -> QSettings:
+        """OS ユーザーごとの画面状態ファイル（ui_state.ini）"""
+        return QSettings(QSettings.Format.IniFormat, QSettings.Scope.UserScope,
+                         "ScheduleManagerV3", "ui_state")
+
+    def _state_splitters(self) -> dict:
+        return {
+            "outer":   self._outer_splitter,
+            "edit":    self.main_pane.splitter,
+            "detail":  self.detail_pane._vsplit,
+            "plan":    self.road_view._splitter,
+            "request": self.assign_view._splitter,
+        }
+
+    def save_ui_state(self) -> None:
+        """終了時の画面状態を保存する"""
+        s = self._ui_settings()
+        s.setValue("window/geometry", self.saveGeometry())
+        for key, sp in self._state_splitters().items():
+            s.setValue(f"splitter/{key}", sp.saveState())
+        s.setValue("view/last_tab", self.stack.currentIndex())
+        s.setValue("view/detail_open", self.detail_toggle_btn.isChecked())
+        tp = self.main_pane.tree_pane
+        s.setValue("edit/filter_own", tp._filter_own)
+        # 存在しなくなったノードは記録しない
+        alive = set(self.state.df_nodes.index) | {"0"}
+        s.setValue("edit/collapsed", sorted(tp._collapsed & alive))
+        gv = self.gantt_view
+        s.setValue("main/status", gv._get_status_filter())
+        s.setValue("main/project", gv.pj_combo.currentData() or "")
+        rv = self.road_view
+        s.setValue("plan/level", rv._current_level)
+        s.setValue("plan/unit", rv._cell_unit)
+        s.setValue("plan/filter_own", rv._filter_own)
+        s.setValue("plan/col_extra", rv._date_col_extra)
+        s.sync()
+
+    def restore_ui_state(self) -> None:
+        """前回終了時の画面状態を復元する（起動時に config のサイズ適用後に呼ぶ）"""
+        s = self._ui_settings()
+        geo = s.value("window/geometry")
+        if geo:
+            self.restoreGeometry(geo)
+        for key, sp in self._state_splitters().items():
+            st = s.value(f"splitter/{key}")
+            if st:
+                sp.restoreState(st)
+        tp = self.main_pane.tree_pane
+        tp._collapsed = set(s.value("edit/collapsed", [], type=list) or [])
+        if s.contains("edit/filter_own"):
+            tp.filter_btn.setChecked(s.value("edit/filter_own", True, type=bool))
+        gv = self.gantt_view
+        status = s.value("main/status", "", type=str)
+        if status in gv._status_radios:
+            gv._status_radios[status].setChecked(True)
+        gv._initial_pj = s.value("main/project", "", type=str)
+        rv = self.road_view
+        rv.apply_saved_view(
+            s.value("plan/level", rv._current_level, type=str),
+            s.value("plan/unit", rv._cell_unit, type=str),
+            s.value("plan/filter_own", rv._filter_own, type=bool),
+            s.value("plan/col_extra", rv._date_col_extra, type=int),
+        )
+        # start_tab = last の場合のみ、前回のタブと詳細ペインの開閉を再現する
+        if self.state.config.start_tab == "last":
+            if s.contains("view/detail_open"):
+                self.detail_toggle_btn.setChecked(
+                    s.value("view/detail_open", False, type=bool))
+            tab = s.value("view/last_tab", -1, type=int)
+            if 0 <= tab < self.stack.count():
+                self._switch_view(tab)
+                return
+        self.refresh()
 
     def _on_save(self) -> None:
         self._commit_pending_edits()
@@ -1295,6 +1421,7 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         try:
             self.state.save()
+            self._reset_undo()  # 保存した状態を Undo の起点にする
             self.main_pane.table_pane._update_dirty_indicator()
             self._update_save_btn_style()
             self.main_pane.tree_pane.refresh()
@@ -1328,6 +1455,7 @@ class MainWindow(QMainWindow):
             self.state.load()
             self.state.nodes_modified = False     # 再読込後は未保存フラグをリセット
             self.state.schedule_modified = False  # 再読込後は未保存フラグをリセット
+            self._reset_undo()  # 読み込んだ状態を Undo の起点にする
             self.main_pane.table_pane._update_dirty_indicator()
             self._update_save_btn_style()
             self.refresh()
@@ -1454,6 +1582,7 @@ class _Main3Pane(QWidget):
         splitter.addWidget(self.table_pane)
         splitter.setSizes([260, 940])
         splitter.setChildrenCollapsible(False)
+        self.splitter = splitter  # 画面状態の記憶用
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1532,6 +1661,7 @@ class TreePane(QWidget):
         self._filter_own: bool = True    # True = 自分に関係するノードのみ表示
         self._search_text: str = ""
         self._import_queue: list = []    # AI取込キュー
+        self._collapsed: set = set()     # 閉じているノードの IDX（再描画・再起動後も維持）
         self._import_pos: int = 0
 
         layout = QVBoxLayout(self)
@@ -1555,12 +1685,12 @@ class TreePane(QWidget):
         _expand_btn = QPushButton("⊞ 全展開")
         _expand_btn.setStyleSheet(STYLE_BUTTON)
         _expand_btn.setToolTip("ツリーを全て展開")
-        _expand_btn.clicked.connect(lambda: self.tree.expandAll())
+        _expand_btn.clicked.connect(self._expand_all)
         top_row.addWidget(_expand_btn)
         _collapse_btn = QPushButton("⊟ 全閉じ")
         _collapse_btn.setStyleSheet(STYLE_BUTTON)
         _collapse_btn.setToolTip("ツリーを全て閉じる")
-        _collapse_btn.clicked.connect(lambda: self.tree.collapseAll())
+        _collapse_btn.clicked.connect(self._collapse_all)
         top_row.addWidget(_collapse_btn)
         # AI取込確認用「次へ」ボタン（取込時のみ有効）
         self._next_btn = QPushButton("次へ →")
@@ -1589,6 +1719,11 @@ class TreePane(QWidget):
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_context_menu)
         self.tree.node_reparented.connect(self._on_node_reparented)
+        # ユーザーの開閉操作を記憶する（refresh 中はシグナルをブロックするため記録されない）
+        self.tree.itemCollapsed.connect(
+            lambda it: self._collapsed.add(it.data(0, Qt.ItemDataRole.UserRole)))
+        self.tree.itemExpanded.connect(
+            lambda it: self._collapsed.discard(it.data(0, Qt.ItemDataRole.UserRole)))
         self.tree.setIndentation(18)
         self.tree.setRootIsDecorated(True)
         # 階層線と種別を視覚的に分かりやすくするスタイル
@@ -1684,6 +1819,9 @@ class TreePane(QWidget):
             # P1 以下を P0 仮想ルートの子として表示
             self._build_tree(p0_item, df, "0", filter_ids)
         self.tree.expandAll()
+        # ユーザーが閉じていたノードは閉じたまま再現する
+        if self._collapsed:
+            self._apply_collapsed(self.tree.invisibleRootItem())
         # 選択を復元（シグナルをブロックしたまま実行して update_for_parent の呼び出しを防ぐ）
         # blockSignals(False) を後に移動することで refresh 中に _normalize_priorities が
         # 呼ばれるのを防ぐ（日付編集後に順序が変わるバグの修正）
@@ -1744,6 +1882,22 @@ class TreePane(QWidget):
                 item.setFont(0, f)
 
             self._build_tree(item, df, idx, filter_ids)
+
+    def _apply_collapsed(self, parent) -> None:
+        for i in range(parent.childCount()):
+            child = parent.child(i)
+            if child.data(0, Qt.ItemDataRole.UserRole) in self._collapsed:
+                child.setExpanded(False)
+            self._apply_collapsed(child)
+
+    def _expand_all(self) -> None:
+        self._collapsed.clear()
+        self.tree.expandAll()
+
+    def _collapse_all(self) -> None:
+        # collapseAll は項目ごとの itemCollapsed を出さないため、ここで全 IDX を記録する
+        self._collapsed = set(self.state.df_nodes.index) | {"0"}
+        self.tree.collapseAll()
 
     def start_import_queue(self, idxs: list) -> None:
         """AI取込後の確認キューをセットし先頭アイテムへ移動する"""
@@ -3005,6 +3159,7 @@ class DetailPane(QWidget):
 
         vsplit.addWidget(report_widget)
         vsplit.setSizes([260, 460])
+        self._vsplit = vsplit  # 画面状態の記憶用
         layout.addWidget(vsplit, stretch=1)
 
         self.info = InfoLabel()

@@ -77,6 +77,7 @@ class GanttView(QWidget):
         super().__init__()
         self.state = state
         self._date_range: list = []   # 表示日付リスト (datetime.date)
+        self._initial_pj: str = ""    # 前回終了時の Project 選択（初回 refresh で適用）
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
@@ -378,7 +379,8 @@ class GanttView(QWidget):
         df = self.state.df_nodes
         # Project1 コンボ更新
         self.pj_combo.blockSignals(True)
-        cur = self.pj_combo.currentData()
+        cur = self.pj_combo.currentData() or self._initial_pj
+        self._initial_pj = ""
         self.pj_combo.clear()
         self.pj_combo.addItem("（全て）", userData="")
         for idx, row in df[df["node_type"] == "project1"].iterrows():
@@ -1063,6 +1065,25 @@ class RoadmapView(QWidget):
 
         self.info = InfoLabel()
         layout.addWidget(self.info)
+
+    def apply_saved_view(self, level: str, unit: str, filter_own: bool,
+                         col_extra: int) -> None:
+        """前回終了時の表示設定を反映する（起動時用。再描画は表示時の refresh に任せる）"""
+        if level in self._lvl_btns:
+            self._current_level = level
+            for lbl, btn in self._lvl_btns.items():
+                btn.setChecked(lbl == level)
+        if unit in self._unit_btns:
+            self._cell_unit = unit
+            for u, btn in self._unit_btns.items():
+                btn.setChecked(u == unit)
+        self._date_col_extra = max(-40, min(100, int(col_extra)))
+        self._filter_own = bool(filter_own)
+        self._filter_own_btn.blockSignals(True)
+        self._filter_own_btn.setChecked(self._filter_own)
+        self._filter_own_btn.setText(
+            "👤 選択中メンバーのみ ✓" if self._filter_own else "👤 選択中メンバーのみ")
+        self._filter_own_btn.blockSignals(False)
 
     # ── レベル / 単位ボタン ──
 
@@ -2640,6 +2661,7 @@ class AssignmentView(QWidget):
 
         # 左:右 = 1:2 の初期幅
         splitter.setSizes([300, 600])
+        self._splitter = splitter  # 画面状態の記憶用
 
         self.info = InfoLabel()
         layout.addWidget(self.info)
@@ -3054,6 +3076,8 @@ class AssignmentView(QWidget):
             self.state.logger.info(f"[Request] 承諾 user={self.state.user} 件数={len(asgn_ids)} ids={asgn_ids}")
 
         self.state.df_assignments = self.state.db.read_assignments()
+        # DB へ直接反映したノード変更は元に戻せないため、ここを Undo の起点にする
+        self.state.reset_undo()
         self.refresh()
         count = len(asgn_ids)
         msg = "承諾しました" if count == 1 else f"{count}件をまとめて承諾しました"
@@ -3323,7 +3347,7 @@ class ConfigView(QWidget):
         self._spin("gui_window_height", cfg.window_height, fl, "window_height:", 400, 2160)
         self._spin("gui_font_size",     cfg.font_size,     fl, "font_size:",     6, 24)
         self._text("gui_start_tab",     cfg.start_tab,     fl,
-                   "start_tab (today/main/edit/plan):")
+                   "start_tab (today/main/edit/plan/last):")
         self._text("gui_detail_pane",
                    "open" if cfg.detail_pane_open else "closed", fl,
                    "detail_pane (open/closed):")
@@ -3849,6 +3873,8 @@ class AIImportView(QWidget):
 
         if not imported_idxs:
             return
+        # DB へ直接登録した行はメモリから戻すと食い違うため、ここを Undo の起点にする
+        self.state.reset_undo()
         self.state.refresh()
 
         if self.state.logger:

@@ -1532,6 +1532,153 @@ def test_save_load(state):
 # -------------------------------------------------------
 # メイン
 # -------------------------------------------------------
+def test_undo_redo(win, task_idx, ticket_idx):
+    """B6: Ctrl+Z（元に戻す）/ Ctrl+Y（やり直し）"""
+    print("\n[B6] 元に戻す / やり直しテスト")
+    from PySide6.QtCore import Qt
+    import db as DB
+    state = win.state
+    tp = win.main_pane.table_pane
+
+    def row_of(idx):
+        for r in range(tp.table.rowCount()):
+            it = tp.table.item(r, 0)
+            if it and it.data(Qt.ItemDataRole.UserRole) == idx:
+                return r
+        return -1
+
+    try:
+        # 起点: 保存直後（履歴なし・未保存なし）
+        win._on_save()
+        assert not win._undo.can_undo(), "保存直後に戻せる履歴がある"
+        tp.update_for_parent(task_idx)
+        orig = str(state.df_nodes.loc[ticket_idx, "title"])
+        tp.table.item(row_of(ticket_idx), 0).setText("Undo確認用タイトル")
+        assert state.df_nodes.loc[ticket_idx, "title"] == "Undo確認用タイトル"
+        win._on_undo()
+        assert state.df_nodes.loc[ticket_idx, "title"] == orig, "タイトルが戻らない"
+        assert not state.nodes_modified, "起点まで戻ったのに未保存扱い"
+        win._on_redo()
+        assert state.df_nodes.loc[ticket_idx, "title"] == "Undo確認用タイトル", "やり直せない"
+        assert state.nodes_modified
+        win._on_undo()
+        ok("表の編集 → Ctrl+Z で戻り、Ctrl+Y でやり直せる（起点では未保存フラグも戻る）")
+    except Exception as e:
+        ng("表の編集の Undo/Redo", e)
+
+    try:
+        # 1 操作内の複数変更（連番化 + 追加 + 自動チケット）は 1 回で戻る
+        n_before = len(state.df_nodes)
+        tp.update_for_parent(task_idx)
+        tp._add_from_blank_row("Undo一括確認")
+        assert len(state.df_nodes) == n_before + 1
+        win._on_undo()
+        assert len(state.df_nodes) == n_before, "1 回の Undo で追加が消えない"
+        ok("1 操作内の複数変更は 1 回の Ctrl+Z で戻る")
+    except Exception as e:
+        ng("1 操作単位の Undo", e)
+
+    try:
+        # 日次スケジュールの割り当ても戻る（実績工数も連動）
+        state.current_member = state.user
+        panel = win.schedule_panel
+        act_before = float(state.df_nodes.loc[ticket_idx, "actual_hours"] or 0)
+        panel._update_schedule_slots([40, 41], ticket_idx)
+        assert float(state.df_nodes.loc[ticket_idx, "actual_hours"]) == act_before + 0.5
+        win._on_undo()
+        sch_idx = DB.daily_sch_idx(state.current_date, state.user)
+        slot_empty = (sch_idx not in state.df_daily.index
+                      or not state.df_daily.loc[sch_idx, "C1000"])
+        assert slot_empty, "スロット割り当てが戻らない"
+        assert float(state.df_nodes.loc[ticket_idx, "actual_hours"] or 0) == act_before
+        ok("スケジュール割り当ての Ctrl+Z で実績工数も元に戻る")
+    except Exception as e:
+        ng("スケジュールの Undo", e)
+
+    try:
+        # 保存すると起点が更新され、それより前には戻れない
+        tp.update_for_parent(task_idx)
+        tp.table.item(row_of(ticket_idx), 1).setText("7")
+        win._on_save()
+        win._on_undo()
+        assert int(state.df_nodes.loc[ticket_idx, "priority"]) == 7, "保存前の状態に戻ってしまった"
+        assert not state.nodes_modified
+        ok("保存後は保存前の状態へ戻らない（保存時点が起点）")
+    except Exception as e:
+        ng("保存時の Undo 起点", e)
+
+
+def test_ui_state(state, version, win, tmpdir):
+    """D3: 画面状態（ウィンドウ・分割・フィルタ・ツリー開閉・前回タブ）の記憶"""
+    print("\n[D3] 画面状態の記憶テスト")
+    from PySide6.QtCore import QSettings, Qt
+    from ui_main import MainWindow, IDX_ROADMAP
+    # 実ユーザーの ui_state.ini を汚さないよう保存先を一時フォルダへ
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, tmpdir)
+    try:
+        tp = win.main_pane.tree_pane
+        tp.refresh()
+        root = tp.tree.invisibleRootItem().child(0)  # P0
+        first = root.child(0)                          # 先頭の P1
+        first_idx = first.data(0, Qt.ItemDataRole.UserRole)
+        first.setExpanded(False)
+        tp.refresh()
+        again = tp._find_item(tp.tree.invisibleRootItem(), first_idx)
+        assert again is not None and not again.isExpanded(), "再描画で全展開に戻った"
+        ok("Edit ツリーで閉じたノードは再描画後も閉じたまま")
+    except Exception as e:
+        ng("ツリー開閉の保持", e)
+        return
+
+    try:
+        state.config.start_tab = "last"
+        win.gantt_view._status_radios["all"].setChecked(True)
+        win.road_view.apply_saved_view("Task", "月", True, 15)
+        tp.filter_btn.setChecked(False)
+        win.detail_toggle_btn.setChecked(True)
+        win._switch_view(IDX_ROADMAP)
+        win.main_pane.splitter.setSizes([400, 800])
+        edit_sizes = win.main_pane.splitter.sizes()
+        state.nodes_modified = False
+        state.schedule_modified = False
+        win.save_ui_state()
+
+        win2 = MainWindow(state, version)
+        win2.resize(1500, 900)
+        win2.restore_ui_state()
+        win2.show()
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()
+        assert win2.stack.currentIndex() == IDX_ROADMAP, "前回のタブで開かない"
+        assert win2.detail_toggle_btn.isChecked(), "詳細ペインの開閉が戻らない"
+        assert win2.gantt_view._get_status_filter() == "all"
+        rv = win2.road_view
+        assert (rv._current_level, rv._cell_unit, rv._filter_own, rv._date_col_extra) \
+            == ("Task", "月", True, 15), "Plan の表示設定が戻らない"
+        tp2 = win2.main_pane.tree_pane
+        assert not tp2._filter_own, "Edit の『選択中メンバーのみ』が戻らない"
+        assert first_idx in tp2._collapsed, "ツリーの開閉が戻らない"
+        # 分割位置は Edit タブを表示してから比率で比較（ウィンドウ幅が異なるため）
+        from ui_main import IDX_MAIN
+        win2._switch_view(IDX_MAIN)
+        QApplication.processEvents()
+        s2 = win2.main_pane.splitter.sizes()
+        r1, r2 = edit_sizes[0] / sum(edit_sizes), s2[0] / sum(s2)
+        assert abs(r1 - r2) < 0.02, f"分割位置が戻らない {s2} vs {edit_sizes}"
+        ok("終了時の画面状態が次回起動時に復元される（start_tab=last）")
+        state.config.start_tab = "today"
+        win3 = MainWindow(state, version)
+        win3.restore_ui_state()
+        from ui_main import IDX_TODAY
+        assert win3.stack.currentIndex() == IDX_TODAY, "start_tab=today なのに前回タブで開いた"
+        ok("start_tab が last 以外なら config のタブで起動する")
+        for w in (win2, win3):
+            w.hide()
+            w.deleteLater()
+    except Exception as e:
+        ng("画面状態の保存・復元", e)
+
+
 def main():
     print("=" * 55)
     print("  ヘッドレス GUI テスト (QT_QPA_PLATFORM=offscreen)")
@@ -1570,7 +1717,9 @@ def main():
             test_personal_review_member(win)
             test_team_log_export(win)
             test_assignment_view_multi_rows(win, ticket_idx)
+            test_undo_redo(win, task_idx, ticket_idx)
             test_save_load(state)
+            test_ui_state(state, version, win, tmpdir)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

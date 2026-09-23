@@ -55,7 +55,7 @@ class AppConfig:
     window_width: int = 1500
     window_height: int = 900
     font_size: int = 9
-    # 起動時に表示するタブ（today / main / edit / plan）
+    # 起動時に表示するタブ（today / main / edit / plan / last=前回終了時のタブ）
     start_tab: str = "today"
     # 詳細ペインを起動時に開くか（True=開く / False=閉じる）
     detail_pane_open: bool = False
@@ -231,6 +231,20 @@ class AppState:
         if not self.current_date:
             self.current_date = datetime.date.today().isoformat()
 
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        # 変更フラグが立った（= 何かを編集した）ことを Undo 履歴へ通知する
+        if name in ("nodes_modified", "schedule_modified") and value:
+            func = self.__dict__.get("modified_func")
+            if callable(func):
+                func()
+
+    def reset_undo(self) -> None:
+        """Undo 履歴を現在の状態で初期化する（DB へ直接書き込んだ操作の後などに呼ぶ）"""
+        func = getattr(self, "undo_reset_func", None)
+        if callable(func):
+            func()
+
     def reload_nodes(self) -> None:
         """DB からノード全件再読込"""
         if self.db:
@@ -339,6 +353,79 @@ class AppState:
             self.memo_text              = self.db.read_memo(self.login_user)
             self.permanent_notice       = self.db.read_permanent_notice(self.login_user)
             self.all_permanent_notices  = self.db.read_all_permanent_notices()
+
+
+# -------------------------------------------------------
+# UndoHistory - 元に戻す / やり直し（インメモリ編集のスナップショット履歴）
+# -------------------------------------------------------
+class UndoHistory:
+    """
+    編集のたびに df_nodes / df_daily / df_daily_log と変更フラグを丸ごと記録し、
+    Ctrl+Z / Ctrl+Y で行き来する。履歴は保存・再読込の時点を起点（baseline）とし、
+    それより前には戻らない（保存済み DB とメモリの食い違いを防ぐため）。
+    """
+
+    def __init__(self, limit: int = 30):
+        self.limit = limit      # baseline を除いて保持する操作数の上限
+        self._states: list = []  # [(df_nodes, df_daily, df_daily_log, nodes_mod, sch_mod), ...]
+        self._pos = -1           # 現在表示中の状態の位置
+
+    @staticmethod
+    def _capture(state: "AppState") -> tuple:
+        return (state.df_nodes.copy(), state.df_daily.copy(), state.df_daily_log.copy(),
+                bool(state.nodes_modified), bool(state.schedule_modified))
+
+    def reset(self, state: "AppState") -> None:
+        """現在の状態を起点にして履歴を初期化する"""
+        self._states = [self._capture(state)]
+        self._pos = 0
+
+    def push(self, state: "AppState") -> bool:
+        """編集後の状態を記録する。直前と同じ内容なら記録しない。記録したら True。"""
+        if self._pos < 0:
+            self.reset(state)
+            return False
+        cur = self._states[self._pos]
+        if (state.df_nodes.equals(cur[0]) and state.df_daily.equals(cur[1])
+                and state.df_daily_log.equals(cur[2])):
+            return False
+        # 戻した後に新たな編集をしたら、やり直し用の履歴は捨てる
+        del self._states[self._pos + 1:]
+        self._states.append(self._capture(state))
+        if len(self._states) > self.limit + 1:
+            del self._states[0]
+        self._pos = len(self._states) - 1
+        return True
+
+    def can_undo(self) -> bool:
+        return self._pos > 0
+
+    def can_redo(self) -> bool:
+        return 0 <= self._pos < len(self._states) - 1
+
+    def undo(self, state: "AppState") -> bool:
+        if not self.can_undo():
+            return False
+        self._pos -= 1
+        self._restore(state)
+        return True
+
+    def redo(self, state: "AppState") -> bool:
+        if not self.can_redo():
+            return False
+        self._pos += 1
+        self._restore(state)
+        return True
+
+    def _restore(self, state: "AppState") -> None:
+        nodes, daily, log, n_mod, s_mod = self._states[self._pos]
+        # 履歴側を以後の編集で書き換えないようコピーを渡す
+        state.df_nodes = nodes.copy()
+        state.df_daily = daily.copy()
+        state.df_daily_log = log.copy()
+        # フラグ復元は Undo 記録のきっかけにしない（__setattr__ の通知を経由しない）
+        state.__dict__["nodes_modified"] = n_mod
+        state.__dict__["schedule_modified"] = s_mod
 
 
 # -------------------------------------------------------
@@ -547,6 +634,8 @@ def main() -> None:
 
     window = MainWindow(state, APP_VERSION)
     window.resize(config.window_width, config.window_height)
+    # 前回終了時のウィンドウ位置・分割・フィルタ等を復元（初回は config のサイズのまま）
+    window.restore_ui_state()
     window.setWindowTitle(f"{APP_NAME}  [{config.get_display_name(config.username)}]")
     window.show()
 
