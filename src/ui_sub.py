@@ -1233,7 +1233,9 @@ class RoadmapView(QWidget):
             d_to = datetime.date(y6, m6, min(today.day, d6_max))
         elif name == "Next01y":
             d_from = today
-            d_to   = datetime.date(today.year + 1, today.month, today.day)
+            # 2/29 起点で翌年に同日が無い場合は月末日に丸める
+            d1_max = calendar.monthrange(today.year + 1, today.month)[1]
+            d_to   = datetime.date(today.year + 1, today.month, min(today.day, d1_max))
         else:
             return
 
@@ -2002,25 +2004,21 @@ class AnalysisView(QWidget):
             for idx, row in groups.iterrows()
         }
 
-        if user_set is None:
-            # 全員: ノード自身の集計値をそのまま使用
-            for idx in list(agg.keys()):
-                row = df.loc[idx]
-                agg[idx]["actual"] = float(row.get("actual_hours", 0) or 0)
-                agg[idx]["est"]    = float(row.get("estimated_hours", 0) or 0)
-        else:
-            # 特定ユーザーのみ: チケットを走査して積み上げ
-            tickets = df[(df["node_type"] == "ticket") &
-                         (df["assigned_to"].isin(user_set))]
-            if scope_idxs:
-                tickets = tickets[tickets.index.map(
-                    lambda i: self._is_in_scope(str(i), scope_idxs, df)
-                )]
-            for t_idx, t_row in tickets.iterrows():
-                anc = self._find_ancestor_at_type(str(t_idx), level)
-                if anc and anc in agg:
-                    agg[anc]["actual"] += float(t_row.get("actual_hours", 0) or 0)
-                    agg[anc]["est"]    += float(t_row.get("estimated_hours", 0) or 0)
+        # チケットを走査して集計レベルの祖先へ積み上げる
+        # （見積は上位ノードへ集計されないため、全員の場合もチケットから合算する）
+        tickets = df[(df["node_type"] == "ticket")
+                     & (~df["status"].isin(["cancel", "deleted"]))]
+        if user_set is not None:
+            tickets = tickets[tickets["assigned_to"].isin(user_set)]
+        if scope_idxs:
+            tickets = tickets[tickets.index.map(
+                lambda i: self._is_in_scope(str(i), scope_idxs, df)
+            )]
+        for t_idx, t_row in tickets.iterrows():
+            anc = self._find_ancestor_at_type(str(t_idx), level)
+            if anc and anc in agg:
+                agg[anc]["actual"] += float(t_row.get("actual_hours", 0) or 0)
+                agg[anc]["est"]    += float(t_row.get("estimated_hours", 0) or 0)
 
         # ── 棒グラフ描画 ──────────────────────────────────
         # 個人振り返り（2分割描画）の後でも正しく描けるよう Figure ごと再生成する
@@ -2309,7 +2307,6 @@ class SearchView(QWidget):
             date_to="",
             node_types=["ticket"],
         )
-        self._last_result = result
         # 期間内実績工数を一括計算（日付範囲指定時のみ）
         period_hours = self._calc_period_hours_batch(
             list(result.index), date_from, date_to
@@ -2317,6 +2314,8 @@ class SearchView(QWidget):
         # 期間指定時は期間内工数が 0 のアイテムを除外する
         if date_from or date_to:
             result = result[result.index.map(lambda i: period_hours.get(i, 0) > 0)]
+        # CSV 出力は画面に表示した結果と一致させる（期間フィルタ後）
+        self._last_result = result
         rows = []
         for idx, r in result.iterrows():
             anc = self._get_ancestors(idx)
@@ -3417,7 +3416,9 @@ class ConfigView(QWidget):
 
     def _on_save(self) -> None:
         """フォーム値を user_config.ini に書き込む（config.ini は上書きしない）"""
-        parser = configparser.ConfigParser()
+        # 読込側（load_config）と同じく % を解釈せず、キーの大文字小文字を保持する
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.optionxform = str
         # 既存の user_config.ini を読んで保持（なければ config.ini をベースにする）
         if self._USER_CONFIG_PATH.exists():
             parser.read(str(self._USER_CONFIG_PATH), encoding="utf-8")
@@ -3985,6 +3986,19 @@ class AIImportView(QWidget):
         df_nodes = self.state.df_nodes
         sch_idx = DB.daily_sch_idx(date_str, self.state.user)
 
+        # 割り当て可能なのは自分担当のチケットのみ（手動割り当てと同じ制約）
+        invalid = []
+        for it in items:
+            t = it["ticket_idx"]
+            if t not in df_nodes.index:
+                invalid.append(f"ticket_idx が見つかりません: {t}")
+            elif (str(df_nodes.loc[t, "node_type"]) != "ticket"
+                  or str(df_nodes.loc[t, "assigned_to"]) != self.state.user):
+                invalid.append(f"自分のチケットではありません: {t}")
+        if invalid:
+            self.info.set_error("取り込み不可: " + " / ".join(invalid))
+            return
+
         # 日付行が存在しなければ作成
         if self.state.df_daily.empty or sch_idx not in self.state.df_daily.index:
             new_row = {c: "" for c in DB.DAILY_SCH_COLS[1:]}
@@ -3997,10 +4011,6 @@ class AIImportView(QWidget):
             ticket_idx = it["ticket_idx"]
             from_col = it["from_col"]
             to_col = it["to_col"]
-
-            if ticket_idx not in df_nodes.index:
-                self.info.set_error(f"ticket_idx が見つかりません: {ticket_idx}")
-                continue
 
             from_i = DB.DAILY_TIME_COLS.index(from_col)
             to_i = DB.DAILY_TIME_COLS.index(to_col)
@@ -4137,6 +4147,11 @@ class AIImportView(QWidget):
         if not date_str:
             errors.append("date が見つかりません（先頭に date: YYYY-MM-DD を記載してください）")
             return date_str, items, errors
+        try:
+            date_str = datetime.date.fromisoformat(date_str).isoformat()
+        except ValueError:
+            errors.append(f"date の形式が不正です（YYYY-MM-DD）: {date_str}")
+            return "", items, errors
 
         # 以降のセクションをスケジュールアイテムとして解析
         for section in sections[1:]:

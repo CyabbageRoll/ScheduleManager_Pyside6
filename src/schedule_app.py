@@ -109,7 +109,10 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
     cfg = AppConfig()
     # 読み込み優先順: config.ini（デフォルト）→ user_config.ini（ユーザー設定で上書き）
     files = [str(path), str(USER_CONFIG_FILE)]
-    parser = configparser.ConfigParser()
+    # interpolation=None: パス等に含まれる % をそのまま値として扱う（起動エラー防止）
+    parser = configparser.ConfigParser(interpolation=None)
+    # キーの大文字小文字を保持する（[DisplayNames] の ID 照合のため）
+    parser.optionxform = str
     parser.read(files, encoding="utf-8")
     if not parser.sections():
         return cfg

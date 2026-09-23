@@ -2,9 +2,7 @@
 db.py - データベース接続・CRUD・工数集計・IDX生成
 """
 import sqlite3
-import hashlib
 import os
-import random
 import secrets
 import datetime
 import time
@@ -66,12 +64,19 @@ DEFAULT_COLORS_BY_TYPE = {
 
 
 # --- IDX ユーティリティ ---
+_ISSUED_IDX: set = set()  # このプロセスで発行済みの IDX（同一セッション内の重複防止）
+
+
 def generate_idx(owner: str) -> str:
-    """YYMMDD_HH + MD5[:6] 形式の TEXT IDX を生成する。重複しにくいランダム文字列を付与。"""
+    """YYMMDD_HH + 16進6桁 形式の TEXT IDX を生成する。
+    乱数は secrets で 16^6（約1677万）通りから取り、同一プロセス内の重複は再生成で回避する。
+    owner は従来互換のため引数として残す。"""
     n = datetime.datetime.now().strftime("%y%m%d%H")
-    rn = str(random.randint(0, 99999))
-    suffix = hashlib.md5((rn + owner).encode()).hexdigest()[:6]
-    return f"{n[:6]}_{n[6:]}{suffix}"
+    while True:
+        idx = f"{n[:6]}_{n[6:]}{secrets.token_hex(3)}"
+        if idx not in _ISSUED_IDX:
+            _ISSUED_IDX.add(idx)
+            return idx
 
 
 def daily_sch_idx(date_str: str, username: str) -> str:

@@ -602,10 +602,13 @@ def filter_nodes(df: pd.DataFrame,
 
     if keyword:
         # タイトルまたはメモにキーワードが含まれる行を抽出（大文字小文字を区別しない）
+        # regex=False: 「(」「.」等を正規表現ではなく文字として扱う
         kw = keyword.lower()
         mask = (
-            result.get("title", pd.Series(dtype=str)).fillna("").str.lower().str.contains(kw)
-            | result.get("memo", pd.Series(dtype=str)).fillna("").str.lower().str.contains(kw)
+            result.get("title", pd.Series(dtype=str)).fillna("").str.lower()
+            .str.contains(kw, regex=False)
+            | result.get("memo", pd.Series(dtype=str)).fillna("").str.lower()
+            .str.contains(kw, regex=False)
         )
         result = result[mask]
 

@@ -881,6 +881,7 @@ class MainWindow(QMainWindow):
         ]
         self._tab_style = _TAB_STYLE  # バッジリセット時に使用
         self._tab_btns: dict = {}
+        self._tab_labels: dict = {}  # 番号付きの元ラベル（バッジ表示後の復元用）
         # タブの並び順（一番左を1番として Ctrl+番号 と対応させる）
         self._view_order = [view_idx for _, view_idx in views]
         for n, (label, view_idx) in enumerate(views, start=1):
@@ -894,6 +895,7 @@ class MainWindow(QMainWindow):
                 btn.setToolTip(f"Ctrl+{n} で切替")
             tb.addWidget(btn)
             self._tab_btns[view_idx] = btn
+            self._tab_labels[view_idx] = num_label
 
         tb.addSeparator()
 
@@ -1415,15 +1417,18 @@ class MainWindow(QMainWindow):
         btn = self._tab_btns.get(IDX_ASSIGN)
         if btn is None:
             return
+        # 番号付きの元ラベルを基準にする（Ctrl+番号の表示を消さない）
+        base_label = self._tab_labels.get(IDX_ASSIGN, "📨 Request")
         if pending > 0:
-            btn.setText(f"📨 Request ({pending})")
+            btn.setText(f"{base_label} ({pending})")
+            # 基本スタイル + 強調（現在のスタイルに足すと refresh ごとに文字列が伸び続ける）
             btn.setStyleSheet(
-                btn.styleSheet() +
+                self._tab_style +
                 "QPushButton { background: #E53935; color: white; font-weight: bold; }"
                 "QPushButton:checked { background: #B71C1C; color: white; }"
             )
         else:
-            btn.setText("📨 Request")
+            btn.setText(base_label)
             btn.setStyleSheet(self._tab_style)
 
 
@@ -2489,6 +2494,10 @@ class TablePane(QWidget):
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             ds = dlg.apply_to_state()  # インメモリ更新
+            # 親ノード（task 以上）には「詳細作成」「完了」チケットを自動生成（仕様 2.2）
+            if child_type != "ticket":
+                for _child in DB.build_auto_children(ds, self.state.user):
+                    self.state.df_nodes.loc[_child.name] = _child
             self._mark_dirty()
             self.state.refresh()
 
@@ -2700,6 +2709,10 @@ class TablePane(QWidget):
         ds["status"] = "todo"
         ds["color"] = parent_color
         self.state.df_nodes.loc[ds.name] = ds  # インメモリ更新
+        # 親ノード（task 以上）には「詳細作成」「完了」チケットを自動生成（仕様 2.2）
+        if child_type != "ticket":
+            for _child in DB.build_auto_children(ds, self.state.user):
+                self.state.df_nodes.loc[_child.name] = _child
         self._mark_dirty()
         self.info.set_info(f"追加: {title}")
         # itemChanged シグナル処理中に setRowCount(0) を呼ぶと
@@ -3322,7 +3335,8 @@ class DetailPane(QWidget):
         """モードに応じた集計期間(date_from, date_to: ISO文字列)を返す"""
         today = datetime.date.today()
         if mode == "monthly":
-            first = today.replace(day=1)
+            # 月ナビで表示中の月を対象にする（過去月のレポートに当月実績が入らないように）
+            first = self._rep_month
             nxt = (first.replace(year=first.year + 1, month=1)
                    if first.month == 12
                    else first.replace(month=first.month + 1))
