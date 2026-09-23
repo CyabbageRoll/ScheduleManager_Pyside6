@@ -29,6 +29,7 @@ from ui_widgets import (
     AutoCombo, ScrollableTable, Separator, PomodoroWidget,
     COLOR_OPTIONS, STYLE_BUTTON,
 )
+from theme import C, qss, LEVEL_BG, LEVEL_FG
 
 # 画面インデックス（QStackedWidget）
 IDX_MAIN    = 0
@@ -72,7 +73,7 @@ class _HourLineDelegate(QStyledItemDelegate):
                     skip_hour_line = True
             if not skip_hour_line:
                 painter.save()
-                pen = QPen(QColor("#90A4AE"))
+                pen = QPen(QColor(C.HOUR_LINE))
                 pen.setWidth(1)
                 painter.setPen(pen)
                 painter.drawLine(r.topLeft(), r.topRight())
@@ -81,7 +82,7 @@ class _HourLineDelegate(QStyledItemDelegate):
         # ── 時刻列: 行ごとの区切り線を常時描画 ──
         if col == 0:
             painter.save()
-            painter.setPen(QPen(QColor("#E8E8E8")))
+            painter.setPen(QPen(QColor(C.SLOT_LINE)))
             painter.drawLine(r.bottomLeft(), r.bottomRight())
             painter.restore()
             return
@@ -92,7 +93,7 @@ class _HourLineDelegate(QStyledItemDelegate):
         if not pos:
             # 空スロット: 下端に薄い区切り線（15分刻みが見えるように）
             painter.save()
-            painter.setPen(QPen(QColor("#E8E8E8")))
+            painter.setPen(QPen(QColor(C.SLOT_LINE)))
             painter.drawLine(r.bottomLeft(), r.bottomRight())
             painter.restore()
             return
@@ -104,8 +105,9 @@ class _HourLineDelegate(QStyledItemDelegate):
             stripe = QColor(c.red(), c.green(), c.blue(), 255)   # ソリッド
             border = QColor(c.red(), c.green(), c.blue(), 180)
         else:
-            stripe = QColor(77, 182, 172, 255)
-            border = QColor(77, 182, 172, 180)
+            stripe = QColor(C.SLOT_CARD)
+            border = QColor(C.SLOT_CARD)
+            border.setAlpha(180)
 
         painter.save()
 
@@ -178,10 +180,10 @@ class DailyScheduleWidget(QWidget):
 
         # ── コンパクト入力フォーム（チームログから移動）──
         input_frame = QFrame()
-        input_frame.setStyleSheet(
-            "QFrame { background:#F8F9FA; border-radius:4px; border:1px solid #CFD8DC; }"
+        input_frame.setStyleSheet(qss(
+            "QFrame { background:@card_alt; border-radius:4px; border:1px solid @border; }"
             "QLabel { border:none; font-size:7pt; }"
-        )
+        ))
         in_layout = QVBoxLayout(input_frame)
         in_layout.setContentsMargins(4, 3, 4, 3)
         in_layout.setSpacing(2)
@@ -236,7 +238,7 @@ class DailyScheduleWidget(QWidget):
         self.free_btn.clicked.connect(self._on_free)
         btn_row.addWidget(self.free_btn)
         self.wh_label = QLabel("─")
-        self.wh_label.setStyleSheet("font-size:7pt; color:#546E7A; padding-left:4px;")
+        self.wh_label.setStyleSheet(qss("font-size:7pt; color:@text_sub; padding-left:4px;"))
         btn_row.addWidget(self.wh_label, stretch=1)
         layout.addLayout(btn_row)
 
@@ -258,11 +260,11 @@ class DailyScheduleWidget(QWidget):
         self.schedule_table.setAlternatingRowColors(False)
         self.schedule_table.setShowGrid(False)  # グリッド線を非表示（カードのシームレス描画のため）
         self.schedule_table.verticalHeader().setDefaultSectionSize(16)
-        self.schedule_table.setStyleSheet(
-            "QTableWidget { border: 1px solid #CFD8DC;"
-            " font-size: 8pt; background: #FFFFFF; }"
-            "QTableWidget::item:selected { background: #B2DFDB; color: #004D40; }"
-        )
+        self.schedule_table.setStyleSheet(qss(
+            "QTableWidget { border: 1px solid @border;"
+            " font-size: 8pt; background: @surface; }"
+            "QTableWidget::item:selected { background: @slot_select_bg; color: @slot_select_text; }"
+        ))
         # デリゲートを設定（毎時00分に区切り線、同一チケットに囲み線を描画）
         self.schedule_table.setItemDelegate(_HourLineDelegate(self.schedule_table))
 
@@ -276,7 +278,7 @@ class DailyScheduleWidget(QWidget):
         hour_font.setPointSize(8)
         sub_font = QFont()
         sub_font.setPointSize(7)
-        _HOUR_BG = QColor("#ECEFF1")   # 毎時00分行の背景色（青灰系）
+        _HOUR_BG = QColor(C.HOUR_BG)   # 毎時00分行の背景色（青灰系）
         for i in range(96):
             hh, mm = i // 4, (i % 4) * 15
             hh_next, mm_next = (i + 1) // 4, ((i + 1) % 4) * 15
@@ -289,14 +291,14 @@ class DailyScheduleWidget(QWidget):
                 # 毎時00分: 太字・スレートブルー・薄い青灰背景
                 item.setData(Qt.ItemDataRole.UserRole, "hour")
                 item.setFont(hour_font)
-                item.setForeground(QColor("#37474F"))
+                item.setForeground(QColor(C.TEXT))
                 item.setBackground(_HOUR_BG)
                 task_item.setData(Qt.ItemDataRole.UserRole, "hour")
                 task_item.setBackground(_HOUR_BG)
             else:
                 # サブ行: 少し小さめ・グレー
                 item.setFont(sub_font)
-                item.setForeground(QColor("#90A4AE"))
+                item.setForeground(QColor(C.TEXT_MUTED))
             self.schedule_table.setItem(i, 0, item)
             self.schedule_table.setItem(i, 1, task_item)
 
@@ -617,13 +619,13 @@ class DailyScheduleWidget(QWidget):
         df_nodes = self.state.df_nodes
 
         # 全スロットをクリア（前回の表示を消す）
-        _HOUR_BG = QColor("#ECEFF1")
+        _HOUR_BG = QColor(C.HOUR_BG)
         for i in range(96):
             item = self.schedule_table.item(i, 1)
             if item:
                 item.setText("")
                 # 毎時00分行（i % 4 == 0）の背景は保持し、それ以外は白に戻す
-                item.setBackground(_HOUR_BG if i % 4 == 0 else QColor("white"))
+                item.setBackground(_HOUR_BG if i % 4 == 0 else QColor(C.SURFACE))
                 item.setData(Qt.ItemDataRole.UserRole, None)
                 # 囲み線の位置マークもクリア（枠線が残らないようにする）
                 item.setData(Qt.ItemDataRole.UserRole + 1, "")
@@ -704,7 +706,7 @@ class DailyScheduleWidget(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole + 2, "path" if is_path[i] else "")
                 if t_idx and t_idx in df_nodes.index:
                     hex_c = COLOR_OPTIONS.get(
-                        df_nodes.loc[t_idx, "color"], "#00BCD4"
+                        df_nodes.loc[t_idx, "color"], C.NODE_DEFAULT
                     )
                     bg = QColor(hex_c)
                     bg.setAlpha(110)   # カードの視認性向上
@@ -821,9 +823,9 @@ class MainWindow(QMainWindow):
     def _build_toolbar(self) -> None:
         tb = QToolBar("メインツールバー")
         tb.setMovable(False)
-        tb.setStyleSheet(
-            "QToolBar { background: #ECEFF1; border-bottom: 1px solid #CFD8DC; padding: 4px; }"
-        )
+        tb.setStyleSheet(qss(
+            "QToolBar { background: @toolbar_bg; border-bottom: 1px solid @border; padding: 4px; }"
+        ))
         self.addToolBar(tb)
 
         # 日付ナビゲーション（前日・日付選択・翌日・今日）
@@ -873,26 +875,26 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         # 画面切替ボタン（等幅・縁付き・グラデーション）
-        _TAB_STYLE = (
+        _TAB_STYLE = qss(
             "QPushButton {"
             " background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "   stop:0 #FFFFFF, stop:1 #E8ECEF);"
-            " color: #37474F;"
-            " border: 1px solid #B0BEC5;"
+            "   stop:0 @tab_top, stop:1 @tab_bottom);"
+            " color: @text;"
+            " border: 1px solid @border_strong;"
             " border-radius: 5px;"
             " padding: 5px 0px;"
             " font-size: 8pt; font-weight: bold;"
             " min-width: 74px; max-width: 74px; }"
             "QPushButton:checked {"
             " background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "   stop:0 #1E88E5, stop:1 #1565C0);"
-            " color: white;"
-            " border: 1px solid #0D47A1;"
-            " border-bottom: 2px solid #083A82; }"
+            "   stop:0 @accent_light, stop:1 @accent);"
+            " color: @on_accent;"
+            " border: 1px solid @accent_dark;"
+            " border-bottom: 2px solid @accent_darker; }"
             "QPushButton:hover:!checked {"
             " background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "   stop:0 #E3F2FD, stop:1 #BBDEFB);"
-            " border-color: #64B5F6; color:#1565C0; }"
+            "   stop:0 @accent_bg, stop:1 @accent_bg2);"
+            " border-color: @accent_border; color:@accent; }"
         )
         views = [
             ("🏠 Today",   IDX_TODAY),
@@ -957,23 +959,23 @@ class MainWindow(QMainWindow):
         self.addToolBarBreak()
         tb2 = QToolBar("メンバー選択ツールバー")
         tb2.setMovable(False)
-        tb2.setStyleSheet(
-            "QToolBar { background: #F5F5F5; border-bottom: 1px solid #CFD8DC; padding: 2px; }"
-        )
+        tb2.setStyleSheet(qss(
+            "QToolBar { background: @bg_soft; border-bottom: 1px solid @border; padding: 2px; }"
+        ))
         self.addToolBar(tb2)
         tb2.addWidget(QLabel(" メンバー: "))
 
         # メンバーボタン（ボタン形式で素早く切替）
-        _MEMBER_STYLE = (
+        _MEMBER_STYLE = qss(
             "QPushButton {"
-            " background: #ECEFF1; color: #37474F;"
-            " border: 1px solid #B0BEC5; border-radius: 4px;"
+            " background: @control; color: @text;"
+            " border: 1px solid @border_strong; border-radius: 4px;"
             " padding: 3px 10px; font-size: 8pt; }"
             "QPushButton:checked {"
-            " background: #1565C0; color: white;"
-            " border: 1px solid #0D47A1; }"
+            " background: @accent; color: @on_accent;"
+            " border: 1px solid @accent_dark; }"
             "QPushButton:hover:!checked {"
-            " background: #E3F2FD; border-color: #64B5F6; color: #1565C0; }"
+            " background: @accent_bg; border-color: @accent_border; color: @accent; }"
         )
         self._member_btns: dict = {}
         for m in self.state.members:
@@ -1282,11 +1284,11 @@ class MainWindow(QMainWindow):
         dirty = (getattr(self.state, "nodes_modified", False) or
                  getattr(self.state, "schedule_modified", False))
         if dirty:
-            self._save_btn.setStyleSheet(
-                "QToolButton { background: #E65100; color: white; font-weight: bold; "
+            self._save_btn.setStyleSheet(qss(
+                "QToolButton { background: @warning; color: @on_accent; font-weight: bold; "
                 "border-radius: 3px; padding: 4px 8px; }"
-                "QToolButton:hover { background: #BF360C; }"
-            )
+                "QToolButton:hover { background: @warning_dark; }"
+            ))
         else:
             self._save_btn.setStyleSheet("")  # デフォルトに戻す
 
@@ -1301,9 +1303,9 @@ class MainWindow(QMainWindow):
         s = self._inbox_summary()
         self.inbox_btn.setText(f"📥 Inbox {s['count']}")
         if s["over"] or s["stale"]:
-            self.inbox_btn.setStyleSheet(
-                "QPushButton { background:#E65100; color:white; font-weight:bold;"
-                " border-radius:4px; padding:4px 10px; }")
+            self.inbox_btn.setStyleSheet(qss(
+                "QPushButton { background:@warning; color:@on_accent; font-weight:bold;"
+                " border-radius:4px; padding:4px 10px; }"))
         else:
             self.inbox_btn.setStyleSheet(STYLE_BUTTON)
 
@@ -1662,9 +1664,9 @@ class MainWindow(QMainWindow):
             btn.setText(f"{base_label} ({pending})")
             # 基本スタイル + 強調（現在のスタイルに足すと refresh ごとに文字列が伸び続ける）
             btn.setStyleSheet(
-                self._tab_style +
-                "QPushButton { background: #E53935; color: white; font-weight: bold; }"
-                "QPushButton:checked { background: #B71C1C; color: white; }"
+                self._tab_style + qss(
+                    "QPushButton { background: @danger_btn; color: @on_accent; font-weight: bold; }"
+                    "QPushButton:checked { background: @danger_btn_on; color: @on_accent; }")
             )
         else:
             btn.setText(base_label)
@@ -1838,28 +1840,28 @@ class TreePane(QWidget):
         self.tree.setIndentation(18)
         self.tree.setRootIsDecorated(True)
         # 階層線と種別を視覚的に分かりやすくするスタイル
-        self.tree.setStyleSheet("""
+        self.tree.setStyleSheet(qss("""
             QTreeWidget {
-                border: 1px solid #CFD8DC;
+                border: 1px solid @border;
             }
             QTreeWidget::item {
                 padding: 3px 2px;
-                border-bottom: 1px solid #EEEEEE;
+                border-bottom: 1px solid @row_line;
             }
             QTreeWidget::item:selected {
-                background: #B3E5FC;
-                color: black;
+                background: @select_bg;
+                color: @text_on_select;
             }
             QTreeWidget::branch:has-siblings:!adjoins-item {
-                border-left: 1px solid #CCCCCC;
+                border-left: 1px solid @branch_line;
             }
             QTreeWidget::branch:has-siblings:adjoins-item {
-                border-left: 1px solid #CCCCCC;
+                border-left: 1px solid @branch_line;
             }
             QTreeWidget::branch:!has-siblings:adjoins-item {
-                border-left: 1px solid #CCCCCC;
+                border-left: 1px solid @branch_line;
             }
-        """)
+        """))
         layout.addWidget(self.tree)
 
         self.info = InfoLabel()
@@ -1908,8 +1910,8 @@ class TreePane(QWidget):
         # 📥 Inbox（Task 未設定チケット。表示中メンバーの分のみ）
         inbox_item = QTreeWidgetItem(self.tree)
         inbox_item.setData(0, Qt.ItemDataRole.UserRole, DB.INBOX_PARENT)
-        inbox_item.setBackground(0, QColor("#F3E5F5"))
-        inbox_item.setForeground(0, QColor("#6A1B9A"))
+        inbox_item.setBackground(0, QColor(C.INBOX_BG))
+        inbox_item.setForeground(0, QColor(C.INBOX))
         _fi = QFont()
         _fi.setBold(True)
         inbox_item.setFont(0, _fi)
@@ -1918,8 +1920,8 @@ class TreePane(QWidget):
         p0_item = QTreeWidgetItem(self.tree)
         p0_item.setData(0, Qt.ItemDataRole.UserRole, "0")
         p0_item.setText(0, "[P0] ────────────")
-        p0_item.setBackground(0, QColor("#CFD8DC"))
-        p0_item.setForeground(0, QColor("#37474F"))
+        p0_item.setBackground(0, QColor(C.P0_BG))
+        p0_item.setForeground(0, QColor(C.P0_FG))
         _f = QFont()
         _f.setBold(True)
         p0_item.setFont(0, _f)
@@ -1959,16 +1961,8 @@ class TreePane(QWidget):
         "project3": "P3", "project4": "P4",
         "task": "Task", "ticket": "Tkt",
     }
-    _TYPE_BG = {
-        "project1": "#E3F2FD", "project2": "#E8F5E9",
-        "project3": "#FFF9C4", "project4": "#F3E5F5",
-        "task":     "#ECEFF1", "ticket":   "#FFFFFF",
-    }
-    _TYPE_FG = {
-        "project1": "#1565C0", "project2": "#2E7D32",
-        "project3": "#F57F17", "project4": "#6A1B9A",
-        "task":     "#37474F", "ticket":   "#546E7A",
-    }
+    _TYPE_BG = LEVEL_BG
+    _TYPE_FG = LEVEL_FG
 
     def _build_tree(self, parent_item, df: pd.DataFrame, parent_id: str,
                     filter_ids=None) -> None:
@@ -1991,11 +1985,11 @@ class TreePane(QWidget):
             item.setText(0, label)
 
             # 種別ごとの背景色・文字色
-            type_bg = QColor(self._TYPE_BG.get(node_type, "#FFFFFF"))
-            type_fg = QColor(self._TYPE_FG.get(node_type, "#000000"))
+            type_bg = QColor(self._TYPE_BG.get(node_type, C.SURFACE))
+            type_fg = QColor(self._TYPE_FG.get(node_type, C.TEXT_DEFAULT))
             item.setBackground(0, type_bg)
             if row["status"] in ("done", "deleted"):
-                item.setForeground(0, QColor("#9E9E9E"))
+                item.setForeground(0, QColor(C.TEXT_DONE))
             else:
                 item.setForeground(0, type_fg)
 
@@ -2401,10 +2395,10 @@ class TablePane(QWidget):
 
         # 現在表示中の親ノードを示すヘッダー
         self.header_label = QLabel("（ノードをツリーから選択してください）")
-        self.header_label.setStyleSheet(
-            "QLabel { font-weight: bold; color: #37474F; "
-            "background: #ECEFF1; padding: 4px 6px; border-radius: 3px; }"
-        )
+        self.header_label.setStyleSheet(qss(
+            "QLabel { font-weight: bold; color: @text; "
+            "background: @control; padding: 4px 6px; border-radius: 3px; }"
+        ))
         layout.addWidget(self.header_label)
 
         # ボタン行（未保存インジケーター付き）
@@ -2448,10 +2442,10 @@ class TablePane(QWidget):
         self.table.itemSelectionChanged.connect(
             lambda: self._on_row_changed(self.table.currentRow())
         )
-        self.table.setStyleSheet(
-            "QTableWidget { gridline-color: #E0E0E0; border: 1px solid #CFD8DC; }"
-            "QTableWidget::item:selected { background: #B3E5FC; color: black; }"
-        )
+        self.table.setStyleSheet(qss(
+            "QTableWidget { gridline-color: @border_light; border: 1px solid @border; }"
+            "QTableWidget::item:selected { background: @select_bg; color: @text_on_select; }"
+        ))
         self.table.itemChanged.connect(self._on_item_changed)
         widths = [180, 60, 80, 65, 65, 100, 100, 90, 70, 120]
         for i, w in enumerate(widths):
@@ -2574,7 +2568,7 @@ class TablePane(QWidget):
                         color_name,
                         row.get("memo", ""),
                     ]
-                    hex_c = COLOR_OPTIONS.get(color_name, "#00BCD4")
+                    hex_c = COLOR_OPTIONS.get(color_name, C.NODE_DEFAULT)
                     bg = QColor(hex_c)
                     bg.setAlpha(60)
                     is_own = str(row.get("assigned_to", "")) == self.state.user
@@ -2586,7 +2580,7 @@ class TablePane(QWidget):
                             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                         item.setData(Qt.ItemDataRole.UserRole, idx)
                         if row.get("status") in ("done",):
-                            item.setForeground(QColor("#9E9E9E"))
+                            item.setForeground(QColor(C.TEXT_DONE))
                         else:
                             item.setBackground(bg)
                         self.table.setItem(r, c, item)
@@ -3146,39 +3140,31 @@ class DetailPane(QWidget):
         "project3": "P3", "project4": "P4",
         "task": "Task",   "ticket":   "Ticket",
     }
-    _TYPE_BG = {
-        "project1": "#E3F2FD", "project2": "#E8F5E9",
-        "project3": "#FFF9C4", "project4": "#F3E5F5",
-        "task":     "#ECEFF1", "ticket":   "#E0F7FA",
-    }
-    _TYPE_FG = {
-        "project1": "#1565C0", "project2": "#2E7D32",
-        "project3": "#F57F17", "project4": "#6A1B9A",
-        "task":     "#37474F", "ticket":   "#00838F",
-    }
+    _TYPE_BG = {**LEVEL_BG, "ticket": C.TICKET_BADGE_BG}
+    _TYPE_FG = {**LEVEL_FG, "ticket": C.TICKET_BADGE_FG}
     # ステータスバッジ（ラベル, 背景色, 文字色）
     _STATUS_INFO = {
-        "todo":      ("未着手", "#FFF3E0", "#E65100"),
-        "done":      ("完了",   "#E8F5E9", "#2E7D32"),
-        "cancel":    ("中止",   "#ECEFF1", "#616161"),
-        "regularly": ("定常",   "#E0F2F1", "#00695C"),
-        "deleted":   ("削除",   "#FFEBEE", "#C62828"),
+        "todo":      ("未着手", C.WARNING_BG, C.WARNING),
+        "done":      ("完了",   C.SUCCESS_BG, C.SUCCESS),
+        "cancel":    ("中止",   C.CONTROL,    C.CANCEL),
+        "regularly": ("定常",   C.REGULAR_BG, C.REGULAR),
+        "deleted":   ("削除",   C.DANGER_BG,  C.DANGER),
     }
     # レポート操作ボタン（保存=青系 / LLM=紫系）
-    _STYLE_BTN_PRIMARY = (
-        "QPushButton { background:#1E88E5; color:white; border:1px solid #1565C0;"
+    _STYLE_BTN_PRIMARY = qss(
+        "QPushButton { background:@accent_light; color:@on_accent; border:1px solid @accent;"
         " border-radius:4px; padding:4px 10px; font-weight:bold; }"
-        "QPushButton:hover { background:#1565C0; }"
-        "QPushButton:pressed { background:#0D47A1; }"
-        "QPushButton:disabled { background:#CFD8DC; color:#90A4AE;"
-        " border-color:#B0BEC5; }"
+        "QPushButton:hover { background:@accent; }"
+        "QPushButton:pressed { background:@accent_dark; }"
+        "QPushButton:disabled { background:@control_hover; color:@text_muted;"
+        " border-color:@border_strong; }"
     )
-    _STYLE_BTN_ACCENT = (
-        "QPushButton { background:#EDE7F6; color:#5E35B1; border:1px solid #B39DDB;"
+    _STYLE_BTN_ACCENT = qss(
+        "QPushButton { background:@llm_bg; color:@llm_text; border:1px solid @llm_border;"
         " border-radius:4px; padding:4px 10px; font-weight:bold; }"
-        "QPushButton:hover { background:#D1C4E9; }"
-        "QPushButton:disabled { background:#F5F5F5; color:#B0BEC5;"
-        " border-color:#E0E0E0; }"
+        "QPushButton:hover { background:@llm_hover; }"
+        "QPushButton:disabled { background:@bg_soft; color:@border_strong;"
+        " border-color:@border_light; }"
     )
 
     def __init__(self, state):
@@ -3187,11 +3173,11 @@ class DetailPane(QWidget):
         self._node_idx: Optional[str] = None
 
         # 詳細ペイン全体のトーン（淡い背景＋白カード）
-        self.setStyleSheet(
-            "QFrame#detailCard { background:#FFFFFF; border:1px solid #E0E0E0;"
+        self.setStyleSheet(qss(
+            "QFrame#detailCard { background:@surface; border:1px solid @border_light;"
             " border-radius:8px; }"
-            "QWidget#detailFormHost { background:#F4F6F8; }"
-        )
+            "QWidget#detailFormHost { background:@surface_alt; }"
+        ))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -3223,9 +3209,9 @@ class DetailPane(QWidget):
 
         self.report_title_lbl = QLabel("📋 レポート")
         self.report_title_lbl.setWordWrap(True)
-        self.report_title_lbl.setStyleSheet(
-            "QLabel { background:#E3F2FD; color:#1565C0; border-radius:6px;"
-            " padding:6px 8px; font-weight:bold; font-size:9pt; }")
+        self.report_title_lbl.setStyleSheet(qss(
+            "QLabel { background:@accent_bg; color:@accent; border-radius:6px;"
+            " padding:6px 8px; font-weight:bold; font-size:9pt; }"))
         rlay.addWidget(self.report_title_lbl)
 
         # 月ナビ ◀ [yyyy/mm] ▶
@@ -3236,8 +3222,8 @@ class DetailPane(QWidget):
         self.rep_prev_btn.setFixedWidth(28)
         self.rep_prev_btn.clicked.connect(lambda: self._rep_shift_month(-1))
         self.rep_month_lbl = QLabel("")
-        self.rep_month_lbl.setStyleSheet(
-            "QLabel { font-weight:bold; color:#37474F; padding:0 4px; }")
+        self.rep_month_lbl.setStyleSheet(qss(
+            "QLabel { font-weight:bold; color:@text; padding:0 4px; }"))
         self.rep_next_btn = QPushButton("▶")
         self.rep_next_btn.setStyleSheet(STYLE_BUTTON)
         self.rep_next_btn.setFixedWidth(28)
@@ -3275,9 +3261,9 @@ class DetailPane(QWidget):
 
         self.report_edit = QTextEdit()
         self.report_edit.setAcceptRichText(False)
-        self.report_edit.setStyleSheet(
-            "QTextEdit { border:1px solid #CFD8DC; border-radius:6px;"
-            " padding:6px; background:#FFFFFF; }")
+        self.report_edit.setStyleSheet(qss(
+            "QTextEdit { border:1px solid @border; border-radius:6px;"
+            " padding:6px; background:@surface; }"))
         self.report_edit.setPlaceholderText(
             "このアイテムの当月レポート（自由記述。[名前](パス/URL) でリンクを貼れます）")
         self.report_edit.textChanged.connect(self._on_report_text_changed)
@@ -3285,8 +3271,8 @@ class DetailPane(QWidget):
 
         # 🔗 抽出リンク一覧
         _links_lbl = QLabel("🔗 リンク")
-        _links_lbl.setStyleSheet(
-            "QLabel { color:#546E7A; font-size:8pt; font-weight:bold; }")
+        _links_lbl.setStyleSheet(qss(
+            "QLabel { color:@text_sub; font-size:8pt; font-weight:bold; }"))
         rlay.addWidget(_links_lbl)
         self.links_area = QScrollArea()
         self.links_area.setWidgetResizable(True)
@@ -3344,8 +3330,8 @@ class DetailPane(QWidget):
         v.setSpacing(6)
         if title:
             head = QLabel(title)
-            head.setStyleSheet(
-                "QLabel { color:#90A4AE; font-size:8pt; font-weight:bold; }")
+            head.setStyleSheet(qss(
+                "QLabel { color:@text_muted; font-size:8pt; font-weight:bold; }"))
             v.addWidget(head)
         return card, v
 
@@ -3357,11 +3343,11 @@ class DetailPane(QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(1)
         cap = QLabel(caption)
-        cap.setStyleSheet("QLabel { color:#90A4AE; font-size:8pt; }")
+        cap.setStyleSheet(qss("QLabel { color:@text_muted; font-size:8pt; }"))
         val = QLabel(value if value else "—")
         val.setWordWrap(True)
-        val.setStyleSheet(
-            "QLabel { color:#37474F; font-size:9pt; font-weight:bold; }")
+        val.setStyleSheet(qss(
+            "QLabel { color:@text; font-size:9pt; font-weight:bold; }"))
         v.addWidget(cap)
         v.addWidget(val)
         return w
@@ -3397,9 +3383,9 @@ class DetailPane(QWidget):
             bar.setTextVisible(False)
             bar.setFixedHeight(10)
             # 見積超過は橙、範囲内は緑
-            chunk = "#FB8C00" if actual > est else "#43A047"
+            chunk = C.PROGRESS_OVER if actual > est else C.PROGRESS_OK
             bar.setStyleSheet(
-                "QProgressBar { background:#ECEFF1; border:none;"
+                f"QProgressBar {{ background:{C.CONTROL}; border:none;"
                 " border-radius:5px; }"
                 f"QProgressBar::chunk {{ background:{chunk};"
                 " border-radius:5px; }")
@@ -3409,12 +3395,12 @@ class DetailPane(QWidget):
         else:
             cap = QLabel(f"実績 {actual:.1f} h　（見積 未設定）")
             v.addWidget(cap)
-        cap.setStyleSheet("QLabel { color:#546E7A; font-size:9pt; }")
+        cap.setStyleSheet(qss("QLabel { color:@text_sub; font-size:9pt; }"))
         return w
 
     def _swatch(self, color_name: str) -> QWidget:
         """表示色の丸チップ＋色名"""
-        hex_v = DB.COLOR_OPTIONS.get(color_name, "#BDBDBD")
+        hex_v = DB.COLOR_OPTIONS.get(color_name, C.UNSET_GRAY)
         w = QWidget()
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
@@ -3423,9 +3409,9 @@ class DetailPane(QWidget):
         dot.setFixedSize(14, 14)
         dot.setStyleSheet(
             f"QLabel {{ background:{hex_v}; border-radius:7px;"
-            " border:1px solid #B0BEC5; }")
+            f" border:1px solid {C.BORDER_STRONG}; }}")
         name = QLabel(color_name or "—")
-        name.setStyleSheet("QLabel { color:#90A4AE; font-size:8pt; }")
+        name.setStyleSheet(qss("QLabel { color:@text_muted; font-size:8pt; }"))
         h.addWidget(dot)
         h.addWidget(name)
         h.addStretch()
@@ -3454,19 +3440,19 @@ class DetailPane(QWidget):
         top.setSpacing(6)
         top.addWidget(self._make_badge(
             self._TYPE_LABEL.get(ntype, ntype or "—"),
-            self._TYPE_BG.get(ntype, "#ECEFF1"),
-            self._TYPE_FG.get(ntype, "#37474F")))
+            self._TYPE_BG.get(ntype, C.CONTROL),
+            self._TYPE_FG.get(ntype, C.TEXT)))
         st = _s("status")
         if st:
             s_label, s_bg, s_fg = self._STATUS_INFO.get(
-                st, (st, "#ECEFF1", "#616161"))
+                st, (st, C.CONTROL, C.CANCEL))
             top.addWidget(self._make_badge(s_label, s_bg, s_fg))
         top.addStretch()
         hv.addLayout(top)
         title = QLabel(_s("title") or "（無題）")
         title.setWordWrap(True)
-        title.setStyleSheet(
-            "QLabel { color:#263238; font-size:12pt; font-weight:bold; }")
+        title.setStyleSheet(qss(
+            "QLabel { color:@text_strong; font-size:12pt; font-weight:bold; }"))
         hv.addWidget(title)
         if _s("color"):
             hv.addWidget(self._swatch(_s("color")))
@@ -3511,7 +3497,7 @@ class DetailPane(QWidget):
             memo_card, mv = self._make_card("メモ")
             mlbl = QLabel(memo)
             mlbl.setWordWrap(True)
-            mlbl.setStyleSheet("QLabel { color:#37474F; font-size:9pt; }")
+            mlbl.setStyleSheet(qss("QLabel { color:@text; font-size:9pt; }"))
             mv.addWidget(mlbl)
             self.form_box.addWidget(memo_card)
 
@@ -3620,11 +3606,11 @@ class DetailPane(QWidget):
         for label, target in links:
             btn = QPushButton(f"[{label}]")
             btn.setToolTip(target)
-            btn.setStyleSheet(
-                "QPushButton { background:#E8EAF6; color:#3949AB;"
-                " border:1px solid #C5CAE9; border-radius:10px;"
+            btn.setStyleSheet(qss(
+                "QPushButton { background:@link_bg; color:@link_text;"
+                " border:1px solid @link_border; border-radius:10px;"
                 " padding:3px 10px; text-align:left; }"
-                "QPushButton:hover { background:#C5CAE9; }")
+                "QPushButton:hover { background:@link_border; }"))
             btn.clicked.connect(lambda _=False, t=target: self._open_link(t))
             self.links_layout.addWidget(btn)
 
@@ -3931,14 +3917,14 @@ class QuickAddDialog(QDialog):
         self.preview = QLabel()
         self.preview.setWordWrap(True)
         self.preview.setTextFormat(Qt.TextFormat.RichText)
-        self.preview.setStyleSheet(
-            "QLabel { background:#F4F6F8; border:1px solid #E0E0E0;"
-            " border-radius:6px; padding:6px; }")
+        self.preview.setStyleSheet(qss(
+            "QLabel { background:@surface_alt; border:1px solid @border_light;"
+            " border-radius:6px; padding:6px; }"))
         lay.addWidget(self.preview)
 
         help_lbl = QLabel(self._HELP)
         help_lbl.setWordWrap(True)
-        help_lbl.setStyleSheet("QLabel { color:#90A4AE; font-size:8pt; }")
+        help_lbl.setStyleSheet(qss("QLabel { color:@text_muted; font-size:8pt; }"))
         lay.addWidget(help_lbl)
 
         self.btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
@@ -3990,7 +3976,7 @@ class QuickAddDialog(QDialog):
                           "@ で Task を指定してください")
 
         # プレビュー（チップ風に 1 行で）
-        def chip(text: str, color: str = "#37474F") -> str:
+        def chip(text: str, color: str = C.TEXT) -> str:
             return f"<span style='color:{color};'>{text}</span>"
         parts = [chip(f"📄 <b>{self._esc(p['title']) or '（未入力）'}</b>")]
         hours = p["hours"]
@@ -4004,19 +3990,19 @@ class QuickAddDialog(QDialog):
             parts.append(chip(f"📅 {self._fmt_date(p['deadline'])}"))
         if self._task_idx:
             path = " ＞ ".join(LG.node_path_titles(df, self._task_idx))
-            parts.append(chip(f"📁 {self._esc(path)}", "#1565C0"))
+            parts.append(chip(f"📁 {self._esc(path)}", C.ACCENT))
         elif q is None:
-            parts.append(chip("📥 Inbox", "#6A1B9A"))
+            parts.append(chip("📥 Inbox", C.INBOX))
         if p["memo"]:
             memo = p["memo"] if len(p["memo"]) <= 30 else p["memo"][:30] + "…"
             parts.append(chip(f"📝 {self._esc(memo)}"))
         html = " │ ".join(parts)
         for w in p["warnings"]:
-            html += f"<br>{chip('⚠ ' + self._esc(w), '#E65100')}"
+            html += f"<br>{chip('⚠ ' + self._esc(w), C.WARNING)}"
         for h in p["hints"]:
-            html += f"<br>{chip('💡 ' + self._esc(h), '#546E7A')}"
+            html += f"<br>{chip('💡 ' + self._esc(h), C.TEXT_SUB)}"
         for e in errors:
-            html += f"<br>{chip('✖ ' + self._esc(e), '#C62828')}"
+            html += f"<br>{chip('✖ ' + self._esc(e), C.DANGER)}"
         self.preview.setText(html)
         self.btns.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not errors)
 
@@ -4109,7 +4095,7 @@ class InboxTriageDialog(QDialog):
     変更はインメモリ（Ctrl+Z 可・Ctrl+S で保存）。
     """
     _COLS = ["経過", "チケット", "見積", "納期", "メモ", "移動先 Task（入力で絞り込み）"]
-    _SUGGEST_BG = "#FFF8E1"  # 自動提案した移動先の背景色
+    _SUGGEST_BG = C.SUGGEST_BG  # 自動提案した移動先の背景色
 
     def __init__(self, state, copy_prompt_func=None, parent=None):
         super().__init__(parent)
@@ -4120,7 +4106,7 @@ class InboxTriageDialog(QDialog):
         lay = QVBoxLayout(self)
 
         self.head = QLabel()
-        self.head.setStyleSheet("QLabel { font-weight:bold; color:#6A1B9A; }")
+        self.head.setStyleSheet(qss("QLabel { font-weight:bold; color:@inbox; }"))
         lay.addWidget(self.head)
 
         self.table = QTableWidget(0, len(self._COLS))
@@ -4192,9 +4178,9 @@ class InboxTriageDialog(QDialog):
                 if c == 0:
                     # 滞留の色分け: stale_days 超=橙、7 日超=赤
                     if age > 7:
-                        it.setBackground(QColor("#FFCDD2"))
+                        it.setBackground(QColor(C.ROW_ERROR_BG))
                     elif age > cfg.inbox_stale_days:
-                        it.setBackground(QColor("#FFE0B2"))
+                        it.setBackground(QColor(C.ROW_WARN_BG))
                 self.table.setItem(row, c, it)
             combo = QComboBox()
             combo.setEditable(True)

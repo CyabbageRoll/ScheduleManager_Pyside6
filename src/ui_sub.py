@@ -30,6 +30,7 @@ from ui_widgets import (
     DateButton, UserCombo, ButtonRow, InfoLabel, AutoCombo,
     ScrollableTable, Separator, COLOR_OPTIONS, STYLE_BUTTON,
 )
+from theme import C, qss, LEVEL_BG, LEVEL_FG
 
 
 # ---------- 項目4: ガントチャートセル用デリゲート ----------
@@ -41,7 +42,7 @@ class _GanttCellDelegate(QStyledItemDelegate):
         super().paint(painter, option, index)
         if index.data(Qt.ItemDataRole.UserRole + 10) == "start_avail":
             painter.save()
-            pen = QPen(QColor("#2E7D32"))
+            pen = QPen(QColor(C.START_LINE))
             pen.setWidth(3)
             painter.setPen(pen)
             r = option.rect
@@ -49,7 +50,7 @@ class _GanttCellDelegate(QStyledItemDelegate):
             painter.restore()
         if index.data(Qt.ItemDataRole.UserRole + 11) == "deadline":
             painter.save()
-            pen = QPen(QColor("#D32F2F"))
+            pen = QPen(QColor(C.DEADLINE_LINE))
             pen.setWidth(3)
             painter.setPen(pen)
             r = option.rect
@@ -139,10 +140,10 @@ class GanttView(QWidget):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(False)
-        self.table.setStyleSheet(
-            "QTableWidget { gridline-color: #E0E0E0; border: 1px solid #CFD8DC; }"
-            "QTableWidget::item:selected { background: #B3E5FC; color: black; }"
-        )
+        self.table.setStyleSheet(qss(
+            "QTableWidget { gridline-color: @border_light; border: 1px solid @border; }"
+            "QTableWidget::item:selected { background: @select_bg; color: @text_on_select; }"
+        ))
         self.table.cellClicked.connect(self._on_cell_clicked)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
@@ -532,7 +533,7 @@ class GanttView(QWidget):
             self.table.insertRow(r)
             self.table.setRowHeight(r, 22)
 
-            task_hex = COLOR_OPTIONS.get(str(task_row.get("color", "Yellow")), "#FFA726")
+            task_hex = COLOR_OPTIONS.get(str(task_row.get("color", "Yellow")), C.TASK_DEFAULT)
             task_bg = QColor(task_hex)
             task_bg.setAlpha(140)
             bold = QFont(); bold.setBold(True)
@@ -586,7 +587,7 @@ class GanttView(QWidget):
                     bg2 = QColor(task_hex); bg2.setAlpha(40)
                     item.setBackground(bg2)
                 elif d.weekday() >= 5:
-                    item.setBackground(QColor("#F0F0F0"))
+                    item.setBackground(QColor(C.OFFDAY_BG))
                 self.table.setItem(r, self._FIXED_COLS + ci, item)
 
             task_count += 1
@@ -599,7 +600,7 @@ class GanttView(QWidget):
                 self.table.insertRow(r2)
                 self.table.setRowHeight(r2, 20)
 
-                t_hex = COLOR_OPTIONS.get(str(tr.get("color", "Cyan")), "#00BCD4")
+                t_hex = COLOR_OPTIONS.get(str(tr.get("color", "Cyan")), C.NODE_DEFAULT)
                 t_bg = QColor(t_hex); t_bg.setAlpha(50)
                 bar_color = QColor(t_hex); bar_color.setAlpha(180)
 
@@ -644,7 +645,7 @@ class GanttView(QWidget):
                     item.setData(Qt.ItemDataRole.UserRole, t_idx)
                     item.setData(Qt.ItemDataRole.ToolTipRole, tooltip)
                     if t_status == "done":
-                        item.setForeground(QColor("#9E9E9E"))
+                        item.setForeground(QColor(C.TEXT_DONE))
                     else:
                         item.setBackground(t_bg)
                     self.table.setItem(r2, c, item)
@@ -658,7 +659,7 @@ class GanttView(QWidget):
                     if t_status == "regularly":
                         # regularly: スケジュール表示は空白（マーカーなし）
                         if d.weekday() >= 5:
-                            item.setBackground(QColor("#F0F0F0"))
+                            item.setBackground(QColor(C.OFFDAY_BG))
                         else:
                             item.setBackground(t_bg)
                     elif t_status not in ("done", "cancel"):
@@ -682,19 +683,19 @@ class GanttView(QWidget):
                             if d in work_days:
                                 item.setText("🔨")
                                 if deadline and d > deadline:
-                                    item.setBackground(QColor("#EF5350"))
-                                    item.setForeground(QColor("white"))
+                                    item.setBackground(QColor(C.OVERDUE_CELL))
+                                    item.setForeground(QColor(C.ON_ACCENT))
                                 else:
                                     item.setBackground(bar_color)
                             elif d.weekday() >= 5:
-                                item.setBackground(QColor("#F0F0F0"))
+                                item.setBackground(QColor(C.OFFDAY_BG))
                             else:
                                 item.setBackground(t_bg)
                     else:
                         if d.weekday() >= 5:
-                            item.setBackground(QColor("#F0F0F0"))
+                            item.setBackground(QColor(C.OFFDAY_BG))
                         if t_status == "done":
-                            item.setForeground(QColor("#9E9E9E"))
+                            item.setForeground(QColor(C.TEXT_DONE))
 
                     item.setData(Qt.ItemDataRole.ToolTipRole, tooltip)
                     self.table.setItem(r2, self._FIXED_COLS + ci, item)
@@ -856,21 +857,13 @@ class RoadmapView(QWidget):
         "project3": "P3", "project4": "P4",
         "task": "Task",   "ticket":   "Tkt",
     }
-    _TYPE_BG = {
-        "project1": "#E3F2FD", "project2": "#E8F5E9",
-        "project3": "#FFF9C4", "project4": "#F3E5F5",
-        "task":     "#ECEFF1", "ticket":   "#FFFFFF",
-    }
-    _TYPE_FG = {
-        "project1": "#1565C0", "project2": "#2E7D32",
-        "project3": "#F57F17", "project4": "#6A1B9A",
-        "task":     "#37474F", "ticket":   "#546E7A",
-    }
+    _TYPE_BG = LEVEL_BG
+    _TYPE_FG = LEVEL_FG
     # 表示レベルボタンの色
-    _LVL_BG = {"Project2": "#E8F5E9", "Project3": "#FFF9C4",
-               "Project4": "#F3E5F5", "Task":     "#ECEFF1"}
-    _LVL_FG = {"Project2": "#2E7D32", "Project3": "#F57F17",
-               "Project4": "#6A1B9A", "Task":     "#37474F"}
+    _LVL_BG = {"Project2": C.P2_BG, "Project3": C.P3_BG,
+               "Project4": C.P4_BG, "Task":     C.TASK_BG}
+    _LVL_FG = {"Project2": C.P2_FG, "Project3": C.P3_FG,
+               "Project4": C.P4_FG, "Task":     C.TASK_FG}
 
     def __init__(self, state):
         super().__init__()
@@ -899,7 +892,7 @@ class RoadmapView(QWidget):
             btn.setStyleSheet(
                 f"QPushButton {{ background:{bg}; color:{fg}; border:2px solid {fg};"
                 f" border-radius:10px; padding:3px 12px; font-weight:bold; font-size:8pt; }}"
-                f"QPushButton:checked {{ background:{fg}; color:white; }}"
+                f"QPushButton:checked {{ background:{fg}; color:{C.ON_ACCENT}; }}"
             )
             btn.clicked.connect(lambda _, lbl=label: self._on_level_btn(lbl))
             ctrl.addWidget(btn)
@@ -914,11 +907,11 @@ class RoadmapView(QWidget):
             btn = QPushButton(unit)
             btn.setCheckable(True)
             btn.setChecked(unit == "週")
-            btn.setStyleSheet(
-                "QPushButton { background:#E3F2FD; color:#1565C0; border:2px solid #1565C0;"
+            btn.setStyleSheet(qss(
+                "QPushButton { background:@accent_bg; color:@accent; border:2px solid @accent;"
                 " border-radius:10px; padding:3px 10px; font-size:8pt; }"
-                "QPushButton:checked { background:#1565C0; color:white; }"
-            )
+                "QPushButton:checked { background:@accent; color:@on_accent; }"
+            ))
             btn.clicked.connect(lambda _, u=unit: self._on_unit_btn(u))
             ctrl.addWidget(btn)
             self._unit_btns[unit] = btn
@@ -942,10 +935,10 @@ class RoadmapView(QWidget):
         ctrl.addWidget(self.to_btn)
         ctrl.addSpacing(8)
         # クイック期間ボタン群
-        _quick_style = (
-            "QPushButton { background:#EDE7F6; color:#4527A0; border:1px solid #7E57C2;"
+        _quick_style = qss(
+            "QPushButton { background:@llm_bg; color:@request_text; border:1px solid @request_border;"
             " border-radius:8px; padding:2px 5px; font-size:7pt; font-weight:bold; }"
-            "QPushButton:hover { background:#D1C4E9; }"
+            "QPushButton:hover { background:@llm_hover; }"
         )
         for qname in ["今期", "1Q", "2Q", "3Q", "4Q", "Next30d", "Next06m", "Next01y"]:
             qbtn = QPushButton(qname)
@@ -960,11 +953,11 @@ class RoadmapView(QWidget):
             btn = QPushButton(label)
             btn.setFixedWidth(26)
             btn.setToolTip("日付列幅を縮小" if delta < 0 else "日付列幅を拡大")
-            btn.setStyleSheet(
-                "QPushButton { background:#F5F5F5; border:1px solid #BDBDBD;"
+            btn.setStyleSheet(qss(
+                "QPushButton { background:@bg_soft; border:1px solid @unset_gray;"
                 " border-radius:4px; font-size:10pt; font-weight:bold; }"
-                "QPushButton:hover { background:#E0E0E0; }"
-            )
+                "QPushButton:hover { background:@soft_btn_hover; }"
+            ))
             btn.clicked.connect(lambda _, d=delta: self._on_date_col_resize(d))
             ctrl.addWidget(btn)
         ctrl.addStretch()
@@ -982,11 +975,11 @@ class RoadmapView(QWidget):
         _left_layout.setSpacing(2)
 
         # ボタン行（全展開/全閉じ/選択中メンバーのみ）
-        _tree_btn_style = (
-            "QPushButton { background:#F5F5F5; border:1px solid #BDBDBD;"
+        _tree_btn_style = qss(
+            "QPushButton { background:@bg_soft; border:1px solid @unset_gray;"
             " border-radius:4px; padding:2px 6px; font-size:7pt; }"
-            "QPushButton:hover { background:#E0E0E0; }"
-            "QPushButton:checked { background:#1565C0; color:white; border-color:#1565C0; }"
+            "QPushButton:hover { background:@soft_btn_hover; }"
+            "QPushButton:checked { background:@accent; color:@on_accent; border-color:@accent; }"
         )
         _tree_btn_row = QHBoxLayout()
         _expand_all_btn = QPushButton("⊞ 全展開")
@@ -1011,14 +1004,14 @@ class RoadmapView(QWidget):
         self.tree.setHeaderLabel("親の絞り込み")
         self.tree.setIndentation(16)
         self.tree.setRootIsDecorated(True)
-        self.tree.setStyleSheet("""
-            QTreeWidget { border: 1px solid #CFD8DC; font-size: 8pt; }
-            QTreeWidget::item { padding: 3px 2px; border-bottom: 1px solid #EEEEEE; }
-            QTreeWidget::item:selected { background: #B3E5FC; color: black; }
-            QTreeWidget::branch:has-siblings:!adjoins-item { border-left: 1px solid #CCCCCC; }
-            QTreeWidget::branch:has-siblings:adjoins-item  { border-left: 1px solid #CCCCCC; }
-            QTreeWidget::branch:!has-siblings:adjoins-item { border-left: 1px solid #CCCCCC; }
-        """)
+        self.tree.setStyleSheet(qss("""
+            QTreeWidget { border: 1px solid @border; font-size: 8pt; }
+            QTreeWidget::item { padding: 3px 2px; border-bottom: 1px solid @row_line; }
+            QTreeWidget::item:selected { background: @select_bg; color: @text_on_select; }
+            QTreeWidget::branch:has-siblings:!adjoins-item { border-left: 1px solid @branch_line; }
+            QTreeWidget::branch:has-siblings:adjoins-item  { border-left: 1px solid @branch_line; }
+            QTreeWidget::branch:!has-siblings:adjoins-item { border-left: 1px solid @branch_line; }
+        """))
         # Ctrl+クリックで複数の親を選択できるよう拡張選択モードに変更
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
@@ -1036,10 +1029,10 @@ class RoadmapView(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setDefaultSectionSize(self._COL_W_DATE)
-        self.table.setStyleSheet(
-            "QTableWidget { gridline-color: #E8EAF6; font-size: 8pt; }"
-            "QTableWidget::item:selected { background: #C5CAE9; color: black; }"
-        )
+        self.table.setStyleSheet(qss(
+            "QTableWidget { gridline-color: @plan_grid; font-size: 8pt; }"
+            "QTableWidget::item:selected { background: @plan_select_bg; color: @text_on_select; }"
+        ))
         # ダブルクリック・右クリックメニューの設定
         self.table.itemDoubleClicked.connect(self._on_item_double_clicked)
         self.table.cellClicked.connect(self._on_cell_clicked)
@@ -1052,9 +1045,9 @@ class RoadmapView(QWidget):
 
         # 凡例
         legend = QHBoxLayout()
-        for color, lbl in [("#90CAF9", "計画（開始日〜納期）"),
-                            ("#A5D6A7", "実績（作業済み）"),
-                            ("#80DEEA", "計画＋実績")]:
+        for color, lbl in [(C.BAR_PLAN, "計画（開始日〜納期）"),
+                            (C.BAR_ACTUAL, "実績（作業済み）"),
+                            (C.BAR_BOTH, "計画＋実績")]:
             dot = QLabel("■")
             dot.setStyleSheet(f"color:{color}; font-size:14pt;")
             legend.addWidget(dot)
@@ -1132,8 +1125,8 @@ class RoadmapView(QWidget):
             item = QTreeWidgetItem([label])
             item.setData(0, Qt.ItemDataRole.UserRole, idx)
             item.setData(0, Qt.ItemDataRole.UserRole + 1, ntype)
-            item.setBackground(0, QColor(self._TYPE_BG.get(ntype, "#FFFFFF")))
-            item.setForeground(0, QColor(self._TYPE_FG.get(ntype, "#000000")))
+            item.setBackground(0, QColor(self._TYPE_BG.get(ntype, C.SURFACE)))
+            item.setForeground(0, QColor(self._TYPE_FG.get(ntype, C.TEXT_DEFAULT)))
             if parent_item is None:
                 self.tree.addTopLevelItem(item)
             else:
@@ -1549,8 +1542,8 @@ class RoadmapView(QWidget):
 
             indent = "  " * depth
             type_short = self._TYPE_LABEL.get(ntype, ntype)
-            bg_hex = self._TYPE_BG.get(ntype, "#FFFFFF")
-            fg_hex = self._TYPE_FG.get(ntype, "#000000")
+            bg_hex = self._TYPE_BG.get(ntype, C.SURFACE)
+            fg_hex = self._TYPE_FG.get(ntype, C.TEXT_DEFAULT)
             bg_color = QColor(bg_hex)
             bg_color.setAlpha(50)  # うっすら見える程度に薄く
 
@@ -1586,7 +1579,7 @@ class RoadmapView(QWidget):
             for ci, (ps, pe, _pl) in enumerate(periods):
                 cell = _make_row_non_selectable(bg_color)
                 if ps.weekday() >= 5 and self._cell_unit == "日":
-                    cell.setBackground(QColor("#F0F0F0"))
+                    cell.setBackground(QColor(C.OFFDAY_BG))
                 else:
                     plan_ov = False
                     if p_sa and p_dl:
@@ -1658,7 +1651,7 @@ class RoadmapView(QWidget):
             start_avail = _parse(row.get("start_available"))
             deadline    = _parse(row.get("deadline"))
             status      = str(row.get("status", ""))
-            hex_color   = COLOR_OPTIONS.get(str(row.get("color", "Cyan")), "#00BCD4")
+            hex_color   = COLOR_OPTIONS.get(str(row.get("color", "Cyan")), C.NODE_DEFAULT)
             bg          = QColor(hex_color); bg.setAlpha(35)
 
             indent = "  " * depth
@@ -1680,7 +1673,7 @@ class RoadmapView(QWidget):
                 it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 it.setData(Qt.ItemDataRole.UserRole, idx)
                 if status == "done":
-                    it.setForeground(QColor("#9E9E9E"))
+                    it.setForeground(QColor(C.TEXT_DONE))
                 else:
                     it.setBackground(bg)
                 self.table.setItem(r, c, it)
@@ -1700,7 +1693,7 @@ class RoadmapView(QWidget):
                 cell.setToolTip(tooltip_text)
 
                 if ps.weekday() >= 5 and self._cell_unit == "日":
-                    cell.setBackground(QColor("#F0F0F0"))
+                    cell.setBackground(QColor(C.OFFDAY_BG))
                 else:
                     # 計画バー: done/cancel は描画しない
                     plan_ov = False
@@ -1716,11 +1709,11 @@ class RoadmapView(QWidget):
                     act_ov = any(ps <= ad <= pe for ad in item_actual_dates)
 
                     if plan_ov and act_ov:
-                        cell.setBackground(QColor("#80DEEA"))  # 計画＋実績: シアン
+                        cell.setBackground(QColor(C.BAR_BOTH))  # 計画＋実績: シアン
                     elif act_ov:
-                        cell.setBackground(QColor("#A5D6A7"))  # 実績のみ: 緑
+                        cell.setBackground(QColor(C.BAR_ACTUAL))  # 実績のみ: 緑
                     elif plan_ov:
-                        cell.setBackground(QColor("#90CAF9"))  # 計画のみ: 青
+                        cell.setBackground(QColor(C.BAR_PLAN))  # 計画のみ: 青
                         if self._cell_unit == "日":
                             if ps == start_avail:
                                 cell.setText("▶")
@@ -1732,7 +1725,7 @@ class RoadmapView(QWidget):
 
                     # done/cancel は文字を灰色にして完了済みであることを示す
                     if status in ("done", "cancel"):
-                        cell.setForeground(QColor("#9E9E9E"))
+                        cell.setForeground(QColor(C.TEXT_DONE))
 
                 self.table.setItem(r, self._FIXED_COLS + ci, cell)
 
@@ -1797,11 +1790,11 @@ class AnalysisView(QWidget):
         self._filter_tree.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
         self._filter_tree.setIndentation(16)
-        self._filter_tree.setStyleSheet("""
-            QTreeWidget { border: 1px solid #CFD8DC; }
+        self._filter_tree.setStyleSheet(qss("""
+            QTreeWidget { border: 1px solid @border; }
             QTreeWidget::item { padding: 2px 2px; }
-            QTreeWidget::item:selected { background: #B3E5FC; color: black; }
-        """)
+            QTreeWidget::item:selected { background: @select_bg; color: @text_on_select; }
+        """))
         filter_vlay.addWidget(self._filter_tree)
         ctrl_h.addWidget(filter_box, stretch=1)
 
@@ -1944,8 +1937,8 @@ class AnalysisView(QWidget):
         label = f"[{type_short}] {row.get('title', '')}"
         item.setText(0, label)
         item.setData(0, Qt.ItemDataRole.UserRole, idx)
-        item.setBackground(0, QColor(TREE_BG.get(node_type, "#FFFFFF")))
-        item.setForeground(0, QColor(TREE_FG.get(node_type, "#000000")))
+        item.setBackground(0, QColor(TREE_BG.get(node_type, C.SURFACE)))
+        item.setForeground(0, QColor(TREE_FG.get(node_type, C.TEXT_DEFAULT)))
         if node_type in ("project1", "project2", "task"):
             f = QFont()
             f.setBold(True)
@@ -2051,8 +2044,8 @@ class AnalysisView(QWidget):
             actuals = [v["actual"] for v in agg.values()]
             x = list(range(len(labels)))
             w = 0.35
-            self._ax.bar([i - w / 2 for i in x], ests,    w, label="見積(h)", color="#90CAF9")
-            self._ax.bar([i + w / 2 for i in x], actuals, w, label="実績(h)", color="#A5D6A7")
+            self._ax.bar([i - w / 2 for i in x], ests,    w, label="見積(h)", color=C.BAR_PLAN)
+            self._ax.bar([i + w / 2 for i in x], actuals, w, label="実績(h)", color=C.BAR_ACTUAL)
             self._ax.set_xticks(x)
             self._ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
             self._ax.set_ylabel("工数 (h)", fontsize=9)
@@ -2132,20 +2125,20 @@ class AnalysisView(QWidget):
         else:
             ax1.text(0.5, 0.5, "直近4週の実績がありません",
                      ha="center", va="center", transform=ax1.transAxes,
-                     fontsize=9, color="#888")
+                     fontsize=9, color=C.CHART_TEXT)
 
         # 右: 見積 vs 実績の散布図（対角線より上 = 見積より時間がかかった）
         ax2 = self._fig.add_subplot(122)
         if acc:
             xs = [a["estimated"] for a in acc]
             ys = [a["actual"] for a in acc]
-            ax2.scatter(xs, ys, color="#1565C0", alpha=0.7)
+            ax2.scatter(xs, ys, color=C.ACCENT, alpha=0.7)
             m = max(max(xs), max(ys)) * 1.1
-            ax2.plot([0, m], [0, m], "--", color="#999", linewidth=1)
+            ax2.plot([0, m], [0, m], "--", color=C.CHART_GUIDE, linewidth=1)
         else:
             ax2.text(0.5, 0.5, "見積付きの完了チケットがありません",
                      ha="center", va="center", transform=ax2.transAxes,
-                     fontsize=9, color="#888")
+                     fontsize=9, color=C.CHART_TEXT)
         ax2.set_title("見積 vs 実績（完了チケット）", fontsize=10)
         ax2.set_xlabel("見積 (h)", fontsize=9)
         ax2.set_ylabel("実績 (h)", fontsize=9)
@@ -2583,18 +2576,18 @@ class AssignmentView(QWidget):
         self.req_tree.header().setStretchLastSection(True)
         self.req_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.req_tree.setIndentation(16)
-        self.req_tree.setStyleSheet("""
-            QTreeWidget { border: 1px solid #CFD8DC; }
+        self.req_tree.setStyleSheet(qss("""
+            QTreeWidget { border: 1px solid @border; }
             QTreeWidget::item { padding: 2px 2px; }
-            QTreeWidget::item:selected { background: #B3E5FC; color: black; }
-        """)
+            QTreeWidget::item:selected { background: @select_bg; color: @text_on_select; }
+        """))
         self.req_tree.itemClicked.connect(self._on_req_item_clicked)
         self.req_tree.itemSelectionChanged.connect(self._on_target_changed)
         left_layout.addWidget(self.req_tree, stretch=1)
 
         # 凡例
         legend_lbl = QLabel("★ = 自分のアイテム  ○ = 上位階層（選択不可）")
-        legend_lbl.setStyleSheet("QLabel { color: #888; font-size: 11px; padding-top: 2px; }")
+        legend_lbl.setStyleSheet(qss("QLabel { color: @text_dim; font-size: 11px; padding-top: 2px; }"))
         left_layout.addWidget(legend_lbl)
         splitter.addWidget(left_widget)
 
@@ -2609,9 +2602,9 @@ class AssignmentView(QWidget):
 
         # 動作説明ラベル（ノードタイプに応じて切替）
         self._req_info_lbl = QLabel("")
-        self._req_info_lbl.setStyleSheet(
-            "QLabel { color: #555; font-style: italic; padding: 2px 0; }"
-        )
+        self._req_info_lbl.setStyleSheet(qss(
+            "QLabel { color: @text_note; font-style: italic; padding: 2px 0; }"
+        ))
         req_form.addRow("説明:", self._req_info_lbl)
 
         # 送り先: ticket は複数選択可、task以上は1名のみ
@@ -2674,16 +2667,8 @@ class AssignmentView(QWidget):
         "task": "Task", "ticket": "Tkt",
     }
     # ツリー表示用の背景色・文字色（TreePane と同仕様）
-    _TREE_BG = {
-        "project1": "#E3F2FD", "project2": "#E8F5E9",
-        "project3": "#FFF9C4", "project4": "#F3E5F5",
-        "task":     "#ECEFF1", "ticket":   "#FFFFFF",
-    }
-    _TREE_FG = {
-        "project1": "#1565C0", "project2": "#2E7D32",
-        "project3": "#F57F17", "project4": "#6A1B9A",
-        "task":     "#37474F", "ticket":   "#546E7A",
-    }
+    _TREE_BG = LEVEL_BG
+    _TREE_FG = LEVEL_FG
 
     # 階層順（P1〜Ticket の 6 段階）
     _HIERARCHY = ["project1", "project2", "project3", "project4", "task", "ticket"]
@@ -2771,12 +2756,12 @@ class AssignmentView(QWidget):
             item.setText(0, label)
             item.setData(0, Qt.ItemDataRole.UserRole, idx)
             # 種別ごとの背景色・文字色
-            item.setBackground(0, QColor(self._TREE_BG.get(node_type, "#FFFFFF")))
-            item.setForeground(0, QColor(self._TREE_FG.get(node_type, "#000000")))
+            item.setBackground(0, QColor(self._TREE_BG.get(node_type, C.SURFACE)))
+            item.setForeground(0, QColor(self._TREE_FG.get(node_type, C.TEXT_DEFAULT)))
             # 選択不可ノード（祖先のみ表示）はグレーアウト・選択不可
             if idx not in selectable_ids:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-                item.setForeground(0, QColor("#AAAAAA"))
+                item.setForeground(0, QColor(C.TEXT_DISABLED))
             # P1/P2/Task は太字
             if node_type in ("project1", "project2", "task"):
                 f = QFont()
@@ -2805,8 +2790,8 @@ class AssignmentView(QWidget):
                 | (responded >= cutoff)
             )
         ]
-        _GRAY = QColor("#BDBDBD")
-        _MINE_BG = QColor("#E3F2FD")  # 自分宛の行は薄青で強調
+        _GRAY = QColor(C.UNSET_GRAY)
+        _MINE_BG = QColor(C.ACCENT_BG)  # 自分宛の行は薄青で強調
         # 挿入中はソートを一時停止（有効のままだと行途中の setItem で
         # 再ソートが走り、行位置がズレて空欄になるため）
         self.recv_table.setSortingEnabled(False)
@@ -3270,7 +3255,7 @@ class ConfigView(QWidget):
         outer.addLayout(btn_row)
 
         note = QLabel("※ 一部の設定はアプリ再起動後に反映されます。")
-        note.setStyleSheet("QLabel { color: #888; font-size: 10px; }")
+        note.setStyleSheet(qss("QLabel { color: @text_dim; font-size: 10px; }"))
         outer.addWidget(note)
 
         self.info = InfoLabel()
@@ -3281,11 +3266,11 @@ class ConfigView(QWidget):
     def _group(self, title: str) -> QFormLayout:
         """グループボックスを追加してその FormLayout を返す"""
         gb = QGroupBox(title)
-        gb.setStyleSheet(
-            "QGroupBox { font-weight: bold; border: 1px solid #CFD8DC;"
+        gb.setStyleSheet(qss(
+            "QGroupBox { font-weight: bold; border: 1px solid @border;"
             " border-radius: 4px; margin-top: 8px; padding-top: 6px; }"
             "QGroupBox::title { subcontrol-origin: margin; left: 8px; }"
-        )
+        ))
         fl = QFormLayout(gb)
         fl.setSpacing(6)
         self._form_layout.addWidget(gb)
@@ -3546,12 +3531,12 @@ class DashboardView(QWidget):
 
         # 📥 Inbox バナー（Task 未設定チケットがあるときだけ表示）
         self.inbox_banner = QFrame()
-        self.inbox_banner.setStyleSheet(
-            "QFrame { background:#F3E5F5; border:1px solid #CE93D8; border-radius:6px; }")
+        self.inbox_banner.setStyleSheet(qss(
+            "QFrame { background:@inbox_bg; border:1px solid @inbox_border; border-radius:6px; }"))
         _bl = QHBoxLayout(self.inbox_banner)
         _bl.setContentsMargins(8, 4, 8, 4)
         self.inbox_lbl = QLabel("")
-        self.inbox_lbl.setStyleSheet("QLabel { color:#6A1B9A; font-weight:bold; border:none; }")
+        self.inbox_lbl.setStyleSheet(qss("QLabel { color:@inbox; font-weight:bold; border:none; }"))
         _bl.addWidget(self.inbox_lbl)
         _bl.addStretch()
         _inbox_btn = QPushButton("振り分ける")
@@ -3580,9 +3565,9 @@ class DashboardView(QWidget):
     def _make_card(self, key: str, title: str, btn_label: str) -> QGroupBox:
         """ヘッダー（タイトル + 件数バッジ + 開くボタン）+ リストのカードを作る"""
         gb = QGroupBox()
-        gb.setStyleSheet(
-            "QGroupBox { border: 1px solid #CFD8DC; border-radius: 6px;"
-            " margin-top: 4px; background: white; }")
+        gb.setStyleSheet(qss(
+            "QGroupBox { border: 1px solid @border; border-radius: 6px;"
+            " margin-top: 4px; background: @surface; }"))
         vlay = QVBoxLayout(gb)
         head = QHBoxLayout()
         title_lbl = QLabel(title)
@@ -3607,12 +3592,12 @@ class DashboardView(QWidget):
         badge = self._cards[key]["badge"]
         if count > 0:
             badge.setText(f"{count} 件")
-            badge.setStyleSheet(
-                "QLabel { background: #E65100; color: white; border-radius: 8px;"
-                " padding: 1px 8px; font-size: 10px; font-weight: bold; }")
+            badge.setStyleSheet(qss(
+                "QLabel { background: @warning; color: @on_accent; border-radius: 8px;"
+                " padding: 1px 8px; font-size: 10px; font-weight: bold; }"))
         else:
             badge.setText(zero_text)
-            badge.setStyleSheet("QLabel { color: #2E7D32; font-size: 10px; }")
+            badge.setStyleSheet(qss("QLabel { color: @success; font-size: 10px; }"))
 
     def refresh(self) -> None:
         today = datetime.date.today().isoformat()
@@ -3656,12 +3641,12 @@ class DashboardView(QWidget):
         for row in alerts["overdue"]:
             item = QListWidgetItem(
                 f"⚠超過 {row['deadline']}  {row['title']}（{row['task']}）")
-            item.setForeground(QColor("#C62828"))
+            item.setForeground(QColor(C.DANGER))
             lst.addItem(item)
         for row in alerts["approaching"]:
             item = QListWidgetItem(
                 f"接近 {row['deadline']}  {row['title']}（{row['task']}）")
-            item.setForeground(QColor("#E65100"))
+            item.setForeground(QColor(C.WARNING))
             lst.addItem(item)
         n_alerts = len(alerts["overdue"]) + len(alerts["approaching"])
         if n_alerts == 0:
@@ -3703,7 +3688,7 @@ class DashboardView(QWidget):
                 reported += 1
             else:
                 item = QListWidgetItem(f"{disp}: （未入力）")
-                item.setForeground(QColor("#90A4AE"))
+                item.setForeground(QColor(C.TEXT_MUTED))
                 lst.addItem(item)
         self._set_badge("team", 0,
                         zero_text=f"{reported}/{len(self.state.members)} 人入力済")
