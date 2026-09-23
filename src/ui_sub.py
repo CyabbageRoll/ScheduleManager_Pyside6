@@ -1473,7 +1473,7 @@ class RoadmapView(QWidget):
           1. 期間ボタンから表示期間を取得し、cell_unit に応じた列（ピリオド）を生成
           2. 表示レベル（Project2/3/4/Task）でノードを絞り込み
           3. 祖先チェーンごとに親ヘッダー行を挿入してグループ化
-          4. 各ノード行に計画バー（青）・実績バー（緑）・両方（シアン）を描画
+          4. 各ノード行に計画バー・実績バー・両方の色を描画（色は theme の BAR_PLAN 等）
           5. ツリー絞り込みで選択した親の配下ノードのみ表示
         """
         df = self.state.df_nodes
@@ -1709,11 +1709,11 @@ class RoadmapView(QWidget):
                     act_ov = any(ps <= ad <= pe for ad in item_actual_dates)
 
                     if plan_ov and act_ov:
-                        cell.setBackground(QColor(C.BAR_BOTH))  # 計画＋実績: シアン
+                        cell.setBackground(QColor(C.BAR_BOTH))  # 計画＋実績
                     elif act_ov:
-                        cell.setBackground(QColor(C.BAR_ACTUAL))  # 実績のみ: 緑
+                        cell.setBackground(QColor(C.BAR_ACTUAL))  # 実績のみ
                     elif plan_ov:
-                        cell.setBackground(QColor(C.BAR_PLAN))  # 計画のみ: 青
+                        cell.setBackground(QColor(C.BAR_PLAN))  # 計画のみ
                         if self._cell_unit == "日":
                             if ps == start_avail:
                                 cell.setText("▶")
@@ -1733,7 +1733,7 @@ class RoadmapView(QWidget):
 
         self.info.set_info(
             f"{count} 件表示  ({d_from} 〜 {d_to})  "
-            "  ■青=計画  ■緑=実績  ■シアン=計画+実績"
+            "  ■ラベンダー=計画  ■ミント=実績  ■水色=計画+実績"
         )
 
     # ── 公開 ──

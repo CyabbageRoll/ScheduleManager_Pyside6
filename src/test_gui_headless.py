@@ -1893,6 +1893,44 @@ def test_ui_state(state, version, win, tmpdir):
         ng("画面状態の保存・復元", e)
 
 
+def test_theme():
+    """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
+    print("\n[D1] テーマ集約テスト")
+    import re
+    import theme
+    from PySide6.QtWidgets import QApplication
+    src = Path(__file__).parent
+    try:
+        hits = [f"{f.name}:{n}" for f in sorted(src.glob("ui_*.py"))
+                for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1)
+                if re.search(r"#[0-9A-Fa-f]{6}\b|#[0-9A-Fa-f]{3}\b", line)]
+        assert not hits, hits
+        ok("ui_*.py に色コードの直書きが無い")
+    except Exception as e:
+        ng("色コードの直書き", e)
+    try:
+        names = {n for n in vars(theme.C) if n.isupper()}
+        undefined = set()
+        for f in list(src.glob("ui_*.py")) + [src / "theme.py"]:
+            text = f.read_text(encoding="utf-8")
+            undefined |= {m for m in re.findall(r"@([a-z][a-z0-9_]*)", text)
+                          if m != "staticmethod" and m.upper() not in names}
+            undefined |= {m for m in re.findall(r"\bC\.([A-Z][A-Z0-9_]*)", text) if m not in names}
+        assert not undefined, undefined
+        ok("使用中の色トークンが全て theme.C に定義されている")
+    except Exception as e:
+        ng("色トークンの定義", e)
+    try:
+        app = QApplication.instance()
+        before = app.styleSheet()
+        theme.apply_app_theme(app)
+        assert app.styleSheet() == theme.APP_QSS and "@" not in theme.APP_QSS
+        app.setStyleSheet(before)
+        ok("apply_app_theme がアプリ全体のスタイルを適用できる")
+    except Exception as e:
+        ng("apply_app_theme", e)
+
+
 def main():
     print("=" * 55)
     print("  ヘッドレス GUI テスト (QT_QPA_PLATFORM=offscreen)")
@@ -1936,6 +1974,7 @@ def main():
             test_quick_add_inbox(win, task_idx, tmpdir)
             test_save_load(state)
             test_ui_state(state, version, win, tmpdir)
+            test_theme()
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

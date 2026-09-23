@@ -874,27 +874,22 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        # 画面切替ボタン（等幅・縁付き・グラデーション）
+        # 画面切替ボタン（等幅・角丸のピル型。選択中はアクセント色で塗る）
         _TAB_STYLE = qss(
             "QPushButton {"
-            " background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "   stop:0 @tab_top, stop:1 @tab_bottom);"
-            " color: @text;"
-            " border: 1px solid @border_strong;"
-            " border-radius: 5px;"
+            " background: transparent;"
+            " color: @tab_text;"
+            " border: 1px solid transparent;"
+            " border-radius: 8px;"
             " padding: 5px 0px;"
             " font-size: 8pt; font-weight: bold;"
             " min-width: 74px; max-width: 74px; }"
             "QPushButton:checked {"
-            " background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "   stop:0 @accent_light, stop:1 @accent);"
+            " background: @accent;"
             " color: @on_accent;"
-            " border: 1px solid @accent_dark;"
-            " border-bottom: 2px solid @accent_darker; }"
+            " border-color: @accent; }"
             "QPushButton:hover:!checked {"
-            " background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            "   stop:0 @accent_bg, stop:1 @accent_bg2);"
-            " border-color: @accent_border; color:@accent; }"
+            " background: @accent_bg; color: @accent_dark; }"
         )
         views = [
             ("🏠 Today",   IDX_TODAY),
@@ -968,14 +963,14 @@ class MainWindow(QMainWindow):
         # メンバーボタン（ボタン形式で素早く切替）
         _MEMBER_STYLE = qss(
             "QPushButton {"
-            " background: @control; color: @text;"
-            " border: 1px solid @border_strong; border-radius: 4px;"
-            " padding: 3px 10px; font-size: 8pt; }"
+            " background: transparent; color: @text_sub;"
+            " border: 1px solid @border; border-radius: 8px;"
+            " padding: 3px 12px; font-size: 8pt; }"
             "QPushButton:checked {"
-            " background: @accent; color: @on_accent;"
-            " border: 1px solid @accent_dark; }"
+            " background: @accent_bg; color: @accent_dark;"
+            " border: 1px solid @accent_border; }"
             "QPushButton:hover:!checked {"
-            " background: @accent_bg; border-color: @accent_border; color: @accent; }"
+            " background: @control_hover; }"
         )
         self._member_btns: dict = {}
         for m in self.state.members:
