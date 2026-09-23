@@ -2,6 +2,7 @@
 ui_main.py - メインウィンドウ・ツールバー・3ペイン・日次スケジュール
 """
 import datetime
+import re
 from typing import Optional
 
 import pandas as pd
@@ -13,7 +14,7 @@ from PySide6.QtWidgets import (
     QFrame, QStackedWidget, QSizePolicy, QToolBar, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QSpinBox, QCheckBox,
     QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu,
-    QApplication, QStyle, QProgressBar, QGridLayout,
+    QApplication, QStyle, QProgressBar, QGridLayout, QListWidget, QListWidgetItem,
 )
 from pathlib import Path
 
@@ -161,6 +162,8 @@ class DailyScheduleWidget(QWidget):
     00:00〜23:45 を 15 分刻みで表示し、各スロットにチケットを割り当てられる。
     健康状態・就業場所・常時メモなどの日次ログ入力フォームも内包する。
     """
+    # 選択スロットで「新しいチケットを作って割り当て」（行番号リスト）
+    quick_add_requested = Signal(list)
 
     def __init__(self, state):
         super().__init__()
@@ -371,6 +374,11 @@ class DailyScheduleWidget(QWidget):
 
         df = self.state.df_nodes
         menu = QMenu(self)
+        # チケットが無いことに気づいたらその場で作って割り当てる（Ctrl+N と同じ）
+        new_act = menu.addAction("＋ 新しいチケットを作成して割り当て…  (Ctrl+N)")
+        new_act.triggered.connect(
+            lambda checked=False: self.quick_add_requested.emit(list(rows)))
+        menu.addSeparator()
 
         # 自分担当・割り当て可能(todo/regularly)のチケット
         if df.empty:
@@ -458,10 +466,14 @@ class DailyScheduleWidget(QWidget):
                     mid_titles.append(title)
                 cur = str(df.loc[cur, "parent_id"] or "")
             if group_node is None:
-                group_node = "0"
+                # Task 未設定（Inbox）のチケットは専用グループにまとめる
+                in_inbox = str(df.loc[t_idx, "parent_id"]) == DB.INBOX_PARENT
+                group_node = DB.INBOX_PARENT if in_inbox else "0"
             proj_titles.reverse()
             mid_titles.reverse()
-            group_label = " / ".join(proj_titles) if proj_titles else "（プロジェクト未設定）"
+            group_label = (" / ".join(proj_titles) if proj_titles
+                           else "📥 Inbox（Task 未設定）" if group_node == DB.INBOX_PARENT
+                           else "（プロジェクト未設定）")
 
             status_icon = "↻ " if str(df.loc[t_idx, "status"]) == "regularly" else ""
             leaf_parts = mid_titles + [str(df.loc[t_idx, "title"])]
@@ -469,7 +481,8 @@ class DailyScheduleWidget(QWidget):
 
             g = groups.setdefault(group_node, {
                 "label": group_label,
-                "key": self._priority_path(df, group_node) if group_node != "0" else (),
+                "key": (self._priority_path(df, group_node)
+                        if group_node not in ("0", DB.INBOX_PARENT) else ()),
                 "leaves": [],
             })
             g["leaves"].append((self._priority_path(df, t_idx), t_idx, leaf_label))
@@ -791,6 +804,7 @@ class MainWindow(QMainWindow):
         state.dirty_changed_func = self._update_save_btn_style
 
         # 元に戻す / やり直し（編集のたびに状態を記録。1 操作内の複数変更は 1 回にまとめる）
+        self._qa_recent_tasks: list = []  # クイック追加で最近使った Task（候補の上位表示用）
         self._undo = UndoHistory()
         self._undo_pending = False
         self._undo.reset(state)
@@ -849,6 +863,12 @@ class MainWindow(QMainWindow):
             tb.addAction(act)
             if i == 0:  # 保存ボタン（i==0）の QToolButton 参照を保持
                 self._save_btn = tb.widgetForAction(act)
+
+        # 📥 Inbox（件数表示・上限/滞留で強調。クリックで振り分け画面）
+        self.inbox_btn = QPushButton("📥 Inbox")
+        self.inbox_btn.setToolTip("Task 未設定チケットを振り分けます（Ctrl+N で追加）")
+        self.inbox_btn.clicked.connect(self._open_inbox_triage)
+        tb.addWidget(self.inbox_btn)
 
         tb.addSeparator()
 
@@ -1037,6 +1057,7 @@ class MainWindow(QMainWindow):
         # インライン編集後の軽量リフレッシュ（ツリー再構築なし）
         self.main_pane.table_pane.schedule_refresh.connect(self.schedule_panel.refresh)
         self.gantt_view.ticket_clicked.connect(self.schedule_panel.assign_ticket)
+        self.schedule_panel.quick_add_requested.connect(self._on_quick_add)
         self.gantt_view.edit_requested.connect(self._on_gantt_edit_requested)
         self.road_view.edit_requested.connect(self._on_gantt_edit_requested)
         self.road_view.edit_popup_requested.connect(self._on_roadmap_edit_popup)
@@ -1061,6 +1082,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._on_save)
         QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._on_load)
         # 入力欄の編集中は各欄の文字単位の Undo が優先される（Qt の標準動作）
+        QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(lambda: self._on_quick_add())
         QShortcut(QKeySequence("Ctrl+Z"), self).activated.connect(self._on_undo)
         for seq in ("Ctrl+Shift+Z", "Ctrl+Y"):
             QShortcut(QKeySequence(seq), self).activated.connect(self._on_redo)
@@ -1235,6 +1257,9 @@ class MainWindow(QMainWindow):
 
     def _on_dashboard_navigate(self, key: str) -> None:
         """ダッシュボードのカードから対応タブへ遷移する"""
+        if key == "inbox":
+            self._open_inbox_triage()
+            return
         mapping = {"schedule": IDX_GANTT, "edit": IDX_MAIN,
                    "request": IDX_ASSIGN, "team": IDX_TEAM}
         self._switch_view(mapping.get(key, IDX_GANTT))
@@ -1264,6 +1289,91 @@ class MainWindow(QMainWindow):
             )
         else:
             self._save_btn.setStyleSheet("")  # デフォルトに戻す
+
+    # ---------- Inbox ----------
+
+    def _inbox_summary(self) -> dict:
+        cfg = self.state.config
+        return LG.inbox_summary(self.state.df_nodes, self.state.user,
+                                cfg.inbox_max_items, cfg.inbox_stale_days)
+
+    def _update_inbox_btn(self) -> None:
+        s = self._inbox_summary()
+        self.inbox_btn.setText(f"📥 Inbox {s['count']}")
+        if s["over"] or s["stale"]:
+            self.inbox_btn.setStyleSheet(
+                "QPushButton { background:#E65100; color:white; font-weight:bold;"
+                " border-radius:4px; padding:4px 10px; }")
+        else:
+            self.inbox_btn.setStyleSheet(STYLE_BUTTON)
+
+    def _open_inbox_triage(self) -> None:
+        dlg = InboxTriageDialog(self.state, self.ai_import_view._on_get_ticket_prompt, self)
+        dlg.exec()
+        self.refresh()
+
+    def maybe_prompt_inbox(self) -> None:
+        """起動時: 上限到達または滞留があるときだけ振り分け画面を出す（1 日 1 回まで）"""
+        s = self._inbox_summary()
+        if not (s["over"] or s["stale"]):
+            return
+        settings = self._ui_settings()
+        today = datetime.date.today().isoformat()
+        if settings.value("inbox/last_prompt", "", type=str) == today:
+            return
+        settings.setValue("inbox/last_prompt", today)
+        settings.sync()
+        self._open_inbox_triage()
+
+    # ---------- クイック追加（Ctrl+N） ----------
+
+    def _on_quick_add(self, rows=None) -> None:
+        """クイック追加ダイアログを開く。日次スケジュールでスロット選択中なら
+        作成したチケットをそのスロットへ割り当てる（工数省略時はスロット時間を見積に）。"""
+        self._commit_pending_edits()
+        if rows is None:
+            rows = []
+            if (self.schedule_panel.isVisible()
+                    and self.state.current_member == self.state.user):
+                rows = sorted({i.row() for i in
+                               self.schedule_panel.schedule_table.selectedIndexes()})
+        default_h = len(rows) * 0.25 if rows else None
+        dlg = QuickAddDialog(self.state, default_h, self._qa_recent_tasks, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not dlg.result_data:
+            return
+        ds = self._create_quick_ticket(dlg.result_data)
+        where = ("📥 Inbox" if ds["parent_id"] == DB.INBOX_PARENT
+                 else self.state.df_nodes.loc[ds["parent_id"], "title"])
+        if rows:
+            self.schedule_panel._assign_to_rows(rows, ds.name)
+            self.schedule_panel.schedule_table.clearSelection()
+        self.refresh()
+        self.statusBar().showMessage(
+            f"作成しました: {ds['title']} → {where}"
+            + ("（選択スロットに割り当て）" if rows else ""), 5000)
+
+    def _create_quick_ticket(self, r: dict) -> pd.Series:
+        """クイック追加の結果からチケットを作成する（インメモリ。保存は Ctrl+S）"""
+        df = self.state.df_nodes
+        parent = r["parent"]
+        siblings = df[df["parent_id"] == parent]
+        priority = int(siblings["priority"].max()) + 1 if not siblings.empty else 1
+        color = str(df.loc[parent, "color"] or "Cyan") if parent in df.index else "Cyan"
+        ds = DB.create_initial_node(self.state.user, "ticket", r["title"],
+                                    parent_id=parent, priority=priority, color=color)
+        ds["estimated_hours"] = float(r["hours"] or 0.0)
+        ds["deadline"] = r["deadline"].isoformat() if r["deadline"] else None
+        ds["start_available"] = r["start"].isoformat() if r["start"] else None
+        ds["memo"] = r["memo"]
+        self.state.df_nodes.loc[ds.name] = ds
+        if parent != DB.INBOX_PARENT:
+            if parent in self._qa_recent_tasks:
+                self._qa_recent_tasks.remove(parent)
+            self._qa_recent_tasks.insert(0, parent)
+            del self._qa_recent_tasks[10:]
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
+        return ds
 
     # ---------- 元に戻す / やり直し ----------
 
@@ -1531,6 +1641,7 @@ class MainWindow(QMainWindow):
             cur.refresh()
         # 未処理 Request の件数に応じてタブボタンを強調表示
         self._update_request_tab_badge()
+        self._update_inbox_btn()
         # Plan タブ等の変更後も保存ボタン色を最新状態に同期
         self._update_save_btn_style()
 
@@ -1794,6 +1905,15 @@ class TreePane(QWidget):
         self.tree.blockSignals(True)
         self.tree.clear()
 
+        # 📥 Inbox（Task 未設定チケット。表示中メンバーの分のみ）
+        inbox_item = QTreeWidgetItem(self.tree)
+        inbox_item.setData(0, Qt.ItemDataRole.UserRole, DB.INBOX_PARENT)
+        inbox_item.setBackground(0, QColor("#F3E5F5"))
+        inbox_item.setForeground(0, QColor("#6A1B9A"))
+        _fi = QFont()
+        _fi.setBold(True)
+        inbox_item.setFont(0, _fi)
+
         # P0 仮想ルートアイテムを先頭に追加（P1 の親として選択可能）
         p0_item = QTreeWidgetItem(self.tree)
         p0_item.setData(0, Qt.ItemDataRole.UserRole, "0")
@@ -1818,15 +1938,19 @@ class TreePane(QWidget):
                 filter_ids = None
             # P1 以下を P0 仮想ルートの子として表示
             self._build_tree(p0_item, df, "0", filter_ids)
+            inbox_df = LG.inbox_tickets(df, self.state.current_user)
+            self._build_tree(inbox_item, inbox_df, DB.INBOX_PARENT, filter_ids)
+        inbox_item.setText(0, f"📥 Inbox ({inbox_item.childCount()})  Task 未設定")
         self.tree.expandAll()
-        # ユーザーが閉じていたノードは閉じたまま再現する
-        if self._collapsed:
-            self._apply_collapsed(self.tree.invisibleRootItem())
         # 選択を復元（シグナルをブロックしたまま実行して update_for_parent の呼び出しを防ぐ）
         # blockSignals(False) を後に移動することで refresh 中に _normalize_priorities が
         # 呼ばれるのを防ぐ（日付編集後に順序が変わるバグの修正）
         if self._selected_idx:
             self._restore_selection(self._selected_idx)
+        # ユーザーが閉じていたノードは閉じたまま再現する（選択復元のスクロールで
+        # 親が自動展開されるため、復元の後に適用する）
+        if self._collapsed:
+            self._apply_collapsed(self.tree.invisibleRootItem())
         self.tree.blockSignals(False)
 
     # 種別ごとの短縮ラベル・背景色・文字色
@@ -2082,10 +2206,13 @@ class TreePane(QWidget):
             if idx in self.state.df_nodes.index:
                 node_type = str(self.state.df_nodes.loc[idx, "node_type"])
             is_ticket = (node_type == "ticket")
-            self._btn_row.set_enabled("＋ 新規", not is_ticket)
+            # Inbox へは Ctrl+N / 表の空白行で追加する
+            self._btn_row.set_enabled("＋ 新規", not is_ticket and idx != DB.INBOX_PARENT)
 
     def _on_new(self) -> None:
         """新規ノード作成ダイアログ"""
+        if self._selected_idx == DB.INBOX_PARENT:
+            return  # Inbox へは Ctrl+N / 表の空白行で追加する
         parent_idx = self._selected_idx or "0"
         if parent_idx != "0" and parent_idx not in self.state.df_nodes.index:
             parent_idx = "0"
@@ -2356,6 +2483,9 @@ class TablePane(QWidget):
         if parent_idx == "0":
             # P0 仮想ルートを選択した場合
             self.header_label.setText("[P0] ルート  ▶  子 Project1 一覧")
+        elif parent_idx == DB.INBOX_PARENT:
+            self.header_label.setText(
+                "📥 Inbox（Task 未設定）  ▶  ツリーで Task へドラッグして振り分け")
         elif parent_idx and parent_idx in df.index:
             row = df.loc[parent_idx]
             node_type = str(row.get("node_type", ""))
@@ -2424,6 +2554,8 @@ class TablePane(QWidget):
             children = df[
                 (df["parent_id"] == self._parent_idx) & (df["status"] != "deleted")
             ].copy()
+            if self._parent_idx == DB.INBOX_PARENT:
+                children = children[children["assigned_to"] == self.state.current_user]
             if not children.empty:
                 children = children.sort_values("priority")
                 for idx, row in children.iterrows():
@@ -2831,6 +2963,8 @@ class TablePane(QWidget):
             return None
         if self._parent_idx == "0":
             return "project1"
+        if self._parent_idx == DB.INBOX_PARENT:
+            return "ticket"
         if self._parent_idx not in self.state.df_nodes.index:
             return None
         parent_type = self.state.df_nodes.loc[self._parent_idx, "node_type"]
@@ -2841,6 +2975,14 @@ class TablePane(QWidget):
         child_type = self._get_child_type()
         if not child_type:
             return
+        if self._parent_idx == DB.INBOX_PARENT:
+            cfg = self.state.config
+            if LG.inbox_summary(self.state.df_nodes, self.state.user,
+                                cfg.inbox_max_items, cfg.inbox_stale_days)["over"]:
+                self.info.set_info(f"⚠ Inbox が上限（{cfg.inbox_max_items} 件）です。"
+                                   "先に振り分けてください")
+                QTimer.singleShot(0, self._rebuild_table)
+                return
         # 既存アイテムの priority を連番化してから末尾の優先度を求める
         self._normalize_priorities(self._parent_idx)
         df = self.state.df_nodes
@@ -3745,3 +3887,391 @@ class _NodeEditDialog(QDialog):
         ds["memo"]            = self.f_memo.toPlainText()
         ds["updated_at"]      = datetime.date.today().isoformat()
         return ds
+
+
+# ---------- クイック追加ダイアログ（Ctrl+N） ----------
+
+class QuickAddDialog(QDialog):
+    """
+    1 行入力でチケットを作るダイアログ（B2）。
+    入力例: 「見積書レビュー 2h 金曜 @設計書 #先方確認済み」
+    解析は logic.parse_quick_add。@Task は候補リストから選べる。@ なしは Inbox 行き。
+    確定後は result_data に {title, hours, deadline, start, memo, parent} を持つ。
+    """
+
+    _HELP = ("工数: 2h 30m 1.5 1時間半 ／ 納期: 明日 金 来週水 9/30 月末 5日 ／ "
+             "範囲: 9/28〜10/2 ／ @Task（なしは Inbox） ／ #以降はメモ ／ 「」で囲むとタイトル")
+
+    def __init__(self, state, default_hours: Optional[float] = None,
+                 recent_tasks=(), parent=None):
+        super().__init__(parent)
+        self.state = state
+        self._default_hours = default_hours
+        self._recent = list(recent_tasks)
+        self._chosen: dict = {}   # 候補から選んだ @語（正規化）→ Task IDX
+        self._parsed: dict = {}
+        self._task_idx: Optional[str] = None
+        self.result_data: Optional[dict] = None
+
+        self.setWindowTitle("＋ クイック追加")
+        self.setMinimumWidth(620)
+        lay = QVBoxLayout(self)
+
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText("例: 見積書レビュー 2h 金曜 @設計書 #先方確認済み")
+        self.edit.setStyleSheet("QLineEdit { font-size: 11pt; padding: 5px; }")
+        lay.addWidget(self.edit)
+
+        self.cands = QListWidget()
+        self.cands.setMaximumHeight(160)
+        self.cands.setVisible(False)
+        self.cands.itemDoubleClicked.connect(lambda _: self._choose_candidate())
+        lay.addWidget(self.cands)
+
+        self.preview = QLabel()
+        self.preview.setWordWrap(True)
+        self.preview.setTextFormat(Qt.TextFormat.RichText)
+        self.preview.setStyleSheet(
+            "QLabel { background:#F4F6F8; border:1px solid #E0E0E0;"
+            " border-radius:6px; padding:6px; }")
+        lay.addWidget(self.preview)
+
+        help_lbl = QLabel(self._HELP)
+        help_lbl.setWordWrap(True)
+        help_lbl.setStyleSheet("QLabel { color:#90A4AE; font-size:8pt; }")
+        lay.addWidget(help_lbl)
+
+        self.btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                     | QDialogButtonBox.StandardButton.Cancel)
+        self.btns.button(QDialogButtonBox.StandardButton.Ok).setText("作成 (Enter)")
+        self.btns.accepted.connect(self._on_create)
+        self.btns.rejected.connect(self.reject)
+        lay.addWidget(self.btns)
+
+        self.edit.textChanged.connect(self._update)
+        self.edit.installEventFilter(self)
+        self._update()
+
+    # ── 入力の解析とプレビュー ──
+
+    def _inbox_full(self) -> bool:
+        cfg = self.state.config
+        s = LG.inbox_summary(self.state.df_nodes, self.state.user,
+                             cfg.inbox_max_items, cfg.inbox_stale_days)
+        return s["over"]
+
+    def _update(self) -> None:
+        p = LG.parse_quick_add(self.edit.text(), holidays=self.state.config.holidays)
+        self._parsed = p
+        df = self.state.df_nodes
+        errors, notes = [], []
+        self._task_idx = None
+        q = p["task_query"]
+
+        # @Task の解決と候補リスト
+        show_cands = False
+        if q is not None:
+            key = LG.norm_key(q)
+            if key in self._chosen and self._chosen[key] in df.index:
+                self._task_idx = self._chosen[key]
+            else:
+                self._task_idx, n = LG.resolve_task_query(
+                    df, q, self.state.user, self._recent)
+                show_cands = True
+                if self._task_idx is None:
+                    errors.append("該当する Task がありません" if n == 0
+                                  else f"Task 候補 {n} 件 — ↑↓ で選んで Enter")
+        self._fill_candidates(q if show_cands else None)
+
+        if not p["title"]:
+            errors.append("チケット名を入力してください")
+        if q is None and self._inbox_full():
+            errors.append(f"Inbox が上限（{self.state.config.inbox_max_items} 件）です。"
+                          "@ で Task を指定してください")
+
+        # プレビュー（チップ風に 1 行で）
+        def chip(text: str, color: str = "#37474F") -> str:
+            return f"<span style='color:{color};'>{text}</span>"
+        parts = [chip(f"📄 <b>{self._esc(p['title']) or '（未入力）'}</b>")]
+        hours = p["hours"]
+        if hours is not None:
+            parts.append(chip(f"⏱ {hours:g}h" + ("（15分単位に切上げ）" if p["hours_rounded"] else "")))
+        elif self._default_hours:
+            parts.append(chip(f"⏱ {self._default_hours:g}h（選択スロット）"))
+        if p["start"]:
+            parts.append(chip(f"▶ {self._fmt_date(p['start'])}"))
+        if p["deadline"]:
+            parts.append(chip(f"📅 {self._fmt_date(p['deadline'])}"))
+        if self._task_idx:
+            path = " ＞ ".join(LG.node_path_titles(df, self._task_idx))
+            parts.append(chip(f"📁 {self._esc(path)}", "#1565C0"))
+        elif q is None:
+            parts.append(chip("📥 Inbox", "#6A1B9A"))
+        if p["memo"]:
+            memo = p["memo"] if len(p["memo"]) <= 30 else p["memo"][:30] + "…"
+            parts.append(chip(f"📝 {self._esc(memo)}"))
+        html = " │ ".join(parts)
+        for w in p["warnings"]:
+            html += f"<br>{chip('⚠ ' + self._esc(w), '#E65100')}"
+        for h in p["hints"]:
+            html += f"<br>{chip('💡 ' + self._esc(h), '#546E7A')}"
+        for e in errors:
+            html += f"<br>{chip('✖ ' + self._esc(e), '#C62828')}"
+        self.preview.setText(html)
+        self.btns.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not errors)
+
+    @staticmethod
+    def _esc(s: str) -> str:
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    @staticmethod
+    def _fmt_date(d) -> str:
+        return f"{d.month}/{d.day}({'月火水木金土日'[d.weekday()]})"
+
+    # ── @Task 候補 ──
+
+    def _fill_candidates(self, query: Optional[str]) -> None:
+        self.cands.clear()
+        if query is None:
+            self.cands.setVisible(False)
+            return
+        for idx, path in LG.quick_add_task_candidates(
+                self.state.df_nodes, query, self.state.user, self._recent):
+            item = QListWidgetItem(path)
+            item.setData(Qt.ItemDataRole.UserRole, idx)
+            self.cands.addItem(item)
+        self.cands.setVisible(self.cands.count() > 0)
+        if self.cands.count():
+            self.cands.setCurrentRow(0)
+
+    def _choose_candidate(self) -> None:
+        """選択中の候補を @語 として確定する（入力欄の @語 をタイトルで置き換え）"""
+        item = self.cands.currentItem()
+        if item is None:
+            return
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        title = re.sub(r"\s+", "", str(self.state.df_nodes.loc[idx, "title"]))
+        text = self.edit.text()
+        memo_m = re.search(r"(?:^|\s)[#＃]", text)
+        body_end = memo_m.start() if memo_m else len(text)
+        hits = [m for m in re.finditer(r"(?:(?<=\s)|^)[@＠]\S*", text)
+                if m.start() < body_end]
+        if not hits:
+            return
+        m = hits[-1]
+        new_text = text[:m.start()] + "@" + title + text[m.end():]
+        self._chosen[LG.norm_key(title)] = idx
+        self.edit.setText(new_text)
+        self.edit.setCursorPosition(m.start() + 1 + len(title))
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.edit and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if self.cands.isVisible() and key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                step = -1 if key == Qt.Key.Key_Up else 1
+                row = max(0, min(self.cands.count() - 1, self.cands.currentRow() + step))
+                self.cands.setCurrentRow(row)
+                return True
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                # 候補表示中の Enter は候補の確定、それ以外は作成
+                if self.cands.isVisible() and self.cands.currentItem() is not None:
+                    self._choose_candidate()
+                else:
+                    self._on_create()
+                return True
+        return super().eventFilter(obj, event)
+
+    # ── 確定 ──
+
+    def _on_create(self) -> None:
+        self._update()
+        if not self.btns.button(QDialogButtonBox.StandardButton.Ok).isEnabled():
+            return
+        p = self._parsed
+        hours = p["hours"] if p["hours"] is not None else (self._default_hours or 0.0)
+        self.result_data = {
+            "title":    p["title"],
+            "hours":    hours,
+            "deadline": p["deadline"],
+            "start":    p["start"],
+            "memo":     p["memo"],
+            "parent":   self._task_idx or DB.INBOX_PARENT,
+        }
+        self.accept()
+
+
+# ---------- Inbox 振り分けダイアログ ----------
+
+class InboxTriageDialog(QDialog):
+    """
+    Inbox（Task 未設定）チケットを Task へ振り分けるダイアログ（B2）。
+    各行の移動先は、過去チケット名との類似度（logic.suggest_task）で自動提案する。
+    変更はインメモリ（Ctrl+Z 可・Ctrl+S で保存）。
+    """
+    _COLS = ["経過", "チケット", "見積", "納期", "メモ", "移動先 Task（入力で絞り込み）"]
+    _SUGGEST_BG = "#FFF8E1"  # 自動提案した移動先の背景色
+
+    def __init__(self, state, copy_prompt_func=None, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self._copy_prompt_func = copy_prompt_func
+        self.setWindowTitle("📥 Inbox の振り分け")
+        self.resize(980, 480)
+        lay = QVBoxLayout(self)
+
+        self.head = QLabel()
+        self.head.setStyleSheet("QLabel { font-weight:bold; color:#6A1B9A; }")
+        lay.addWidget(self.head)
+
+        self.table = QTableWidget(0, len(self._COLS))
+        self.table.setHorizontalHeaderLabels(self._COLS)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        for c, w in enumerate([55, 220, 55, 90, 220]):
+            self.table.setColumnWidth(c, w)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        lay.addWidget(self.table, stretch=1)
+
+        self.info = InfoLabel()
+        lay.addWidget(self.info)
+
+        row = QHBoxLayout()
+        self.move_btn = QPushButton("✔ 移動先を選んだ行を移動")
+        self.move_btn.clicked.connect(self._on_move)
+        self.del_btn = QPushButton("🗑 選択行を削除")
+        self.del_btn.clicked.connect(self._on_delete)
+        self.ai_btn = QPushButton("🤖 AI 振り分け用プロンプトをコピー")
+        self.ai_btn.setToolTip("Task 一覧 + Inbox 一覧をコピーします。\n"
+                               "LLM の返答は AI取込タブの「取り込み」で反映できます")
+        self.ai_btn.clicked.connect(self._on_copy_prompt)
+        later_btn = QPushButton("後で")
+        later_btn.clicked.connect(self.reject)
+        for b in (self.move_btn, self.del_btn, self.ai_btn):
+            b.setStyleSheet(STYLE_BUTTON)
+            row.addWidget(b)
+        row.addStretch()
+        later_btn.setStyleSheet(STYLE_BUTTON)
+        row.addWidget(later_btn)
+        lay.addLayout(row)
+
+        self._task_items = self._task_choices()
+        self._rebuild()
+
+    def _task_choices(self) -> list:
+        """移動先候補 [(階層パス, task_idx), ...]（完了・中止 Task 除く、パス順）"""
+        df = self.state.df_nodes
+        tasks = LG.quick_add_task_candidates(df, "", self.state.user, limit=100000)
+        return sorted(((path, idx) for idx, path in tasks), key=lambda x: x[0])
+
+    def _rebuild(self) -> None:
+        cfg = self.state.config
+        df = self.state.df_nodes
+        inbox = LG.inbox_tickets(df, self.state.user)
+        s = LG.inbox_summary(df, self.state.user, cfg.inbox_max_items, cfg.inbox_stale_days)
+        self.head.setText(f"📥 Inbox {s['count']} 件（上限 {cfg.inbox_max_items} 件"
+                          f"・最古 {s['oldest_days']} 日前）")
+        self.table.setRowCount(0)
+        today = datetime.date.today()
+        from PySide6.QtWidgets import QCompleter
+        for idx, r in inbox.iterrows():
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            try:
+                age = (today - datetime.date.fromisoformat(str(r.get("created_at", ""))[:10])).days
+            except ValueError:
+                age = 0
+            est = float(r.get("estimated_hours") or 0)
+            vals = [f"{age}日", str(r.get("title", "")),
+                    f"{est:g}h" if est else "-",
+                    str(r.get("deadline") or "") or "-",
+                    str(r.get("memo") or "")]
+            for c, v in enumerate(vals):
+                it = QTableWidgetItem(v)
+                it.setData(Qt.ItemDataRole.UserRole, idx)
+                if c == 0:
+                    # 滞留の色分け: stale_days 超=橙、7 日超=赤
+                    if age > 7:
+                        it.setBackground(QColor("#FFCDD2"))
+                    elif age > cfg.inbox_stale_days:
+                        it.setBackground(QColor("#FFE0B2"))
+                self.table.setItem(row, c, it)
+            combo = QComboBox()
+            combo.setEditable(True)
+            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            combo.addItem("（未選択）", None)
+            for path, t_idx in self._task_items:
+                combo.addItem(path, t_idx)
+            comp = combo.completer()
+            comp.setFilterMode(Qt.MatchFlag.MatchContains)
+            comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            sug = LG.suggest_task(df, str(r.get("title", "")), str(r.get("memo") or ""),
+                                  self.state.user)
+            if sug:
+                i = combo.findData(sug)
+                if i >= 0:
+                    combo.setCurrentIndex(i)
+                    combo.setStyleSheet(f"QComboBox {{ background:{self._SUGGEST_BG}; }}")
+                    combo.setToolTip("💡 過去のチケット名から自動提案した移動先です")
+            self.table.setCellWidget(row, 5, combo)
+        has = self.table.rowCount() > 0
+        self.move_btn.setEnabled(has)
+        self.del_btn.setEnabled(has)
+
+    def _row_idx(self, row: int) -> Optional[str]:
+        it = self.table.item(row, 0)
+        return it.data(Qt.ItemDataRole.UserRole) if it else None
+
+    def _on_move(self) -> None:
+        df = self.state.df_nodes
+        today = datetime.date.today().isoformat()
+        moved = 0
+        for row in range(self.table.rowCount()):
+            combo = self.table.cellWidget(row, 5)
+            i = combo.findText(combo.currentText())  # 手入力の場合も一致する候補で確定
+            task_idx = combo.itemData(i) if i > 0 else None
+            idx = self._row_idx(row)
+            if not task_idx or idx not in df.index:
+                continue
+            siblings = df[df["parent_id"] == task_idx]
+            df.loc[idx, "parent_id"] = task_idx
+            df.loc[idx, "priority"] = int(siblings["priority"].max()) + 1 if not siblings.empty else 1
+            df.loc[idx, "updated_at"] = today
+            moved += 1
+        if not moved:
+            self.info.set_info("⚠ 移動先を選んだ行がありません")
+            return
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
+        self._rebuild()
+        self.info.set_info(f"{moved} 件を振り分けました（Ctrl+S で保存 / Ctrl+Z で取り消し）")
+
+    def _on_delete(self) -> None:
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if not rows:
+            self.info.set_info("⚠ 削除する行を選択してください")
+            return
+        df = self.state.df_nodes
+        ans = QMessageBox.question(self, "削除確認", f"選択した {len(rows)} 件を論理削除しますか？")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        today = datetime.date.today().isoformat()
+        skipped = []
+        for row in rows:
+            idx = self._row_idx(row)
+            reason = LG.delete_block_reason(df, idx, self.state.user)
+            if reason:
+                skipped.append(f"{df.loc[idx, 'title']}: {reason}")
+                continue
+            df.loc[idx, "status"] = "deleted"
+            df.loc[idx, "updated_at"] = today
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
+        self._rebuild()
+        if skipped:
+            QMessageBox.warning(self, "削除できなかったチケット", "\n".join(skipped))
+
+    def _on_copy_prompt(self) -> None:
+        if self._copy_prompt_func:
+            self._copy_prompt_func()
+            self.info.set_info("コピーしました。LLM の返答は AI取込タブで取り込めます")

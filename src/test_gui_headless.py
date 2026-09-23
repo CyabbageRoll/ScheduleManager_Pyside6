@@ -1608,6 +1608,220 @@ def test_undo_redo(win, task_idx, ticket_idx):
         ng("保存時の Undo 起点", e)
 
 
+def test_quick_add_parse():
+    """B2: クイック追加の解析ルール（06_B2 仕様書の表）"""
+    print("\n[B2] クイック追加の解析テスト")
+    import logic as LG
+    T = datetime.date(2026, 9, 23)  # 水曜日
+    D = lambda m, d, y=2026: datetime.date(y, m, d)
+    cases = [
+        ("水の入れ替え　1.５　明日", dict(title="水の入れ替え", hours=1.5, deadline=D(9, 24))),
+        ("a ２ｈ", dict(hours=2.0)), ("a 2.5", dict(hours=2.5)), ("a 30分", dict(hours=0.5)),
+        ("a 1時間半", dict(hours=1.5)), ("a 20分", dict(hours=0.5, hours_rounded=True)),
+        ("Phase 3", dict(title="Phase 3", hours=None)),
+        ("a 水", dict(deadline=D(9, 23))), ("a 来週水", dict(deadline=D(9, 30))),
+        ("a 今週中", dict(deadline=D(9, 25))), ("a 月末", dict(deadline=D(9, 30))),
+        ("a 5日", dict(deadline=D(10, 5))), ("a ９／３０", dict(deadline=D(9, 30))),
+        ("a 1/10", dict(deadline=D(1, 10, 2027))), ("a 9/10", dict(deadline=D(9, 10))),
+        ("a 9/28〜10/2", dict(start=D(9, 28), deadline=D(10, 2))),
+        ("レビュー2h", dict(title="レビュー2h", hours=None)),
+        ("「水」 交換", dict(title="水 交換", deadline=None)),
+        ("見積 2h 金曜 @設計書", dict(title="見積", task_query="設計書", deadline=D(9, 25))),
+        ("x 明日 #明日までに鍵", dict(title="x", memo="明日までに鍵", deadline=D(9, 24))),
+        ("Issue#123 対応", dict(title="Issue#123 対応", memo="")),
+    ]
+    bad = []
+    for text, exp in cases:
+        r = LG.parse_quick_add(text, today=T)
+        diff = {k: (r[k], v) for k, v in exp.items() if r[k] != v}
+        if diff:
+            bad.append((text, diff))
+    if bad:
+        ng(f"解析ルール {len(cases) - len(bad)}/{len(cases)}", Exception(str(bad)))
+    else:
+        ok(f"解析ルール {len(cases)} 例がすべて仕様どおり")
+    try:
+        r = LG.parse_quick_add("a 3", today=T)
+        assert r["hints"] and r["title"] == "a 3"
+        r = LG.parse_quick_add("a 9/10", today=T)
+        assert any("過去日" in w for w in r["warnings"])
+        ok("整数のみはヒント表示、過去日は警告")
+    except Exception as e:
+        ng("ヒント・警告", e)
+
+
+def test_quick_add_inbox(win, task_idx, tmpdir):
+    """B2: クイック追加・Inbox・振り分け・AI 取込"""
+    print("\n[B2] クイック追加 / Inbox テスト")
+    import logic as LG
+    import db as DB
+    import ui_main
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QDialog, QMessageBox
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, tmpdir)
+    state = win.state
+    cfg = state.config
+    cfg.inbox_max_items, cfg.inbox_stale_days = 10, 3
+    task_title = str(state.df_nodes.loc[task_idx, "title"])
+
+    try:
+        dlg = ui_main.QuickAddDialog(state)
+        dlg.edit.setText("Inbox確認 1.5 明日 #給湯室の件")
+        dlg._on_create()
+        r = dlg.result_data
+        assert r and r["parent"] == DB.INBOX_PARENT and r["hours"] == 1.5 \
+            and r["memo"] == "給湯室の件", r
+        ds = win._create_quick_ticket(r)
+        assert state.df_nodes.loc[ds.name, "parent_id"] == DB.INBOX_PARENT
+        inbox_idx = ds.name
+        ok("@ なしは Inbox に作成（工数・メモも反映）")
+    except Exception as e:
+        ng("Inbox への作成", e)
+        return
+
+    try:
+        dlg = ui_main.QuickAddDialog(state)
+        dlg.edit.setText(f"Task指定確認 @{task_title}")
+        dlg._on_create()
+        assert dlg.result_data and dlg.result_data["parent"] == task_idx, dlg.result_data
+        dlg = ui_main.QuickAddDialog(state)
+        dlg.edit.setText("該当なし確認 @存在しないTask名xyz")
+        dlg._on_create()
+        assert dlg.result_data is None
+        ok("@Task は候補から確定、該当なしは作成しない")
+    except Exception as e:
+        ng("@Task 指定", e)
+
+    try:
+        # 朝のスロット連携: 4 スロット選択 → 工数 1.0h・割り当て
+        state.current_member = state.user
+        orig_exec = ui_main.QuickAddDialog.exec
+
+        def fake_exec(self):
+            self.edit.setText(f"朝の割当確認 @{task_title}")
+            self._on_create()
+            return QDialog.DialogCode.Accepted if self.result_data else QDialog.DialogCode.Rejected
+        ui_main.QuickAddDialog.exec = fake_exec
+        try:
+            win._on_quick_add(rows=[36, 37, 38, 39])
+        finally:
+            ui_main.QuickAddDialog.exec = orig_exec
+        new = state.df_nodes[state.df_nodes["title"] == "朝の割当確認"]
+        assert len(new) == 1
+        n_idx = new.index[0]
+        assert float(new.loc[n_idx, "estimated_hours"]) == 1.0
+        sch_idx = DB.daily_sch_idx(state.current_date, state.user)
+        assert state.df_daily.loc[sch_idx, "C0900"] == n_idx
+        assert state.df_daily.loc[sch_idx, "C0945"] == n_idx
+        ok("スロット選択中の作成: 工数=スロット時間、同時に割り当て")
+    except Exception as e:
+        ng("スロット連携", e)
+
+    try:
+        assert LG.status_change_error(state.df_nodes, inbox_idx, "done")
+        assert LG.status_change_error(state.df_nodes, inbox_idx, "regularly")
+        assert LG.status_change_error(state.df_nodes, inbox_idx, "cancel") is None
+        ok("Inbox チケットは done / regularly 不可（cancel は可）")
+    except Exception as e:
+        ng("Inbox のステータス制約", e)
+
+    try:
+        cnt = LG.inbox_summary(state.df_nodes, state.user, 99, 3)["count"]
+        cfg.inbox_max_items = cnt
+        dlg = ui_main.QuickAddDialog(state)
+        dlg.edit.setText("上限確認")
+        dlg._on_create()
+        assert dlg.result_data is None, "上限なのに Inbox へ作成できた"
+        dlg.edit.setText(f"上限確認 @{task_title}")
+        dlg._on_create()
+        assert dlg.result_data is not None, "@ 指定でも作成できない"
+        cfg.inbox_max_items = 10
+        ok("Inbox 上限到達後は @Task 指定が必須")
+    except Exception as e:
+        cfg.inbox_max_items = 10
+        ng("Inbox 上限", e)
+
+    try:
+        tp = win.main_pane.tree_pane
+        tp.refresh()
+        item = tp._find_item(tp.tree.invisibleRootItem(), DB.INBOX_PARENT)
+        assert item is not None and item.childCount() >= 1 and "Inbox" in item.text(0)
+        ok("Edit ツリーに 📥 Inbox とチケットが表示される")
+    except Exception as e:
+        ng("Inbox のツリー表示", e)
+
+    try:
+        # AI 取込: idx 指定 → 移動（新規作成しない）、同名 → 移動、不明 IDX → スキップ
+        extra = win._create_quick_ticket({"title": "AI同名確認", "hours": 0, "deadline": None,
+                                          "start": None, "memo": "", "parent": DB.INBOX_PARENT})
+        view = win.ai_import_view
+        prompt = view._build_task_list()
+        assert "【Task未設定Ticket" in prompt and inbox_idx in prompt
+        text = (f"idx: {inbox_idx}\nparent_idx: {task_idx}\n---\n"
+                f"title: AI同名確認\nparent_idx: {task_idx}\n---\n"
+                f"idx: 999999_99zzzzzz\nparent_idx: {task_idx}\n---\n"
+                f"title: AI新規確認\nparent_idx: {task_idx}\n")
+        items, errors, skipped = view._parse_llm_response(text)
+        kinds = [(it["kind"], it.get("idx")) for it in items]
+        assert not errors and len(skipped) == 1, (errors, skipped)
+        assert kinds[0] == ("move", inbox_idx) and kinds[1] == ("move", extra.name) \
+            and kinds[2][0] == "new", kinds
+        n_before = len(state.df_nodes)
+        view.text_edit.setPlainText(text)
+        orig_q = QMessageBox.question
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+        try:
+            view._on_import_tickets()
+        finally:
+            QMessageBox.question = orig_q
+        df = state.df_nodes
+        assert df.loc[inbox_idx, "parent_id"] == task_idx
+        assert df.loc[extra.name, "parent_id"] == task_idx
+        assert (df["title"] == "AI同名確認").sum() == 1, "同名チケットが二重作成された"
+        assert len(df) == n_before + 1, "新規は 1 件のみのはず"
+        ok("AI 取込: Inbox は移動（二重作成なし）、不明 IDX はスキップ、新規は作成")
+    except Exception as e:
+        ng("AI 取込の Inbox 振り分け", e)
+
+    try:
+        # 振り分け画面: 移動先を選んで移動
+        t = win._create_quick_ticket({"title": "振り分け画面確認", "hours": 0, "deadline": None,
+                                      "start": None, "memo": "", "parent": DB.INBOX_PARENT})
+        dlg = ui_main.InboxTriageDialog(state)
+        row = next(r for r in range(dlg.table.rowCount()) if dlg._row_idx(r) == t.name)
+        combo = dlg.table.cellWidget(row, 5)
+        combo.setCurrentIndex(combo.findData(task_idx))
+        dlg._on_move()
+        assert state.df_nodes.loc[t.name, "parent_id"] == task_idx
+        ok("振り分け画面で Task へ移動できる")
+    except Exception as e:
+        ng("振り分け画面", e)
+
+    try:
+        # 起動時表示: 上限/滞留時のみ・1 日 1 回
+        calls = []
+        orig_open = win._open_inbox_triage
+        win._open_inbox_triage = lambda: calls.append(1)
+        try:
+            win._create_quick_ticket({"title": "起動時確認", "hours": 0, "deadline": None,
+                                      "start": None, "memo": "", "parent": DB.INBOX_PARENT})
+            cfg.inbox_max_items = 99
+            win.maybe_prompt_inbox()
+            assert calls == [], "条件外なのに表示された"
+            cfg.inbox_max_items = 1
+            win.maybe_prompt_inbox()
+            win.maybe_prompt_inbox()
+            assert calls == [1], f"表示回数 {len(calls)}"
+        finally:
+            win._open_inbox_triage = orig_open
+            cfg.inbox_max_items = 10
+        ok("起動時の振り分け表示は上限/滞留時のみ・1 日 1 回")
+    except Exception as e:
+        ng("起動時の振り分け表示", e)
+    state.nodes_modified = False
+    state.schedule_modified = False
+
+
 def test_ui_state(state, version, win, tmpdir):
     """D3: 画面状態（ウィンドウ・分割・フィルタ・ツリー開閉・前回タブ）の記憶"""
     print("\n[D3] 画面状態の記憶テスト")
@@ -1618,7 +1832,7 @@ def test_ui_state(state, version, win, tmpdir):
     try:
         tp = win.main_pane.tree_pane
         tp.refresh()
-        root = tp.tree.invisibleRootItem().child(0)  # P0
+        root = tp._find_item(tp.tree.invisibleRootItem(), "0")  # P0（先頭は Inbox）
         first = root.child(0)                          # 先頭の P1
         first_idx = first.data(0, Qt.ItemDataRole.UserRole)
         first.setExpanded(False)
@@ -1718,6 +1932,8 @@ def main():
             test_team_log_export(win)
             test_assignment_view_multi_rows(win, ticket_idx)
             test_undo_redo(win, task_idx, ticket_idx)
+            test_quick_add_parse()
+            test_quick_add_inbox(win, task_idx, tmpdir)
             test_save_load(state)
             test_ui_state(state, version, win, tmpdir)
 

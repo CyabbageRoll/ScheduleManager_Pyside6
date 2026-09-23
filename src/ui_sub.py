@@ -3251,6 +3251,7 @@ class ConfigView(QWidget):
         self._build_section_daily_info()
         self._build_section_report()
         self._build_section_pomodoro()
+        self._build_section_inbox()
         self._build_section_commands()
 
         self._form_layout.addStretch()
@@ -3383,6 +3384,14 @@ class ConfigView(QWidget):
         self._spin("pomo_break", cfg.pomodoro_break_minutes, fl,
                    "break_minutes (休憩時間/分):", 1, 60)
 
+    def _build_section_inbox(self) -> None:
+        cfg = self.state.config
+        fl = self._group("[Inbox]")
+        self._spin("inbox_max", cfg.inbox_max_items, fl,
+                   "max_items (Inbox 上限件数):", 1, 999)
+        self._spin("inbox_stale", cfg.inbox_stale_days, fl,
+                   "stale_days (滞留とみなす日数):", 1, 365)
+
     def _build_section_commands(self) -> None:
         cfg = self.state.config
         fl = self._group("[Commands]")
@@ -3427,6 +3436,8 @@ class ConfigView(QWidget):
         _set("gui_detail_pane",  "open" if cfg.detail_pane_open else "closed")
         _set("pomo_work",        cfg.pomodoro_work_minutes)
         _set("pomo_break",       cfg.pomodoro_break_minutes)
+        _set("inbox_max",        cfg.inbox_max_items)
+        _set("inbox_stale",      cfg.inbox_stale_days)
 
     # ── 保存 ──
 
@@ -3492,6 +3503,10 @@ class ConfigView(QWidget):
         parser.set("Pomodoro", "work_minutes",  self._get("pomo_work"))
         parser.set("Pomodoro", "break_minutes", self._get("pomo_break"))
 
+        _ensure("Inbox")
+        parser.set("Inbox", "max_items",  self._get("inbox_max"))
+        parser.set("Inbox", "stale_days", self._get("inbox_stale"))
+
         # Commands は既存エントリをそのまま保持（フォームに表示した分のみ更新）
         _ensure("Commands")
         cfg = self.state.config
@@ -3515,7 +3530,7 @@ class DashboardView(QWidget):
     """今日のダッシュボード（今日やること・気にすべきことを 1 画面に集約）"""
 
     # カードの「開く」クリック → MainWindow がタブ遷移する
-    navigate_requested = Signal(str)  # "schedule" / "edit" / "request" / "team"
+    navigate_requested = Signal(str)  # "schedule" / "edit" / "request" / "team" / "inbox"
 
     def __init__(self, state):
         super().__init__()
@@ -3528,6 +3543,23 @@ class DashboardView(QWidget):
         self.header_lbl = QLabel("🏠 Today")
         layout.addWidget(self.header_lbl)
         layout.addWidget(Separator())
+
+        # 📥 Inbox バナー（Task 未設定チケットがあるときだけ表示）
+        self.inbox_banner = QFrame()
+        self.inbox_banner.setStyleSheet(
+            "QFrame { background:#F3E5F5; border:1px solid #CE93D8; border-radius:6px; }")
+        _bl = QHBoxLayout(self.inbox_banner)
+        _bl.setContentsMargins(8, 4, 8, 4)
+        self.inbox_lbl = QLabel("")
+        self.inbox_lbl.setStyleSheet("QLabel { color:#6A1B9A; font-weight:bold; border:none; }")
+        _bl.addWidget(self.inbox_lbl)
+        _bl.addStretch()
+        _inbox_btn = QPushButton("振り分ける")
+        _inbox_btn.setStyleSheet(STYLE_BUTTON)
+        _inbox_btn.clicked.connect(lambda: self.navigate_requested.emit("inbox"))
+        _bl.addWidget(_inbox_btn)
+        self.inbox_banner.setVisible(False)
+        layout.addWidget(self.inbox_banner)
 
         grid = QGridLayout()
         grid.setSpacing(8)
@@ -3588,6 +3620,16 @@ class DashboardView(QWidget):
         df_nodes = self.state.df_nodes
         self.header_lbl.setText(
             f"🏠 Today {today}  [{self.state.display_name(user)}]")
+
+        # 0. Inbox バナー
+        cfg = self.state.config
+        ib = LG.inbox_summary(df_nodes, user, cfg.inbox_max_items, cfg.inbox_stale_days)
+        self.inbox_banner.setVisible(ib["count"] > 0)
+        if ib["count"]:
+            warn = ("　⚠ 上限に達しています" if ib["over"]
+                    else "　⚠ 滞留しています" if ib["stale"] else "")
+            self.inbox_lbl.setText(
+                f"📥 Inbox {ib['count']} 件（最古 {ib['oldest_days']} 日前）{warn}")
 
         # 1. 今日のスケジュール（連続区間にまとめて表示）
         lst = self._cards["schedule"]["list"]
@@ -3816,39 +3858,68 @@ class AIImportView(QWidget):
                 t_memo_str = f" | {t_memo}" if t_memo else ""
                 lines.append(f"    - {t_idx} | {t_title}{dl_str}{t_memo_str}")
 
+        # Task 未設定（Inbox）のチケット: AI に振り分け先を判断させる
+        inbox = LG.inbox_tickets(df, self.state.user)
+        if not inbox.empty:
+            lines += ["", "【Task未設定Ticket（Inbox）（IDX | チケット名 | 見積 | 納期 | memo）】",
+                      "  ※ 各チケットに最適な親Taskを Task一覧 から選んでください"]
+            for t_idx, t_row in inbox.iterrows():
+                est = float(t_row.get("estimated_hours") or 0)
+                dl = str(t_row.get("deadline") or "").strip() or "-"
+                memo = str(t_row.get("memo") or "").strip()
+                lines.append(f"  {t_idx} | {t_row.get('title', '')} | "
+                             f"{f'{est:g}h' if est else '-'} | {dl} | {memo}")
+
         return "\n".join(lines)
 
     # ── チケット取り込み ──
 
     def _on_import_tickets(self) -> None:
-        """テキストエリアの LLM 返答をパースし、チケットを DB へ登録する"""
+        """テキストエリアの LLM 返答をパースし、新規チケットの DB 登録と
+        Inbox チケットの振り分け（移動。新規作成はしない）を行う"""
         text = self.text_edit.toPlainText().strip()
         if not text:
             self.info.set_error("テキストが空です")
             return
 
-        items, errors = self._parse_llm_response(text)
+        items, errors, skipped = self._parse_llm_response(text)
         if errors:
             self.info.set_error("パースエラー: " + " / ".join(errors))
             return
         if not items:
-            self.info.set_error("取り込める内容が見つかりませんでした")
+            self.info.set_error("取り込める内容が見つかりませんでした"
+                                + (f"（スキップ: {' / '.join(skipped)}）" if skipped else ""))
             return
 
-        preview = "\n".join(
-            f"{i}. {it['title']}  (Task: {it['parent_idx']})"
-            for i, it in enumerate(items, 1)
-        )
+        df = self.state.df_nodes
+
+        def _task_title(t_idx: str) -> str:
+            return str(df.loc[t_idx, "title"]) if t_idx in df.index else t_idx
+
+        moves = [it for it in items if it["kind"] == "move"]
+        news = [it for it in items if it["kind"] == "new"]
+        lines = []
+        if moves:
+            lines.append(f"■ Inbox から移動 {len(moves)} 件（新規作成しません）")
+            lines += [f"  {it['title']} → {_task_title(it['parent_idx'])}"
+                      + (f"  ※{it['note']}" if it.get("note") else "") for it in moves]
+        if news:
+            lines.append(f"■ 新規作成 {len(news)} 件")
+            lines += [f"  {it['title']} → {_task_title(it['parent_idx'])}" for it in news]
+        if skipped:
+            lines.append(f"■ スキップ {len(skipped)} 件")
+            lines += [f"  {m}" for m in skipped]
         reply = QMessageBox.question(
             self, "チケット取り込み確認",
-            f"{len(items)} 件のチケットを取り込みます。よろしいですか？\n\n{preview}",
+            "以下の内容で取り込みます。よろしいですか？\n\n" + "\n".join(lines),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        # 1) 新規チケット: 従来どおり DB へ直接登録
         imported_idxs = []
-        for it in items:
+        for it in news:
             ds = DB.create_initial_node(
                 owner=self.state.user,
                 node_type="ticket",
@@ -3870,17 +3941,37 @@ class AIImportView(QWidget):
             # （再読込すると他の未保存の編集が失われるため）
             self.state.df_nodes.loc[ds.name] = ds
             imported_idxs.append(str(ds.name))
+        if imported_idxs:
+            # DB へ直接登録した行はメモリから戻すと食い違うため、ここを Undo の起点にする
+            self.state.reset_undo()
 
-        if not imported_idxs:
+        # 2) Inbox の移動: インメモリ（Ctrl+Z で取り消し可・Ctrl+S で保存）
+        moved_idxs = []
+        today = datetime.date.today().isoformat()
+        for it in moves:
+            siblings = df[df["parent_id"] == it["parent_idx"]]
+            df.loc[it["idx"], "parent_id"] = it["parent_idx"]
+            df.loc[it["idx"], "priority"] = (int(siblings["priority"].max()) + 1
+                                             if not siblings.empty else 1)
+            df.loc[it["idx"], "updated_at"] = today
+            moved_idxs.append(it["idx"])
+        if moved_idxs:
+            self.state.nodes_modified = True
+            self.state.notify_dirty()
+
+        if not imported_idxs and not moved_idxs:
             return
-        # DB へ直接登録した行はメモリから戻すと食い違うため、ここを Undo の起点にする
-        self.state.reset_undo()
         self.state.refresh()
 
         if self.state.logger:
-            self.state.logger.info(f"[AI取込] チケット {len(imported_idxs)} 件登録 user={self.state.user} ids={imported_idxs}")
-        self.info.set_info(f"{len(imported_idxs)} 件を取り込みました")
-        self.import_done.emit(imported_idxs)
+            self.state.logger.info(
+                f"[AI取込] 新規 {len(imported_idxs)} 件 / Inbox 移動 {len(moved_idxs)} 件"
+                f" user={self.state.user} new={imported_idxs} moved={moved_idxs}")
+        msg = f"新規 {len(imported_idxs)} 件を取り込み、Inbox から {len(moved_idxs)} 件を振り分けました"
+        if moved_idxs:
+            msg += "（振り分けは Ctrl+S で保存）"
+        self.info.set_info(msg)
+        self.import_done.emit(imported_idxs + moved_idxs)
 
     @staticmethod
     def _strip_code_fences(text: str) -> str:
@@ -3892,17 +3983,23 @@ class AIImportView(QWidget):
         LLM 返答からチケットリストをパースする。
 
         フォーマット:
-            title: タイトル（必須）
+            title: タイトル（新規作成時は必須）
             parent_idx: 親Task の IDX（必須）
             deadline: YYYY-MM-DD（省略可）
             memo: メモ（省略可）
             ---
-            （複数チケットは --- で区切る）
+            idx: Inbox チケットの IDX（振り分け時。title 不要）
+            parent_idx: 親Task の IDX
+            （複数エントリは --- で区切る）
 
         後方互換: $$$items ... $$$ ブロックがあればその中身を抽出する。
+        戻り値: (items, errors, skipped)
+            items: [{"kind": "new"|"move", "title", "parent_idx", ...}]
+            skipped: 取り込まない理由のメッセージ（エラーではない）
         """
         items: list = []
         errors: list = []
+        skipped: list = []
         df = self.state.df_nodes
 
         text = self._strip_code_fences(text)
@@ -3911,10 +4008,13 @@ class AIImportView(QWidget):
         match = re.search(r"\$\$\$items\s*(.*?)\$\$\$", text, re.DOTALL)
         block = match.group(1).strip() if match else text.strip()
 
-        # 構文チェック: title キーが1つも無ければエラー
-        if "title:" not in block:
-            errors.append("title: が見つかりません。フォーマットを確認してください")
-            return items, errors
+        # 構文チェック: title / idx キーが 1 つも無ければエラー（parent_idx は数えない）
+        if not re.search(r"(?m)^\s*(title|idx)\s*:", block):
+            errors.append("title: / idx: が見つかりません。フォーマットを確認してください")
+            return items, errors, skipped
+
+        inbox = LG.inbox_tickets(df, self.state.user)
+        used_inbox: set = set()  # 同じ Inbox チケットを二重に移動しない
 
         entries = [e.strip() for e in block.split("---") if e.strip()]
 
@@ -3925,9 +4025,34 @@ class AIImportView(QWidget):
                     key, _, val = line.partition(":")
                     item[key.strip()] = val.strip()
 
-            if not item.get("title"):
+            inbox_idx = item.get("idx", "")
+            if not inbox_idx and not item.get("title"):
                 errors.append("title が空のエントリがあります")
                 continue
+
+            # --- Inbox チケットの振り分け（idx 指定）---
+            if inbox_idx:
+                if inbox_idx not in df.index:
+                    skipped.append(f"IDX が見つかりません: {inbox_idx}")
+                    continue
+                title = str(df.loc[inbox_idx, "title"])
+                if (str(df.loc[inbox_idx, "parent_id"]) != DB.INBOX_PARENT
+                        or inbox_idx not in inbox.index):
+                    skipped.append(f"振り分け済み（Inbox にありません）: {title}")
+                    continue
+                if inbox_idx in used_inbox:
+                    skipped.append(f"同じチケットが重複しています: {title}")
+                    continue
+                parent_idx = item.get("parent_idx", "")
+                if parent_idx not in df.index or str(df.loc[parent_idx, "node_type"]) != "task":
+                    skipped.append(f"移動先の Task がありません: {title}")
+                    continue
+                used_inbox.add(inbox_idx)
+                items.append({"kind": "move", "idx": inbox_idx, "title": title,
+                              "parent_idx": parent_idx})
+                continue
+
+            # --- 新規（従来形式）---
             if not item.get("parent_idx"):
                 errors.append(f"parent_idx が空: {item.get('title', '?')}")
                 continue
@@ -3940,9 +4065,22 @@ class AIImportView(QWidget):
                 errors.append(f"parent_idx の種別が task ではありません: {parent_idx} (title: {item.get('title')})")
                 continue
 
+            # idx の付け忘れ: タイトルが Inbox チケットと完全一致（1 件）なら移動扱い
+            key = LG.norm_key(item["title"])
+            same = [i for i in inbox.index
+                    if i not in used_inbox and LG.norm_key(inbox.loc[i, "title"]) == key]
+            if len(same) == 1:
+                used_inbox.add(same[0])
+                items.append({"kind": "move", "idx": same[0],
+                              "title": str(inbox.loc[same[0], "title"]),
+                              "parent_idx": parent_idx,
+                              "note": "IDX 指定なし・同名の Inbox チケットと判断"})
+                continue
+
+            item["kind"] = "new"
             items.append(item)
 
-        return items, errors
+        return items, errors, skipped
 
     # ── 日次スケジュール作成プロンプト ──
 

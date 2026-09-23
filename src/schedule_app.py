@@ -80,6 +80,10 @@ class AppConfig:
     pomodoro_work_minutes: int = 25
     pomodoro_break_minutes: int = 5
 
+    # [Inbox] Task 未設定チケットの上限件数・滞留とみなす日数
+    inbox_max_items: int = 10
+    inbox_stale_days: int = 3
+
     # [DisplayNames] - メールアドレス → 表示名 のマッピング
     display_names: Dict[str, str] = field(default_factory=dict)
 
@@ -170,6 +174,11 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
             "Pomodoro", "work_minutes", fallback=cfg.pomodoro_work_minutes)
         cfg.pomodoro_break_minutes = parser.getint(
             "Pomodoro", "break_minutes", fallback=cfg.pomodoro_break_minutes)
+
+    # [Inbox]
+    if parser.has_section("Inbox"):
+        cfg.inbox_max_items = parser.getint("Inbox", "max_items", fallback=cfg.inbox_max_items)
+        cfg.inbox_stale_days = parser.getint("Inbox", "stale_days", fallback=cfg.inbox_stale_days)
 
     # [DisplayNames]
     if parser.has_section("DisplayNames"):
@@ -638,6 +647,9 @@ def main() -> None:
     window.restore_ui_state()
     window.setWindowTitle(f"{APP_NAME}  [{config.get_display_name(config.username)}]")
     window.show()
+    # Inbox が上限到達・滞留のときだけ振り分け画面を出す（表示完了後に実行）
+    from PySide6.QtCore import QTimer
+    QTimer.singleShot(0, window.maybe_prompt_inbox)
 
     logger.info("メインウィンドウ表示完了")
     ret = app.exec()

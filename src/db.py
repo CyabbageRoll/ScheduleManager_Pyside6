@@ -17,6 +17,8 @@ import datetime
 NODE_TYPES = ["project1", "project2", "project3", "project4", "task", "ticket"]
 # ステータスの選択肢（deleted は論理削除用）
 STATUS_LIST = ["todo", "done", "cancel", "regularly", "deleted"]
+# Task 未設定チケット（Inbox）の parent_id。列を増やさず特別な親 ID で表す
+INBOX_PARENT = "inbox"
 # 各ノード種別の直下子種別マッピング（Ticketはキー無し → 子作成不可）
 CHILD_TYPE = {
     "project1": "project2",

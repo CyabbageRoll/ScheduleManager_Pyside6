@@ -222,6 +222,7 @@
   <a class="indent" href="#daily-export">当日ログmd出力</a>
   <a href="#detail-pane">🔎 詳細ペイン（レポート）</a>
   <a href="#pomodoro">🍅 ポモドーロタイマー</a>
+  <a href="#quick-add">＋ クイック追加・📥 Inbox</a>
   <a href="#plan-tab">🗺 Plan（ロードマップ）</a>
   <a href="#edit-tab">✏ Edit（データ編集）</a>
   <a class="indent" href="#edit-tree">階層ツリー</a>
@@ -334,6 +335,7 @@
   <tr><td>タブボタン群</td><td>各機能タブへの切替（下記参照）</td></tr>
   <tr><td><kbd>🔎 詳細</kbd></td><td>右側の詳細ペイン（ノード詳細＋レポート）の表示/非表示を切替（Main/Plan/Edit で有効）。<a href="#detail-pane">詳細</a></td></tr>
   <tr><td><kbd>📖 Manual</kbd></td><td>このマニュアルをブラウザで開く</td></tr>
+  <tr><td><kbd>📥 Inbox n</kbd></td><td>Task 未設定チケットの件数。クリックで振り分け画面。<a href="#inbox">詳細</a></td></tr>
   <tr><td><kbd>🍅 ポモドーロ</kbd></td><td>集中タイマー。終了時に実績を日次スケジュールへ自動記録。<a href="#pomodoro">詳細</a></td></tr>
 </table>
 
@@ -553,6 +555,39 @@
   既存予定があるスロットは上書き確認あり。記録は遅延保存なので <kbd>Ctrl+S</kbd> を忘れずに。
   作業/休憩時間は <a href="#config-tab">⚙ Config</a> → <code>[Pomodoro]</code> で変更できます。
 </div>
+
+<hr>
+
+<!-- ===================== クイック追加・Inbox ===================== -->
+<h2 id="quick-add">＋ クイック追加（Ctrl+N）と 📥 Inbox</h2>
+<p>どの画面からでも <kbd>Ctrl</kbd>+<kbd>N</kbd> で、1 行入力するだけでチケットを作成できます。入力の下に解釈結果がプレビュー表示されるので、確認してから <kbd>Enter</kbd> で作成します。</p>
+
+<table>
+  <tr><th>書き方</th><th>例</th><th>意味</th></tr>
+  <tr><td>工数</td><td><code>2h</code> <code>2.5</code> <code>30分</code> <code>1時間半</code></td><td>見積工数（15分単位に切上げ。整数だけの <code>3</code> はタイトル扱い → <code>3h</code> と入力）</td></tr>
+  <tr><td>納期</td><td><code>明日</code> <code>金</code> <code>来週水</code> <code>9/30</code> <code>5日</code> <code>月末</code> <code>今週中</code></td><td>曜日は今日を含む最も近い日。過去の月日は60日以内なら今年、それより前は来年</td></tr>
+  <tr><td>期間</td><td><code>9/28〜10/2</code></td><td>開始可能日〜納期</td></tr>
+  <tr><td>Task</td><td><code>@設計</code></td><td>候補から ↑↓ で選んで <kbd>Enter</kbd>。<strong>省略すると Inbox</strong></td></tr>
+  <tr><td>メモ</td><td><code>#先方確認済み</code></td><td>空白の後の <code>#</code> から行末まで（中身は解析しない）</td></tr>
+  <tr><td>そのまま</td><td><code>「水」</code></td><td>「」で囲んだ語は必ずタイトル</td></tr>
+</table>
+<p>入力例: <code>見積書レビュー 2h 金曜 @設計書 #先方確認済み</code>（全角文字・全角空白も使えます）</p>
+
+<div class="card tip">
+  <strong>✅ 朝のスケジュール入力と連携</strong>: Main タブの日次スケジュールで時間帯を選んだまま <kbd>Ctrl</kbd>+<kbd>N</kbd>（または右クリック「＋ 新しいチケットを作成して割り当て」）で、
+  作成と同時にその時間帯へ割り当てます。工数を省略すると選んだ時間が見積になります。
+</div>
+
+<h3 id="inbox">📥 Inbox（Task 未設定チケット）</h3>
+<ul>
+  <li>Edit ツリー先頭の <strong>📥 Inbox</strong>・ツールバーの <kbd>📥 Inbox n</kbd>・Today のバナーから確認できます</li>
+  <li>Inbox のチケットは <strong>done / regularly にできません</strong>（Task へ振り分けてから）。日次スケジュールへの割り当ては可能です</li>
+  <li>上限（<code>[Inbox] max_items</code>、既定10件）に達すると、クイック追加では <code>@Task</code> の指定が必須になります</li>
+  <li>上限到達、または <code>stale_days</code>（既定3日）を超えて残っている場合は、起動時に振り分け画面が開きます（1日1回）</li>
+  <li><strong>振り分け画面</strong>: 移動先 Task は過去のチケット名から自動提案（黄色）。経過日数は 3日超=橙・7日超=赤で表示</li>
+  <li>ツリーで Inbox のチケットを Task へドラッグしても振り分けられます</li>
+  <li><strong>AI で振り分け</strong>: AI取込の「プロンプトをコピー」に Inbox 一覧が付きます。LLM の返答を取り込むと、Inbox のチケットは<strong>新規作成されず移動</strong>します</li>
+</ul>
 
 <hr>
 
@@ -956,7 +991,10 @@ ticket_idx: ...</pre>
 <table>
   <tr><th>ショートカット</th><th>動作</th></tr>
   <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>保存（Edit タブの変更を DB に書き込む）</td></tr>
-  <tr><td><kbd>Ctrl</kbd>+<kbd>R</kbd></td><td>最新データを読み込み（未保存変更は破棄）</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>R</kbd></td><td>最新データを読み込み（未保存変更があれば 保存/破棄/キャンセル を確認）</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>N</kbd></td><td><a href="#quick-add">クイック追加</a>（1 行でチケット作成）</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>元に戻す（最後の保存・読込の時点まで）</td></tr>
+  <tr><td><kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>やり直し</td></tr>
   <tr><td><kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd></td><td>タブを切り替え（タブボタンの左から順）</td></tr>
 </table>
 
