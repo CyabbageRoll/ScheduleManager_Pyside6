@@ -611,6 +611,9 @@ def main() -> None:
         app.styleHints().setColorScheme(Qt.ColorScheme.Light)
     except AttributeError:
         pass
+    # 配色・共通スタイル（theme.py）
+    from theme import apply_app_theme
+    apply_app_theme(app)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
 

@@ -14,19 +14,8 @@ from PySide6.QtCore import Qt, QDate, Signal, QTimer
 from PySide6.QtGui import QColor, QFont
 
 from db import COLOR_OPTIONS
-
-# --- 定数 ---
-STYLE_BUTTON = (
-    "QPushButton { background: #ECEFF1; border: 1px solid #B0BEC5;"
-    " border-radius: 4px; padding: 4px 10px; }"
-    "QPushButton:hover { background: #CFD8DC; }"
-    "QPushButton:pressed { background: #B0BEC5; }"
-)
-STYLE_COMBO = (
-    "QComboBox { border: 1px solid #B0BEC5; border-radius: 4px;"
-    " padding: 3px 6px; background: white; }"
-)
-STYLE_LABEL_INFO = "QLabel { color: #546E7A; font-size: 10px; }"
+# 共通スタイルは theme.py に集約（既存の import 先を保つため再公開する）
+from theme import qss, STYLE_BUTTON, STYLE_COMBO, STYLE_LABEL_INFO
 
 
 class DateButton(QPushButton):
@@ -232,7 +221,7 @@ class InfoLabel(QLabel):
     def set_error(self, msg: str) -> None:
         """エラーメッセージを赤色で表示する"""
         self.setText(f"⚠ {msg}")
-        self.setStyleSheet("QLabel { color: #C62828; font-size: 10px; }")
+        self.setStyleSheet(qss("QLabel { color: @danger; font-size: 10px; }"))
 
 
 class AutoCombo(QComboBox):
@@ -286,10 +275,10 @@ class ScrollableTable(QTableWidget):
         self.verticalHeader().setVisible(False)
         self.horizontalHeader().setStretchLastSection(True)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.setStyleSheet(
-            "QTableWidget { gridline-color: #E0E0E0; }"
-            "QTableWidget::item:selected { background: #B3E5FC; color: black; }"
-        )
+        self.setStyleSheet(qss(
+            "QTableWidget { gridline-color: @border_light; }"
+            "QTableWidget::item:selected { background: @select_bg; color: @text_on_select; }"
+        ))
         if col_widths:
             for i, w in enumerate(col_widths):
                 if i < len(columns):
