@@ -387,7 +387,7 @@
 
 <div class="card info">
   <strong>💡 起動時のタブを変えるには</strong><br>
-  <a href="#config-tab">⚙ Config タブ</a> → <code>[GUI] start_tab</code> を <code>today / main / edit / plan</code> から選択（既定は <code>today</code>）。
+  <a href="#config-tab">⚙ Config タブ</a> → <code>[GUI] start_tab</code> のプルダウンで Today / Main / Plan / Edit / 前回終了時のタブ から選択（既定は Today）。
 </div>
 
 <hr>
@@ -770,7 +770,7 @@
   <tr><td>キーワード</td><td>タイトル・メモを全文検索</td></tr>
   <tr><td>担当者</td><td>全員 または 特定メンバーで絞り込み</td></tr>
   <tr><td>ステータス</td><td>複数チェックで OR 検索（例: Todo ✓ Done ✓）</td></tr>
-  <tr><td>更新日範囲</td><td>指定期間内に更新されたものを抽出</td></tr>
+  <tr><td>期間</td><td>📅 ボタンを押すとカレンダーが開きます。◀▶ で 1 日ずつ移動、✕ で未設定に戻します。指定期間内に作業したものを抽出</td></tr>
 </table>
 
 <h4>ボタン</h4>
@@ -917,17 +917,23 @@ ticket_idx: ...</pre>
 
 <!-- ===================== Analyze タブ ===================== -->
 <h2 id="analyze-tab">📈 Analyze タブ（工数分析）</h2>
-<p>指定期間の工数状況を集計・分析します。</p>
+<p>見積と実績の工数を棒グラフで比較します。条件を変えると<strong>自動で再集計</strong>されます（集計ボタンはありません）。</p>
 
-<h4>分析内容（「集計」ボタン）</h4>
+<h4>集計条件</h4>
 <table>
-  <tr><th>集計</th><th>説明</th></tr>
-  <tr><td>担当者別 実績工数</td><td>誰がどれくらい作業したかを比較</td></tr>
-  <tr><td>Project 別 実績工数</td><td>プロジェクトごとの工数配分</td></tr>
-  <tr><td>見積 vs 実績（超過チケット）</td><td>実績が見積を超えているチケットを一覧表示（要注意チケット）</td></tr>
+  <tr><th>項目</th><th>使い方</th></tr>
+  <tr><td>表示アイテム</td><td>左のツリーでチェックしたプロジェクト・Task の配下だけを集計します（チェックなし＝全対象）。親にチェックすると子もまとめて選ばれます。上の欄に名前の一部を入れると絞り込めます。「チェックを全解除」で全対象に戻ります</td></tr>
+  <tr><td>集計レベル</td><td>棒 1 本を P1〜Task・Ticket のどの単位にするか</td></tr>
+  <tr><td>人物</td><td>丸ボタンで人を選択・解除（紫＝選択中）。「全員」「自分だけ」でまとめて切替</td></tr>
+  <tr><td>期間</td><td>全期間 / 今週 / 先週 / 今月 / 先月 / 今年度（4 月始まり）、または 📅 で任意の期間。<strong>期間を選ぶと、実績は期間内に日次スケジュールへ入れた時間、見積はそのチケットの見積全体</strong>になり、期間内に作業したチケットだけが対象になります</td></tr>
+  <tr><td>見積を表示</td><td>オフにすると実績の棒だけを表示します</td></tr>
 </table>
 
-<p>期間は画面上部の日付入力で指定します（デフォルト: 当月1日〜今日）。</p>
+<h4>ドリルダウン</h4>
+<p>グラフの棒をクリックすると、その中身を 1 つ下の階層（例: P1 → Task）で集計し直します。「◀ 戻る」で元の表示に戻ります。</p>
+
+<h4>見積 vs 実績（超過チケット）</h4>
+<p>実績が見積を超えているチケット（要注意チケット）を一覧表示します。自分のチケットはメモ欄をダブルクリックで編集できます。</p>
 
 <h3 id="analyze-personal">🔍 個人振り返り</h3>
 <p>「🔍 個人振り返り」ボタンで、時間の使い方と見積精度を可視化します。<strong>集計対象は画面上部で選択中のメンバー</strong>です。</p>
@@ -936,7 +942,7 @@ ticket_idx: ...</pre>
   <li><strong>見積 vs 実績の散布図</strong>（完了チケット）: 対角線より上＝見積より時間がかかった</li>
   <li>サマリー: 「実績÷見積 平均 1.25」のような指標</li>
 </ul>
-<p>「集計」ボタンを押せば従来の工数分析に戻ります。</p>
+<p>条件（人物・期間など）を変えると通常の工数分析に戻ります。</p>
 
 <hr>
 
@@ -963,7 +969,7 @@ ticket_idx: ...</pre>
   <tr><td>[Database]</td><td>DB 保存フォルダのパス</td></tr>
   <tr><td>[User]</td><td>自分のユーザー名、チームメンバー一覧</td></tr>
   <tr><td>[DisplayNames]</td><td>ユーザー名 → 画面表示名のマッピング</td></tr>
-  <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ、<code>start_tab</code>（起動時タブ: today/main/edit/plan）、<code>detail_pane</code>（詳細ペインの起動時開閉: open/closed）</td></tr>
+  <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ、<code>start_tab</code>（起動時タブ: Today/Main/Plan/Edit/前回終了時。プルダウンで選択）、<code>detail_pane</code>（詳細ペインの起動時開閉: open/closed）</td></tr>
   <tr><td>[Schedule]</td><td>営業時間（始業・終業）、1日の標準作業時間、休日</td></tr>
   <tr><td>[DailyInfoCombo]</td><td>健・場・安・残 の選択肢リスト</td></tr>
   <tr><td>[Report]</td><td><code>output_dir</code>: レポート・当日ログの Markdown 出力先フォルダ</td></tr>

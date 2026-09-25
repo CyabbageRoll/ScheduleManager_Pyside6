@@ -539,8 +539,8 @@ def test_search_view(win, task_idx, ticket_idx):
 
     # 日付範囲指定時に 期間実績(h) 列（列11）が数値 or "0.0" を表示
     try:
-        search_view.f_from.setText(today)
-        search_view.f_to.setText(today)
+        search_view.f_from.set_date(today)
+        search_view.f_to.set_date(today)
         search_view._on_search()
         rows = search_view.result_table.rowCount()
         for r in range(rows):
@@ -550,8 +550,8 @@ def test_search_view(win, task_idx, ticket_idx):
             assert val != "-", f"行{r}: 期間実績が '-' のまま"
         ok(f"日付範囲指定時 期間実績(h)列 に数値表示（{rows}行）")
         # フィールドをリセット
-        search_view.f_from.setText("")
-        search_view.f_to.setText("")
+        search_view.f_from.set_date("")
+        search_view.f_to.set_date("")
     except Exception as e:
         ng("期間実績(h)列 表示確認", e)
 
@@ -1853,6 +1853,12 @@ def test_ui_state(state, version, win, tmpdir):
         win._switch_view(IDX_ROADMAP)
         win.main_pane.splitter.setSizes([400, 800])
         edit_sizes = win.main_pane.splitter.sizes()
+        # ガントのタイトル列幅: 再構築しても保たれ、次回起動時にも戻る
+        gv = win.gantt_view
+        gv.table.setColumnWidth(1, 257)
+        gv._rebuild_table()
+        assert gv.table.columnWidth(1) == 257, f"再構築でタイトル列幅が戻った {gv.table.columnWidth(1)}"
+        ok("ガントのタイトル列幅が再構築後も保たれる")
         state.nodes_modified = False
         state.schedule_modified = False
         win.save_ui_state()
@@ -1866,6 +1872,8 @@ def test_ui_state(state, version, win, tmpdir):
         assert win2.stack.currentIndex() == IDX_ROADMAP, "前回のタブで開かない"
         assert win2.detail_toggle_btn.isChecked(), "詳細ペインの開閉が戻らない"
         assert win2.gantt_view._get_status_filter() == "all"
+        win2.gantt_view._rebuild_table()
+        assert win2.gantt_view.table.columnWidth(1) == 257, "ガントの列幅が次回起動時に戻らない"
         rv = win2.road_view
         assert (rv._current_level, rv._cell_unit, rv._filter_own, rv._date_col_extra) \
             == ("Task", "月", True, 15), "Plan の表示設定が戻らない"
@@ -1891,6 +1899,128 @@ def test_ui_state(state, version, win, tmpdir):
             w.deleteLater()
     except Exception as e:
         ng("画面状態の保存・復元", e)
+
+
+def test_requests_0925(win):
+    """2026-09-25 要望: Config の start_tab 選択式・検索の日付カレンダー"""
+    print("\n[要望0925] Config / 検索の日付テスト")
+    from PySide6.QtWidgets import QComboBox
+    try:
+        cv = win.config_view
+        w = cv._fields["gui_start_tab"]
+        assert isinstance(w, QComboBox), type(w)
+        assert [w.itemData(i) for i in range(w.count())] == ["today", "main", "plan", "edit", "last"]
+        w.setCurrentIndex(w.findData("last"))
+        assert cv._get("gui_start_tab") == "last"
+        cv.refresh()   # config の値（today）に戻る
+        assert cv._get("gui_start_tab") == win.state.config.start_tab
+        ok("Config の start_tab が選択式（保存値は today/main/plan/edit/last）")
+    except Exception as e:
+        ng("start_tab 選択式", e)
+    try:
+        sv = win.search_view
+        from ui_widgets import DateButton
+        assert isinstance(sv.f_from, DateButton) and isinstance(sv.f_to, DateButton)
+        sv.f_from.set_date("")
+        sv._shift_date(sv.f_from, +1)
+        assert sv.f_from.get_date() == (datetime.date.today() + datetime.timedelta(days=1)).isoformat()
+        sv.f_from.clear_date()
+        assert sv.f_from.get_date() == ""
+        ok("検索の期間はカレンダーボタン（◀▶ で 1 日移動・✕ で未設定）")
+    except Exception as e:
+        ng("検索の日付カレンダー", e)
+
+
+def test_analysis_0925(win, pj_idx, task_idx, ticket_idx):
+    """2026-09-25 要望: Analyze（期間・人物・チェック式ツリー・自動再集計・ドリルダウン）"""
+    print("\n[要望0925] Analyze テスト")
+    import logic as LG
+    anal = win.anal_view
+    state = win.state
+    try:
+        T = datetime.date(2026, 9, 25)  # 金曜
+        P = lambda n: LG.analysis_period(n, T)
+        assert P("全期間") == ("", "")
+        assert P("今週") == ("2026-09-21", "2026-09-27")
+        assert P("先週") == ("2026-09-14", "2026-09-20")
+        assert P("今月") == ("2026-09-01", "2026-09-30")
+        assert P("先月") == ("2026-08-01", "2026-08-31")
+        assert P("今年度") == ("2026-04-01", "2027-03-31")
+        assert LG.analysis_period("今年度", datetime.date(2027, 2, 1)) == ("2026-04-01", "2027-03-31")
+        ok("期間プリセット（週は月曜始まり・年度は 4 月始まり）")
+    except Exception as e:
+        ng("期間プリセット", e)
+    try:
+        anal.refresh()
+        anal._select_me_only()
+        assert anal._selected_users() == {state.user}
+        assert anal._recalc_timer.isActive(), "条件変更で再集計が予約されない"
+        anal._select_all_users()
+        assert anal._selected_users() is None
+        ok("人物: 自分だけ／全員 ボタン・変更で自動再集計")
+    except Exception as e:
+        ng("人物の選択", e)
+    try:
+        # 今日のスロットに自分のチケットを 1 時間割り当て → 期間「今日」の実績は 1.0h
+        panel = win.schedule_panel
+        state.current_date = datetime.date.today().isoformat()
+        panel.refresh()
+        panel._assign_to_rows([48, 49, 50, 51], ticket_idx)
+        today = datetime.date.today().isoformat()
+        anal._level_btns["ticket"].setChecked(True)
+        anal._on_period_preset("全期間")
+        anal.p_from.set_date(today); anal.p_to.set_date(today)
+        agg = anal.aggregate()
+        expect = LG.calc_period_hours(state.df_daily, [ticket_idx], today, today)[ticket_idx]
+        assert ticket_idx in agg and abs(agg[ticket_idx]["actual"] - expect) < 1e-9, agg
+        est = float(state.df_nodes.loc[ticket_idx, "estimated_hours"] or 0)
+        assert agg[ticket_idx]["est"] == est, "期間指定時の見積はチケットの見積全体"
+        assert all(v["actual"] > 0 for v in agg.values()), "期間内に作業の無いチケットが混ざる"
+        ok(f"期間指定: 実績は期間内の分（{expect}h）・見積は全体")
+        anal._on_period_custom()
+        assert not any(b.isChecked() for b in anal._period_btns.values()), "任意期間なのにプリセットが選択中"
+        anal._on_period_preset("全期間")
+        assert anal._period() == ("", "")
+        ok("カレンダーで任意期間にするとプリセットの選択が外れる")
+    except Exception as e:
+        ng("期間指定の集計", e)
+    try:
+        anal._level_btns["project1"].setChecked(True)
+        anal._set_checked_ids({task_idx})
+        assert task_idx in anal._checked_ids()
+        agg = anal.aggregate()
+        assert list(agg) == [pj_idx], agg
+        anal._clear_checks()
+        assert anal._checked_ids() == set()
+        anal._tree_search.setText("存在しない名前")
+        vis = [it for it in anal._iter_tree_items() if not it.isHidden()]
+        assert not vis, "絞り込みで一致しない行が表示されている"
+        anal._tree_search.setText("")
+        ok("表示アイテム: チェックで対象を絞る・全解除・名前で絞り込み")
+    except Exception as e:
+        ng("表示アイテムの選択", e)
+    try:
+        anal._level_btns["project1"].setChecked(True)
+        anal._calc()
+        anal.drill_down(pj_idx)
+        assert anal._current_level_type() == "task", anal._current_level_type()  # P2〜P4 を使わない PJ
+        assert anal._checked_ids() >= {pj_idx} and anal._back_btn.isEnabled()
+        anal._drill_back()
+        assert anal._current_level_type() == "project1" and not anal._checked_ids()
+        assert not anal._back_btn.isEnabled()
+        ok("棒クリックのドリルダウン（実在する次の階層へ）と戻る")
+    except Exception as e:
+        ng("ドリルダウン", e)
+    try:
+        anal._show_est_cb.setChecked(False)
+        anal._calc()
+        assert len(anal._ax.containers) == 1, "見積を隠しても棒が 2 系列ある"
+        anal._show_est_cb.setChecked(True)
+        anal._calc()
+        assert len(anal._ax.containers) == 2
+        ok("見積の表示／非表示の切り替え")
+    except Exception as e:
+        ng("見積の表示切替", e)
 
 
 def test_theme():
@@ -1975,6 +2105,8 @@ def main():
             test_save_load(state)
             test_ui_state(state, version, win, tmpdir)
             test_theme()
+            test_requests_0925(win)
+            test_analysis_0925(win, pj_idx, task_idx, ticket_idx)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

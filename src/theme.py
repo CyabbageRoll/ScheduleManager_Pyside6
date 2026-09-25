@@ -154,6 +154,18 @@ STYLE_COMBO = qss(
     " padding: 3px 6px; background: @surface; }"
 )
 STYLE_LABEL_INFO = qss("QLabel { color: @text_sub; font-size: 10px; }")
+# 丸いトグルボタン（メンバー切替・分析の人物/期間など。選択中は淡い紫）
+STYLE_CHIP = qss(
+    "QPushButton {"
+    " background: transparent; color: @text_sub;"
+    " border: 1px solid @border; border-radius: 8px;"
+    " padding: 3px 12px; font-size: 8pt; }"
+    "QPushButton:checked {"
+    " background: @accent_bg; color: @accent_dark;"
+    " border: 1px solid @accent_border; }"
+    "QPushButton:hover:!checked {"
+    " background: @control_hover; }"
+)
 
 
 # ── アプリ全体のスタイル（個別指定の無い部品に効く）──

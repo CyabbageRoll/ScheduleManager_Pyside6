@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QStyledItemDelegate, QPlainTextEdit,
     QApplication, QGridLayout,
 )
-from PySide6.QtCore import Qt, Signal, QDate
+from PySide6.QtCore import Qt, Signal, QDate, QTimer
 from PySide6.QtGui import QColor, QFont, QAction, QCursor, QPen
 from PySide6.QtWidgets import QToolTip
 
@@ -30,7 +30,7 @@ from ui_widgets import (
     DateButton, UserCombo, ButtonRow, InfoLabel, AutoCombo,
     ScrollableTable, Separator, COLOR_OPTIONS, STYLE_BUTTON,
 )
-from theme import C, qss, LEVEL_BG, LEVEL_FG
+from theme import C, qss, LEVEL_BG, LEVEL_FG, STYLE_CHIP, STYLE_LABEL_INFO
 
 
 # ---------- 項目4: ガントチャートセル用デリゲート ----------
@@ -78,6 +78,9 @@ class GanttView(QWidget):
         super().__init__()
         self.state = state
         self._date_range: list = []   # 表示日付リスト (datetime.date)
+        # 固定列の幅（ユーザーがドラッグした幅を再構築後も保つ。終了時に保存）
+        self.fixed_col_widths: list = [60, 180, 60, 70, 45]
+        self._rebuilding = False
         self._initial_pj: str = ""    # 前回終了時の Project 選択（初回 refresh で適用）
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -147,6 +150,7 @@ class GanttView(QWidget):
         self.table.cellClicked.connect(self._on_cell_clicked)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
+        self.table.horizontalHeader().sectionResized.connect(self._on_section_resized)
         self.table.setMouseTracking(True)
         self.table.viewport().setMouseTracking(True)
         self.table.cellEntered.connect(self._on_cell_entered)
@@ -376,6 +380,11 @@ class GanttView(QWidget):
 
         return result
 
+    def _on_section_resized(self, col: int, _old: int, new: int) -> None:
+        """固定列の幅をドラッグで変えたら記憶する（再構築・タブ切替で元に戻さない）"""
+        if not self._rebuilding and col < self._FIXED_COLS and new > 0:
+            self.fixed_col_widths[col] = new
+
     def refresh(self) -> None:
         df = self.state.df_nodes
         # Project1 コンボ更新
@@ -440,18 +449,17 @@ class GanttView(QWidget):
 
         # カラム設定（固定情報列 + 日付列）
         total_cols = self._FIXED_COLS + len(date_list)
+        self._rebuilding = True   # 列数変更に伴う幅変化を記憶しない
         self.table.setColumnCount(total_cols)
         headers = ["種別", "タイトル", "ステータス", "担当者", "見積h"]
         for d in date_list:
             headers.append(f"{d.month}/{d.day}\n{['月','火','水','木','金','土','日'][d.weekday()]}")
         self.table.setHorizontalHeaderLabels(headers)
-        self.table.setColumnWidth(0, 60)
-        self.table.setColumnWidth(1, 180)
-        self.table.setColumnWidth(2, 60)
-        self.table.setColumnWidth(3, 70)
-        self.table.setColumnWidth(4, 45)
+        for c, w in enumerate(self.fixed_col_widths):
+            self.table.setColumnWidth(c, w)
         for c in range(self._FIXED_COLS, total_cols):
             self.table.setColumnWidth(c, self._COL_WIDTH_DATE)
+        self._rebuilding = False
         # 列幅はマウス操作で変更可能（Interactive）
         for c in range(total_cols):
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
@@ -1748,16 +1756,26 @@ class RoadmapView(QWidget):
 class AnalysisView(QWidget):
     """
     工数分析タブ。
-    集計レベル（P1〜Task）・親ノード・ユーザーを選択して棒グラフで工数を可視化し、
-    超過チケット一覧を表示する。
+    表示アイテム（チェック式ツリー）・集計レベル・人物・期間を選ぶと自動で再集計し、
+    棒グラフ（見積/実績）と超過チケット一覧を表示する。棒をクリックすると 1 階層下を集計する。
     """
 
     # ノード階層の順序
     _LEVEL_ORDER = ["project1", "project2", "project3", "project4", "task", "ticket"]
+    _LEVEL_LABEL = {"project1": "P1", "project2": "P2", "project3": "P3",
+                    "project4": "P4", "task": "Task", "ticket": "Ticket"}
 
     def __init__(self, state):
         super().__init__()
         self.state = state
+        self._suspend = False          # まとめて変更する間は再集計しない
+        self._drill_stack: list = []   # ドリルダウン前の状態 [(level, checked_set, 表示名)]
+        self._drill_path: list = []    # 表示中のドリルダウン経路（タイトル）
+        self._bar_ids: list = []       # 棒グラフの並び順の IDX（クリック判定用）
+        self._recalc_timer = QTimer(self)
+        self._recalc_timer.setSingleShot(True)
+        self._recalc_timer.setInterval(120)
+        self._recalc_timer.timeout.connect(self._calc)
 
         # matplotlib を遅延インポート（起動時のオーバーヘッドを避ける）
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -1776,80 +1794,134 @@ class AnalysisView(QWidget):
         layout.addWidget(QLabel("📈 工数分析"))
         layout.addWidget(Separator())
 
-        # ── コントロールパネル（左右 2 ペイン構成）─────────
+        # ── コントロールパネル（左: 表示アイテム / 右: 条件）─────────
         ctrl_box = QGroupBox("集計設定")
         ctrl_h = QHBoxLayout(ctrl_box)
 
-        # ── 左ペイン: フィルタツリー ─────────────────────
-        filter_box = QGroupBox("フィルター（未選択 = 全対象）")
+        # ── 左ペイン: 表示アイテム（チェック式ツリー＋絞り込み）─────
+        filter_box = QGroupBox("表示アイテム（チェックなし = 全対象）")
         filter_vlay = QVBoxLayout(filter_box)
+        find_row = QHBoxLayout()
+        self._tree_search = QLineEdit()
+        self._tree_search.setPlaceholderText("🔍 絞り込み（名前の一部）")
+        self._tree_search.setClearButtonEnabled(True)
+        self._tree_search.textChanged.connect(self._apply_tree_search)
+        find_row.addWidget(self._tree_search, stretch=1)
+        clear_btn = QPushButton("チェックを全解除")
+        clear_btn.setStyleSheet(STYLE_BUTTON)
+        clear_btn.clicked.connect(self._clear_checks)
+        find_row.addWidget(clear_btn)
+        filter_vlay.addLayout(find_row)
         self._filter_tree = QTreeWidget()
         self._filter_tree.setColumnCount(1)
         self._filter_tree.setHeaderLabels(["ノード階層"])
         self._filter_tree.header().setStretchLastSection(True)
-        self._filter_tree.setSelectionMode(
-            QAbstractItemView.SelectionMode.ExtendedSelection)
         self._filter_tree.setIndentation(16)
         self._filter_tree.setStyleSheet(qss("""
             QTreeWidget { border: 1px solid @border; }
             QTreeWidget::item { padding: 2px 2px; }
             QTreeWidget::item:selected { background: @select_bg; color: @text_on_select; }
         """))
+        self._filter_tree.itemChanged.connect(self._on_tree_item_changed)
         filter_vlay.addWidget(self._filter_tree)
         ctrl_h.addWidget(filter_box, stretch=1)
 
-        # ── 右ペイン: 集計設定コントロール ───────────────
-        right_vlay = QVBoxLayout()
-        right_vlay.setSpacing(8)
+        # ── 右ペイン: 集計条件 ───────────────────────────────
+        right = QFormLayout()
+        right.setSpacing(8)
 
         # 集計レベル（P1〜Ticket の 6 択）
         level_row = QHBoxLayout()
-        level_row.addWidget(QLabel("集計レベル:"))
         self._level_btns: dict[str, QRadioButton] = {}
         self._level_grp = QButtonGroup(self)
-        for lbl, typ in [("P1", "project1"), ("P2", "project2"),
-                          ("P3", "project3"), ("P4", "project4"),
-                          ("Task", "task"), ("Ticket", "ticket")]:
-            rb = QRadioButton(lbl)
+        for typ in self._LEVEL_ORDER:
+            rb = QRadioButton(self._LEVEL_LABEL[typ])
             self._level_btns[typ] = rb
             self._level_grp.addButton(rb)
             level_row.addWidget(rb)
         self._level_btns["project1"].setChecked(True)
+        self._level_grp.buttonToggled.connect(lambda _b, on: on and self._schedule_calc())
         level_row.addStretch()
-        right_vlay.addLayout(level_row)
+        right.addRow("集計レベル:", level_row)
 
-        # ユーザー選択
+        # 人物（全員 / 自分だけ ＋ 丸ボタンで個別に選択・解除）
         user_row = QHBoxLayout()
-        user_row.addWidget(QLabel("ユーザー:"))
-        self._all_user_cb = QCheckBox("全員")
-        self._all_user_cb.setChecked(True)
-        self._all_user_cb.stateChanged.connect(self._on_all_user_toggled)
-        user_row.addWidget(self._all_user_cb)
-        self._user_checks: dict[str, QCheckBox] = {}
+        user_row.setSpacing(4)
+        for text, slot in [("全員", self._select_all_users), ("自分だけ", self._select_me_only)]:
+            b = QPushButton(text)
+            b.setStyleSheet(STYLE_BUTTON)
+            b.clicked.connect(slot)
+            user_row.addWidget(b)
+        user_row.addWidget(QLabel("│"))
+        self._user_btns: dict[str, QPushButton] = {}
         for m in state.members:
-            cb = QCheckBox(state.display_name(m))
-            cb.setChecked(True)
-            cb.stateChanged.connect(self._on_user_check_changed)
-            user_row.addWidget(cb)
-            self._user_checks[m] = cb
+            b = QPushButton(state.display_name(m))
+            b.setCheckable(True)
+            b.setChecked(True)
+            b.setStyleSheet(STYLE_CHIP)
+            b.toggled.connect(lambda _on: self._schedule_calc())
+            user_row.addWidget(b)
+            self._user_btns[m] = b
         user_row.addStretch()
-        right_vlay.addLayout(user_row)
+        right.addRow("人物:", user_row)
 
-        # 集計ボタン
-        calc_btn = QPushButton("集計")
-        calc_btn.setStyleSheet(STYLE_BUTTON)
-        calc_btn.clicked.connect(self._calc)
-        right_vlay.addWidget(calc_btn)
+        # 期間（プリセット ＋ カレンダーで任意指定）
+        period_row = QHBoxLayout()
+        period_row.setSpacing(4)
+        self._period_btns: dict[str, QPushButton] = {}
+        self._period_grp = QButtonGroup(self)
+        self._period_grp.setExclusive(True)
+        for name in LG.ANALYSIS_PERIODS:
+            b = QPushButton(name)
+            b.setCheckable(True)
+            b.setStyleSheet(STYLE_CHIP)
+            b.clicked.connect(lambda _=False, n=name: self._on_period_preset(n))
+            self._period_grp.addButton(b)
+            period_row.addWidget(b)
+            self._period_btns[name] = b
+        self._period_btns["全期間"].setChecked(True)
+        period_row.addStretch()
+        right.addRow("期間:", period_row)
+        date_row = QHBoxLayout()
+        self.p_from = DateButton(allow_empty=True)
+        self.p_to = DateButton(allow_empty=True)
+        self.p_from.date_changed.connect(self._on_period_custom)
+        self.p_to.date_changed.connect(self._on_period_custom)
+        date_row.addWidget(self.p_from)
+        date_row.addWidget(QLabel("〜"))
+        date_row.addWidget(self.p_to)
+        date_row.addStretch()
+        right.addRow("", date_row)
+
+        # 表示オプション
+        self._show_est_cb = QCheckBox("見積を表示")
+        self._show_est_cb.setChecked(True)
+        self._show_est_cb.toggled.connect(lambda _on: self._schedule_calc())
+        right.addRow("表示:", self._show_est_cb)
+
+        # ドリルダウン（棒クリック）の戻る＋現在位置
+        drill_row = QHBoxLayout()
+        self._back_btn = QPushButton("◀ 戻る")
+        self._back_btn.setStyleSheet(STYLE_BUTTON)
+        self._back_btn.setEnabled(False)
+        self._back_btn.clicked.connect(self._drill_back)
+        drill_row.addWidget(self._back_btn)
+        self._drill_lbl = QLabel("棒をクリックすると 1 つ下の階層を表示します")
+        self._drill_lbl.setStyleSheet(STYLE_LABEL_INFO)
+        drill_row.addWidget(self._drill_lbl, stretch=1)
+        right.addRow("", drill_row)
+
         # 個人振り返りボタン（自分の週別工数配分と見積精度）
         personal_btn = QPushButton("🔍 個人振り返り")
         personal_btn.setStyleSheet(STYLE_BUTTON)
         personal_btn.setToolTip("自分の直近4週の投入工数（Project1 別）と\n"
                                 "完了チケットの見積精度を表示します")
         personal_btn.clicked.connect(self._calc_personal)
-        right_vlay.addWidget(personal_btn)
-        right_vlay.addStretch()
+        right.addRow("", personal_btn)
 
-        ctrl_h.addLayout(right_vlay, stretch=1)
+        right_w = QWidget()
+        right_w.setLayout(right)
+        ctrl_h.addWidget(right_w, stretch=1)
         layout.addWidget(ctrl_box)
 
         # ── 棒グラフ ───────────────────────────────────────
@@ -1857,6 +1929,7 @@ class AnalysisView(QWidget):
         self._ax = self._fig.add_subplot(111)
         self._canvas = FigureCanvasQTAgg(self._fig)
         self._canvas.setMinimumHeight(220)
+        self._canvas.mpl_connect("button_press_event", self._on_chart_click)
         layout.addWidget(self._canvas, stretch=2)
 
         layout.addWidget(Separator())
@@ -1875,22 +1948,54 @@ class AnalysisView(QWidget):
         self.info = InfoLabel()
         layout.addWidget(self.info)
 
-    # ── ユーザー選択ヘルパー ─────────────────────────────
+    # ── 条件変更 → 自動再集計 ───────────────────────────
 
-    def _on_all_user_toggled(self, state: int) -> None:
-        """全員チェック変化 → 個別チェックに同期"""
-        checked = bool(state)
-        for cb in self._user_checks.values():
-            cb.blockSignals(True)
-            cb.setChecked(checked)
-            cb.blockSignals(False)
+    def _schedule_calc(self) -> None:
+        """条件変更のたびに少し待ってから 1 回だけ再集計する（連続変更をまとめる）"""
+        if not self._suspend:
+            self._recalc_timer.start()
 
-    def _on_user_check_changed(self) -> None:
-        """個別ユーザーチェック変化 → 全員チェックを更新"""
-        all_checked = all(cb.isChecked() for cb in self._user_checks.values())
-        self._all_user_cb.blockSignals(True)
-        self._all_user_cb.setChecked(all_checked)
-        self._all_user_cb.blockSignals(False)
+    def _selected_users(self) -> Optional[set]:
+        """選択中の人物（全員なら None）"""
+        chosen = {m for m, b in self._user_btns.items() if b.isChecked()}
+        return None if len(chosen) == len(self._user_btns) else chosen
+
+    def _set_users(self, members: set) -> None:
+        self._suspend = True
+        for m, b in self._user_btns.items():
+            b.setChecked(m in members)
+        self._suspend = False
+        self._schedule_calc()
+
+    def _select_all_users(self) -> None:
+        self._set_users(set(self._user_btns))
+
+    def _select_me_only(self) -> None:
+        self._set_users({self.state.user})
+
+    def _on_period_preset(self, name: str) -> None:
+        d_from, d_to = LG.analysis_period(name)
+        self._suspend = True
+        self.p_from.set_date(d_from)
+        self.p_to.set_date(d_to)
+        self._suspend = False
+        self._period_btns[name].setChecked(True)
+        self._schedule_calc()
+
+    def _on_period_custom(self, _date: str = "") -> None:
+        """カレンダーで日付を変えたらプリセットの選択を外す（どれにも一致しない任意期間）"""
+        if self._suspend:
+            return
+        cur = (self.p_from.get_date(), self.p_to.get_date())
+        match = next((n for n in LG.ANALYSIS_PERIODS if LG.analysis_period(n) == cur), None)
+        self._period_grp.setExclusive(False)
+        for n, b in self._period_btns.items():
+            b.setChecked(n == match)
+        self._period_grp.setExclusive(True)
+        self._schedule_calc()
+
+    def _period(self) -> tuple:
+        return self.p_from.get_date(), self.p_to.get_date()
 
     # ── レベル選択ヘルパー ───────────────────────────────
 
@@ -1900,10 +2005,62 @@ class AnalysisView(QWidget):
                 return typ
         return "project1"
 
-    # ── フィルタツリー ───────────────────────────────────
+    # ── 表示アイテム（チェック式ツリー）─────────────────────
+
+    def _iter_tree_items(self):
+        """ツリーの全アイテムを親→子の順に返す"""
+        stack = [self._filter_tree.topLevelItem(i)
+                 for i in range(self._filter_tree.topLevelItemCount())][::-1]
+        while stack:
+            it = stack.pop()
+            yield it
+            stack.extend(it.child(i) for i in range(it.childCount() - 1, -1, -1))
+
+    def _checked_ids(self) -> set:
+        return {it.data(0, Qt.ItemDataRole.UserRole) for it in self._iter_tree_items()
+                if it.checkState(0) == Qt.CheckState.Checked}
+
+    def _set_checked_ids(self, ids: set) -> None:
+        """指定 IDX だけにチェックを付ける（子は自動でチェック、親は部分チェック）"""
+        self._suspend = True
+        self._filter_tree.blockSignals(True)
+        for it in self._iter_tree_items():
+            it.setCheckState(0, Qt.CheckState.Unchecked)
+        self._filter_tree.blockSignals(False)
+        for it in self._iter_tree_items():
+            if it.data(0, Qt.ItemDataRole.UserRole) in ids:
+                it.setCheckState(0, Qt.CheckState.Checked)   # 自動 tristate で子・親へ反映
+        self._suspend = False
+
+    def _clear_checks(self) -> None:
+        self._set_checked_ids(set())
+        self._schedule_calc()
+
+    def _on_tree_item_changed(self, _item, column: int) -> None:
+        if column == 0:
+            self._schedule_calc()
+
+    def _apply_tree_search(self, text: str) -> None:
+        """名前に text を含む行と、その親だけを表示する（空なら全表示）"""
+        q = text.strip().lower()
+
+        def visit(it) -> bool:
+            child_hit = False
+            for i in range(it.childCount()):
+                child_hit = visit(it.child(i)) or child_hit
+            hit = not q or q in it.text(0).lower() or child_hit
+            it.setHidden(not hit)
+            if q and child_hit:
+                it.setExpanded(True)
+            return hit
+
+        for i in range(self._filter_tree.topLevelItemCount()):
+            visit(self._filter_tree.topLevelItem(i))
 
     def _build_filter_tree(self) -> None:
-        """フィルタツリーを再構築する（P1→Task の階層、ticket は除外）"""
+        """フィルタツリーを再構築する（P1→Task の階層、ticket は除外）。チェックは引き継ぐ"""
+        keep = self._checked_ids()
+        self._filter_tree.blockSignals(True)
         self._filter_tree.clear()
         df = self.state.df_nodes
         df_active = df[df["status"] != "deleted"]
@@ -1913,6 +2070,10 @@ class AnalysisView(QWidget):
             self._setup_filter_item(item, str(idx), row)
             self._build_filter_subtree(item, df_active, str(idx))
         self._filter_tree.expandAll()
+        self._filter_tree.blockSignals(False)
+        if keep:
+            self._set_checked_ids(keep)
+        self._apply_tree_search(self._tree_search.text())
 
     def _build_filter_subtree(self, parent_item: QTreeWidgetItem,
                                df: "pd.DataFrame", parent_id: str) -> None:
@@ -1927,7 +2088,7 @@ class AnalysisView(QWidget):
             self._build_filter_subtree(item, df, str(idx))
 
     def _setup_filter_item(self, item: QTreeWidgetItem, idx: str, row) -> None:
-        """ツリーアイテムのラベル・色・太字を設定する"""
+        """ツリーアイテムのラベル・色・太字・チェックボックスを設定する"""
         # AssignmentView のスタイル定数を流用（同ファイル内で後続定義）
         TYPE_SHORT = AssignmentView._TYPE_SHORT
         TREE_BG    = AssignmentView._TREE_BG
@@ -1937,6 +2098,9 @@ class AnalysisView(QWidget):
         label = f"[{type_short}] {row.get('title', '')}"
         item.setText(0, label)
         item.setData(0, Qt.ItemDataRole.UserRole, idx)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                      | Qt.ItemFlag.ItemIsAutoTristate)
+        item.setCheckState(0, Qt.CheckState.Unchecked)
         item.setBackground(0, QColor(TREE_BG.get(node_type, C.SURFACE)))
         item.setForeground(0, QColor(TREE_FG.get(node_type, C.TEXT_DEFAULT)))
         if node_type in ("project1", "project2", "task"):
@@ -1956,6 +2120,65 @@ class AnalysisView(QWidget):
             visited.add(cur)
             cur = str(df.loc[cur, "parent_id"] or "") or None
         return False
+
+    # ── ドリルダウン（棒クリックで 1 階層下へ）────────────────
+
+    def _on_chart_click(self, event) -> None:
+        if event.inaxes is None or event.xdata is None or not self._bar_ids:
+            return
+        i = int(round(event.xdata))
+        if 0 <= i < len(self._bar_ids):
+            self.drill_down(self._bar_ids[i])
+
+    def _next_level_below(self, idx: str) -> Optional[str]:
+        """idx の配下に実在する、いちばん浅い階層（P2 を使わない PJ なら Task 等）を返す"""
+        df = self.state.df_nodes
+        pos = self._LEVEL_ORDER.index(self._current_level_type())
+        found = set()
+        stack = [idx]
+        while stack:
+            kids = df[df["parent_id"] == stack.pop()]
+            for k, row in kids.iterrows():
+                nt = str(row.get("node_type", ""))
+                if nt in self._LEVEL_ORDER and self._LEVEL_ORDER.index(nt) > pos:
+                    found.add(self._LEVEL_ORDER.index(nt))
+                stack.append(str(k))
+        return self._LEVEL_ORDER[min(found)] if found else None
+
+    def drill_down(self, idx: str) -> None:
+        """idx の中身を 1 つ下の階層で集計する（配下が無ければ何もしない）"""
+        level = self._current_level_type()
+        df = self.state.df_nodes
+        if idx not in df.index:
+            return
+        nxt = self._next_level_below(idx)
+        if nxt is None:
+            return
+        self._drill_stack.append((level, self._checked_ids(), list(self._drill_path)))
+        self._drill_path.append(str(df.loc[idx, "title"]))
+        self._set_checked_ids({idx})
+        self._suspend = True
+        self._level_btns[nxt].setChecked(True)
+        self._suspend = False
+        self._calc()
+
+    def _drill_back(self) -> None:
+        if not self._drill_stack:
+            return
+        level, checked, path = self._drill_stack.pop()
+        self._drill_path = path
+        self._set_checked_ids(checked)
+        self._suspend = True
+        self._level_btns[level].setChecked(True)
+        self._suspend = False
+        self._calc()
+
+    def _update_drill_ui(self) -> None:
+        self._back_btn.setEnabled(bool(self._drill_stack))
+        if self._drill_path:
+            self._drill_lbl.setText("表示中: 全体 ＞ " + " ＞ ".join(self._drill_path))
+        else:
+            self._drill_lbl.setText("棒をクリックすると 1 つ下の階層を表示します")
 
     # ── 集計・描画 ───────────────────────────────────────
 
@@ -1980,77 +2203,95 @@ class AnalysisView(QWidget):
         self._build_filter_tree()
         self._calc()
 
-    def _calc(self) -> None:
-        """集計してグラフと超過チケット一覧を更新する"""
+    def aggregate(self) -> dict:
+        """
+        現在の条件で集計する。戻り値: {IDX: {"title", "est", "actual"}}（集計レベルのノード単位）
+        期間指定時の実績は期間内の日次スケジュール時間、見積はそのチケットの見積全体。
+        期間指定時は期間内に作業したチケットだけを対象にする。
+        """
         df = self.state.df_nodes
-        if df.empty:
-            return
-
         level = self._current_level_type()
-
-        # 選択ユーザー（None = 全員）
-        if self._all_user_cb.isChecked():
-            user_set: Optional[set[str]] = None
-        else:
-            user_set = {u for u, cb in self._user_checks.items() if cb.isChecked()}
-
-        # ツリー選択からスコープを取得（未選択 = 全対象）
-        sel_items = self._filter_tree.selectedItems()
-        scope_idxs: Optional[set[str]] = (
-            {item.data(0, Qt.ItemDataRole.UserRole) for item in sel_items}
-            if sel_items else None
-        )
+        user_set = self._selected_users()
+        scope_idxs = self._checked_ids() or None
+        d_from, d_to = self._period()
+        has_period = bool(d_from or d_to)
 
         # 集計レベルのノードを取得し、スコープでフィルタ
         groups = df[df["node_type"] == level]
         if scope_idxs:
             groups = groups[groups.index.map(
-                lambda i: self._is_in_scope(str(i), scope_idxs, df)
-            )]
-
-        # 各グループの初期レコード
+                lambda i: self._is_in_scope(str(i), scope_idxs, df))]
         agg: dict[str, dict] = {
-            str(idx): {
-                "title": str(row.get("title", "")),
-                "actual": 0.0,
-                "est": 0.0,
-            }
+            str(idx): {"title": str(row.get("title", "")), "actual": 0.0, "est": 0.0}
             for idx, row in groups.iterrows()
         }
 
         # チケットを走査して集計レベルの祖先へ積み上げる
-        # （見積は上位ノードへ集計されないため、全員の場合もチケットから合算する）
         tickets = df[(df["node_type"] == "ticket")
                      & (~df["status"].isin(["cancel", "deleted"]))]
         if user_set is not None:
             tickets = tickets[tickets["assigned_to"].isin(user_set)]
         if scope_idxs:
             tickets = tickets[tickets.index.map(
-                lambda i: self._is_in_scope(str(i), scope_idxs, df)
-            )]
+                lambda i: self._is_in_scope(str(i), scope_idxs, df))]
+        period_hours = (LG.calc_period_hours(self.state.df_daily, list(tickets.index), d_from, d_to)
+                        if has_period else {})
         for t_idx, t_row in tickets.iterrows():
+            if has_period:
+                actual = period_hours.get(t_idx, 0.0)
+                if actual <= 0:
+                    continue   # 期間内に作業していないチケットは対象外
+            else:
+                actual = float(t_row.get("actual_hours", 0) or 0)
             anc = self._find_ancestor_at_type(str(t_idx), level)
             if anc and anc in agg:
-                agg[anc]["actual"] += float(t_row.get("actual_hours", 0) or 0)
+                agg[anc]["actual"] += actual
                 agg[anc]["est"]    += float(t_row.get("estimated_hours", 0) or 0)
+        if has_period:
+            # 期間指定時は該当チケットの無いノードを出さない（グラフが空の棒で埋まるため）
+            agg = {k: v for k, v in agg.items() if v["actual"] > 0}
+        return agg
+
+    def _calc(self) -> None:
+        """集計してグラフと超過チケット一覧を更新する"""
+        self._recalc_timer.stop()
+        df = self.state.df_nodes
+        self._update_drill_ui()
+        if df.empty:
+            return
+        level = self._current_level_type()
+        user_set = self._selected_users()
+        agg = {} if user_set == set() else self.aggregate()
+        show_est = self._show_est_cb.isChecked()
+        d_from, d_to = self._period()
 
         # ── 棒グラフ描画 ──────────────────────────────────
         # 個人振り返り（2分割描画）の後でも正しく描けるよう Figure ごと再生成する
         self._fig.clear()
         self._ax = self._fig.add_subplot(111)
+        self._bar_ids = list(agg.keys())
         if agg:
             labels  = [v["title"] for v in agg.values()]
             ests    = [v["est"]    for v in agg.values()]
             actuals = [v["actual"] for v in agg.values()]
             x = list(range(len(labels)))
-            w = 0.35
-            self._ax.bar([i - w / 2 for i in x], ests,    w, label="見積(h)", color=C.BAR_PLAN)
-            self._ax.bar([i + w / 2 for i in x], actuals, w, label="実績(h)", color=C.BAR_ACTUAL)
+            if show_est:
+                w = 0.35
+                self._ax.bar([i - w / 2 for i in x], ests, w, label="見積(h)", color=C.BAR_PLAN)
+                self._ax.bar([i + w / 2 for i in x], actuals, w, label="実績(h)", color=C.BAR_ACTUAL)
+            else:
+                self._ax.bar(x, actuals, 0.5, label="実績(h)", color=C.BAR_ACTUAL)
             self._ax.set_xticks(x)
             self._ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+            self._ax.set_xlim(-0.6, max(len(x), 5) - 0.4)   # 項目が少なくても棒を太くしすぎない
             self._ax.set_ylabel("工数 (h)", fontsize=9)
             self._ax.legend(fontsize=8)
-            self._ax.set_title(f"{level} レベル 工数分析", fontsize=10)
+        else:
+            msg = "人物を選択してください" if user_set == set() else "該当するデータがありません"
+            self._ax.text(0.5, 0.5, msg, ha="center", va="center",
+                          transform=self._ax.transAxes, fontsize=9, color=C.CHART_TEXT)
+        period_txt = f"{d_from or '…'} 〜 {d_to or '…'}" if (d_from or d_to) else "全期間"
+        self._ax.set_title(f"{self._LEVEL_LABEL[level]} レベル 工数分析（{period_txt}）", fontsize=10)
         self._canvas.draw()
 
         # ── 超過チケット一覧 ──────────────────────────────
@@ -2064,7 +2305,7 @@ class AnalysisView(QWidget):
                            and float(r.get("estimated_hours", 0) or 0) > 0),
                 axis=1,
             )
-        ]
+        ] if not tickets_all.empty else tickets_all
         al_rows = []
         al_ids = []
         for t_idx, r in over.iterrows():
@@ -2209,33 +2450,24 @@ class SearchView(QWidget):
         date_row = QHBoxLayout()
         date_row.setSpacing(2)
 
-        btn_from_prev = QPushButton("◀")
-        btn_from_prev.setMaximumWidth(28)
-        self.f_from = QLineEdit()
-        self.f_from.setPlaceholderText("YYYY-MM-DD")
-        self.f_from.setMaximumWidth(120)
-        btn_from_next = QPushButton("▶")
-        btn_from_next.setMaximumWidth(28)
-        btn_from_prev.clicked.connect(lambda: self._shift_date(self.f_from, -1))
-        btn_from_next.clicked.connect(lambda: self._shift_date(self.f_from, +1))
-
-        btn_to_prev = QPushButton("◀")
-        btn_to_prev.setMaximumWidth(28)
-        self.f_to = QLineEdit()
-        self.f_to.setPlaceholderText("YYYY-MM-DD")
-        self.f_to.setMaximumWidth(120)
-        btn_to_next = QPushButton("▶")
-        btn_to_next.setMaximumWidth(28)
-        btn_to_prev.clicked.connect(lambda: self._shift_date(self.f_to, -1))
-        btn_to_next.clicked.connect(lambda: self._shift_date(self.f_to, +1))
-
-        date_row.addWidget(btn_from_prev)
-        date_row.addWidget(self.f_from)
-        date_row.addWidget(btn_from_next)
-        date_row.addWidget(QLabel("〜"))
-        date_row.addWidget(btn_to_prev)
-        date_row.addWidget(self.f_to)
-        date_row.addWidget(btn_to_next)
+        # 日付はクリックでカレンダーを開くボタン（未設定可。✕ で未設定に戻す）
+        self.f_from = DateButton(allow_empty=True)
+        self.f_to = DateButton(allow_empty=True)
+        for i, field in enumerate((self.f_from, self.f_to)):
+            if i:
+                date_row.addWidget(QLabel("〜"))
+            prev_btn = QPushButton("◀")
+            prev_btn.setMaximumWidth(28)
+            prev_btn.clicked.connect(lambda _=False, f=field: self._shift_date(f, -1))
+            next_btn = QPushButton("▶")
+            next_btn.setMaximumWidth(28)
+            next_btn.clicked.connect(lambda _=False, f=field: self._shift_date(f, +1))
+            clear_btn = QPushButton("✕")
+            clear_btn.setMaximumWidth(28)
+            clear_btn.setToolTip("日付を未設定に戻す")
+            clear_btn.clicked.connect(field.clear_date)
+            for w in (prev_btn, field, next_btn, clear_btn):
+                date_row.addWidget(w)
         date_row.addStretch()
         date_widget = QWidget()
         date_widget.setLayout(date_row)
@@ -2268,14 +2500,13 @@ class SearchView(QWidget):
     def refresh(self) -> None:
         self._on_search()
 
-    def _shift_date(self, field: QLineEdit, delta: int) -> None:
-        """日付フィールドを delta 日分ずらす。空欄の場合は本日を基準にする。"""
-        text = field.text().strip()
+    def _shift_date(self, field: DateButton, delta: int) -> None:
+        """日付フィールドを delta 日分ずらす。未設定の場合は本日を基準にする。"""
         try:
-            d = datetime.date.fromisoformat(text)
+            d = datetime.date.fromisoformat(field.get_date())
         except ValueError:
             d = datetime.date.today()
-        field.setText((d + datetime.timedelta(days=delta)).isoformat())
+        field.set_date((d + datetime.timedelta(days=delta)).isoformat())
 
     def _calc_period_hours_batch(self, ticket_idxs: list,
                                   date_from: str, date_to: str) -> dict:
@@ -2310,8 +2541,8 @@ class SearchView(QWidget):
     def _on_search(self) -> None:
         statuses = [s for s, cb in self.status_checks.items() if cb.isChecked()]
         member = self.f_member.currentData() or ""
-        date_from = self.f_from.text().strip()
-        date_to   = self.f_to.text().strip()
+        date_from = self.f_from.get_date()
+        date_to   = self.f_to.get_date()
         result = LG.filter_nodes(
             self.state.df_nodes,
             keyword=self.f_kw.text(),
@@ -2359,15 +2590,15 @@ class SearchView(QWidget):
     def _on_preset_week(self) -> None:
         today = datetime.date.today()
         week_ago = (today - datetime.timedelta(days=7)).isoformat()
-        self.f_from.setText(week_ago)
-        self.f_to.setText(today.isoformat())
+        self.f_from.set_date(week_ago)
+        self.f_to.set_date(today.isoformat())
         self._on_search()
 
     def _on_preset_today(self) -> None:
         """今日更新されたノードを検索するプリセット"""
         today = datetime.date.today().isoformat()
-        self.f_from.setText(today)
-        self.f_to.setText(today)
+        self.f_from.set_date(today)
+        self.f_to.set_date(today)
         self._on_search()
 
     def _on_export(self) -> None:
@@ -3196,10 +3427,23 @@ class _NoWheelDoubleSpinBox(QDoubleSpinBox):
         e.ignore()
 
 
+class _NoWheelComboBox(QComboBox):
+    """マウスホイールでの値変更を禁止したコンボボックス"""
+
+    def wheelEvent(self, e):
+        e.ignore()
+
+
 # ---------- Config 設定画面 ----------
 
 class ConfigView(QWidget):
     """config.ini の閲覧・編集ビュー"""
+
+    # 起動時に開くタブの選択肢（設定値, 表示名）
+    _START_TAB_OPTIONS = [
+        ("today", "🏠 Today"), ("main", "📊 Main"), ("plan", "🗺 Plan"),
+        ("edit", "✏ Edit"), ("last", "前回終了時のタブ"),
+    ]
 
     _CONFIG_PATH      = Path(__file__).parent / "config.ini"
     _USER_CONFIG_PATH = Path(__file__).parent.parent / "user_config.ini"
@@ -3282,6 +3526,17 @@ class ConfigView(QWidget):
         self._fields[key] = w
         return w
 
+    def _choice(self, key: str, value: str, form: QFormLayout, label: str,
+                options: list) -> QComboBox:
+        """選択式の設定欄。options は [(設定値, 表示名), ...]"""
+        w = _NoWheelComboBox()
+        for val, text in options:
+            w.addItem(text, val)
+        w.setCurrentIndex(max(w.findData(value), 0))
+        form.addRow(label, w)
+        self._fields[key] = w
+        return w
+
     def _spin(self, key: str, value: int, form: QFormLayout, label: str,
               mn: int = 0, mx: int = 9999) -> QSpinBox:
         # 項目8: ホイール禁止スピンボックスを使用
@@ -3332,8 +3587,8 @@ class ConfigView(QWidget):
         self._spin("gui_window_width",  cfg.window_width,  fl, "window_width:",  800, 3840)
         self._spin("gui_window_height", cfg.window_height, fl, "window_height:", 400, 2160)
         self._spin("gui_font_size",     cfg.font_size,     fl, "font_size:",     6, 24)
-        self._text("gui_start_tab",     cfg.start_tab,     fl,
-                   "start_tab (today/main/edit/plan/last):")
+        self._choice("gui_start_tab", cfg.start_tab, fl, "start_tab (起動時のタブ):",
+                     self._START_TAB_OPTIONS)
         self._text("gui_detail_pane",
                    "open" if cfg.detail_pane_open else "closed", fl,
                    "detail_pane (open/closed):")
@@ -3399,6 +3654,8 @@ class ConfigView(QWidget):
                 w.setValue(float(val))
             elif isinstance(w, QLineEdit):
                 w.setText(str(val))
+            elif isinstance(w, QComboBox):
+                w.setCurrentIndex(max(w.findData(val), 0))
 
         cfg = self.state.config
         _set("db_server_dir",    cfg.server_dir)
@@ -3432,6 +3689,8 @@ class ConfigView(QWidget):
             return str(default)
         if isinstance(w, (QSpinBox, QDoubleSpinBox)):
             return str(w.value())
+        if isinstance(w, QComboBox):
+            return str(w.currentData())
         return w.text().strip()
 
     def _on_save(self) -> None:
