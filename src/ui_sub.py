@@ -881,6 +881,9 @@ class RoadmapView(QWidget):
         self._cell_unit = "週"  # "日" / "週" / "月"
         self._date_col_extra: int = 0  # 日付列幅の追加ピクセル数
         self._filter_own: bool = False  # True = 選択中メンバーのみ表示
+        # 固定列の幅（ユーザーがドラッグした幅を再構築後も保つ。終了時に保存）
+        self.fixed_col_widths: list = [200, 75, 60, 110]
+        self._rebuilding = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -1046,6 +1049,7 @@ class RoadmapView(QWidget):
         self.table.cellClicked.connect(self._on_cell_clicked)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
+        self.table.horizontalHeader().sectionResized.connect(self._on_section_resized)
 
         self._splitter.addWidget(self.table)
         self._splitter.setSizes([200, 700])
@@ -1473,6 +1477,11 @@ class RoadmapView(QWidget):
             pid = df.loc[pid, "parent_id"]
         return chain
 
+    def _on_section_resized(self, col: int, _old: int, new: int) -> None:
+        """固定列の幅をドラッグで変えたら記憶する（再構築・タブ切替で元に戻さない）"""
+        if not self._rebuilding and col < self._FIXED_COLS and new > 0:
+            self.fixed_col_widths[col] = new
+
     def _rebuild_table(self) -> None:
         """
         ロードマップテーブルを再構築する。
@@ -1497,20 +1506,20 @@ class RoadmapView(QWidget):
         total_cols = self._FIXED_COLS + len(periods)
         col_w      = max(10, (50 if self._cell_unit != "日" else self._COL_W_DATE) + self._date_col_extra)
 
+        self._rebuilding = True   # 列数変更に伴う幅変化を記憶しない
         self.table.setColumnCount(total_cols)
         headers = ["タイトル", "担当者", "ステータス", "期間"]
         for ps, pe, pl in periods:
             headers.append(pl)
         self.table.setHorizontalHeaderLabels(headers)
-        self.table.setColumnWidth(0, 200)
-        self.table.setColumnWidth(1, 75)
-        self.table.setColumnWidth(2, 60)
-        self.table.setColumnWidth(3, 110)
+        for c, w in enumerate(self.fixed_col_widths):
+            self.table.setColumnWidth(c, w)
         # 列幅はマウス操作で変更可能（Interactive）
         for c in range(total_cols):
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
         for c in range(self._FIXED_COLS, total_cols):
             self.table.setColumnWidth(c, col_w)
+        self._rebuilding = False
         self.table.setRowCount(0)
 
         if df.empty:

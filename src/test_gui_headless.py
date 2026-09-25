@@ -1859,6 +1859,11 @@ def test_ui_state(state, version, win, tmpdir):
         gv._rebuild_table()
         assert gv.table.columnWidth(1) == 257, f"再構築でタイトル列幅が戻った {gv.table.columnWidth(1)}"
         ok("ガントのタイトル列幅が再構築後も保たれる")
+        rv0 = win.road_view
+        rv0.table.setColumnWidth(0, 263)
+        rv0._rebuild_table()
+        assert rv0.table.columnWidth(0) == 263, f"再構築でタイトル列幅が戻った {rv0.table.columnWidth(0)}"
+        ok("Plan のタイトル列幅が再構築後も保たれる")
         state.nodes_modified = False
         state.schedule_modified = False
         win.save_ui_state()
@@ -1874,6 +1879,8 @@ def test_ui_state(state, version, win, tmpdir):
         assert win2.gantt_view._get_status_filter() == "all"
         win2.gantt_view._rebuild_table()
         assert win2.gantt_view.table.columnWidth(1) == 257, "ガントの列幅が次回起動時に戻らない"
+        win2.road_view._rebuild_table()
+        assert win2.road_view.table.columnWidth(0) == 263, "Plan の列幅が次回起動時に戻らない"
         rv = win2.road_view
         assert (rv._current_level, rv._cell_unit, rv._filter_own, rv._date_col_extra) \
             == ("Task", "月", True, 15), "Plan の表示設定が戻らない"

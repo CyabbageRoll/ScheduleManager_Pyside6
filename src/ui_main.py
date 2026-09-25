@@ -1477,6 +1477,7 @@ class MainWindow(QMainWindow):
         s.setValue("plan/unit", rv._cell_unit)
         s.setValue("plan/filter_own", rv._filter_own)
         s.setValue("plan/col_extra", rv._date_col_extra)
+        s.setValue("plan/col_widths", list(rv.fixed_col_widths))
         s.sync()
 
     def restore_ui_state(self) -> None:
@@ -1498,12 +1499,14 @@ class MainWindow(QMainWindow):
         if status in gv._status_radios:
             gv._status_radios[status].setChecked(True)
         gv._initial_pj = s.value("main/project", "", type=str)
-        widths = s.value("main/col_widths", [], type=list) or []
-        if len(widths) == len(gv.fixed_col_widths):
-            try:
-                gv.fixed_col_widths = [max(int(w), 20) for w in widths]
-            except (TypeError, ValueError):
-                pass
+        # ガント・Plan の固定列の幅
+        for view, key in ((gv, "main/col_widths"), (self.road_view, "plan/col_widths")):
+            widths = s.value(key, [], type=list) or []
+            if len(widths) == len(view.fixed_col_widths):
+                try:
+                    view.fixed_col_widths = [max(int(w), 20) for w in widths]
+                except (TypeError, ValueError):
+                    pass
         rv = self.road_view
         rv.apply_saved_view(
             s.value("plan/level", rv._current_level, type=str),
