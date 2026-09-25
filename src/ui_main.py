@@ -18,8 +18,11 @@ from PySide6.QtWidgets import (
 )
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QDate, Signal, QEvent, QTimer, QUrl, QRect, QSettings
-from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut, QAction, QPen, QDesktopServices
+from PySide6.QtCore import Qt, QDate, Signal, QEvent, QTimer, QUrl, QRectF, QSettings
+from PySide6.QtGui import (
+    QColor, QFont, QKeySequence, QShortcut, QAction, QPen, QDesktopServices,
+    QBrush, QPainter, QPainterPath,
+)
 
 import db as DB
 import logic as LG
@@ -29,7 +32,7 @@ from ui_widgets import (
     AutoCombo, ScrollableTable, Separator, PomodoroWidget,
     COLOR_OPTIONS, STYLE_BUTTON,
 )
-from theme import C, qss, LEVEL_BG, LEVEL_FG
+from theme import C, qss, LEVEL_BG, LEVEL_FG, STYLE_CHIP
 
 # 画面インデックス（QStackedWidget）
 IDX_MAIN    = 0
@@ -48,19 +51,34 @@ IDX_TODAY    = 10
 # ---------- 日次スケジュール用カスタムデリゲート ----------
 
 class _HourLineDelegate(QStyledItemDelegate):
-    """案Bモダンカードスタイル: 毎時区切り・空スロット区切り・チケットカード描画"""
+    """日次スケジュールの描画: 毎時の実線・15 分の点線・角丸のチケットカード"""
 
-    # チケット行はテキストを手動描画するため、initStyleOption でクリア
+    _CARD_RADIUS = 5   # カードの角丸
+    _CARD_INSET  = 3   # カードの左右の余白
+    _STRIPE_W    = 4   # カード左端のカラーストライプ幅
+
+    # チケット行はテキストと背景を手動描画するため、initStyleOption でクリア
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
         if index.column() == 1 and index.data(Qt.ItemDataRole.UserRole + 1):
-            option.text = ""   # super().paint() での描画を抑制
+            option.text = ""                  # super().paint() での描画を抑制
+            option.backgroundBrush = QBrush()  # 四角い背景の塗りを抑制（角丸カードで描く）
 
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
 
         r = option.rect
         col = index.column()
+        pos = index.data(Qt.ItemDataRole.UserRole + 1) if col == 1 else None
+
+        # ── 15 分の区切り: 下端に淡い点線（カードの中は描かない）──
+        if not pos:
+            painter.save()
+            pen = QPen(QColor(C.SLOT_LINE))
+            pen.setStyle(Qt.PenStyle.DotLine)
+            painter.setPen(pen)
+            painter.drawLine(r.bottomLeft(), r.bottomRight())
+            painter.restore()
 
         # ── 毎時区切り線（row % 4 == 0 = 00分の行）──
         if index.row() % 4 == 0:
@@ -73,68 +91,53 @@ class _HourLineDelegate(QStyledItemDelegate):
                     skip_hour_line = True
             if not skip_hour_line:
                 painter.save()
-                pen = QPen(QColor(C.HOUR_LINE))
-                pen.setWidth(1)
-                painter.setPen(pen)
+                painter.setPen(QPen(QColor(C.HOUR_LINE)))
                 painter.drawLine(r.topLeft(), r.topRight())
                 painter.restore()
 
-        # ── 時刻列: 行ごとの区切り線を常時描画 ──
-        if col == 0:
-            painter.save()
-            painter.setPen(QPen(QColor(C.SLOT_LINE)))
-            painter.drawLine(r.bottomLeft(), r.bottomRight())
-            painter.restore()
-            return
-
-        # ── タスク列のみ以下を処理 ──
-        pos = index.data(Qt.ItemDataRole.UserRole + 1)
-
         if not pos:
-            # 空スロット: 下端に薄い区切り線（15分刻みが見えるように）
-            painter.save()
-            painter.setPen(QPen(QColor(C.SLOT_LINE)))
-            painter.drawLine(r.bottomLeft(), r.bottomRight())
-            painter.restore()
             return
 
-        # ── チケットカード描画 ──
+        # ── チケットカード描画（連続スロットを 1 枚の角丸カードに見せる）──
         bg_data = index.data(Qt.ItemDataRole.BackgroundRole)
         if bg_data is not None:
-            c = bg_data.color() if hasattr(bg_data, "color") else QColor(bg_data)
-            stripe = QColor(c.red(), c.green(), c.blue(), 255)   # ソリッド
-            border = QColor(c.red(), c.green(), c.blue(), 180)
+            fill = bg_data.color() if hasattr(bg_data, "color") else QColor(bg_data)
         else:
-            stripe = QColor(C.SLOT_CARD)
-            border = QColor(C.SLOT_CARD)
-            border.setAlpha(180)
+            fill = QColor(C.SLOT_CARD)
+            fill.setAlpha(110)
+        solid = QColor(fill.red(), fill.green(), fill.blue())
+        border = QColor(fill.red(), fill.green(), fill.blue(), 150)
+
+        # このセルに見えるカード範囲（先頭・末尾だけ上下に 1px の隙間）
+        rad = self._CARD_RADIUS
+        card = QRectF(r).adjusted(self._CARD_INSET, 0, -self._CARD_INSET, 0)
+        if pos in ("first", "single"):
+            card.setTop(card.top() + 1)
+        if pos in ("last", "single"):
+            card.setBottom(card.bottom() - 1)
+        # 角丸にしない側はセル外へ伸ばしてからクリップし、隣のセルと継ぎ目なくつなぐ
+        shape = QRectF(card)
+        if pos in ("middle", "last"):
+            shape.setTop(shape.top() - rad * 2)
+        if pos in ("first", "middle"):
+            shape.setBottom(shape.bottom() + rad * 2)
+        path = QPainterPath()
+        path.addRoundedRect(shape.adjusted(0.5, 0.5, -0.5, -0.5), rad, rad)
 
         painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setClipRect(card)
+        painter.fillPath(path, fill)
+        # 左端のカラーストライプ（カードの角丸に沿って切り抜く）
+        painter.save()
+        painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
+        painter.fillRect(QRectF(card.left(), card.top(), self._STRIPE_W, card.height()), solid)
+        painter.restore()
+        painter.setPen(QPen(border, 1))
+        painter.drawPath(path)
+        painter.restore()
 
-        # ① 連続行の境界隙間を 1px 拡張して埋める
-        gap_top    = 1 if pos in ("middle", "last")  else 0
-        gap_bottom = 1 if pos in ("first",  "middle") else 0
-        y_top  = r.top()    - gap_top
-        y_high = r.height() + gap_top + gap_bottom
-
-        # ② 左端のカラーストライプ（5px・シームレス）
-        painter.fillRect(QRect(r.left(), y_top, 5, y_high), stripe)
-
-        # ③ カード外枠
-        pen = QPen(border)
-        pen.setWidth(1)
-        painter.setPen(pen)
-        x0 = r.left() + 5    # ストライプ右端
-        x1 = r.right() - 1   # 右端
-        y_b = y_top + y_high - 1
-        painter.drawLine(x0, y_top, x0, y_b)   # ストライプ右縦線（常時）
-        painter.drawLine(x1, y_top, x1, y_b)   # 右縦線（常時）
-        if pos in ("first", "single"):
-            painter.drawLine(r.left(), r.top(), x1, r.top())           # 上横線
-        if pos in ("last", "single"):
-            painter.drawLine(r.left(), r.bottom() - 1, x1, r.bottom() - 1)  # 下横線
-
-        # ④ テキストをストライプの右（7px オフセット）で再描画
+        # ── テキストをストライプの右に描画 ──
         text = index.data(Qt.ItemDataRole.DisplayRole)
         if text:
             is_sel = bool(option.state & QStyle.StateFlag.State_Selected)
@@ -144,16 +147,16 @@ class _HourLineDelegate(QStyledItemDelegate):
             font = QFont(option.font)
             if index.data(Qt.ItemDataRole.UserRole + 2) == "path":
                 font.setPointSize(max(font.pointSize() - 1, 6))
+            painter.save()
             painter.setPen(text_color)
             painter.setFont(font)
-            text_rect = r.adjusted(7, 1, -2, -1)
+            text_rect = card.toRect().adjusted(self._STRIPE_W + 4, 0, -3, 0)
             fm = painter.fontMetrics()
             elided = fm.elidedText(text, Qt.TextElideMode.ElideRight, text_rect.width())
             painter.drawText(text_rect,
                              Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                              elided)
-
-        painter.restore()
+            painter.restore()
 
 
 # ---------- 日次スケジュールウィジェット ----------
@@ -961,17 +964,7 @@ class MainWindow(QMainWindow):
         tb2.addWidget(QLabel(" メンバー: "))
 
         # メンバーボタン（ボタン形式で素早く切替）
-        _MEMBER_STYLE = qss(
-            "QPushButton {"
-            " background: transparent; color: @text_sub;"
-            " border: 1px solid @border; border-radius: 8px;"
-            " padding: 3px 12px; font-size: 8pt; }"
-            "QPushButton:checked {"
-            " background: @accent_bg; color: @accent_dark;"
-            " border: 1px solid @accent_border; }"
-            "QPushButton:hover:!checked {"
-            " background: @control_hover; }"
-        )
+        _MEMBER_STYLE = STYLE_CHIP
         self._member_btns: dict = {}
         for m in self.state.members:
             display = self.state.display_name(m)
@@ -1478,11 +1471,13 @@ class MainWindow(QMainWindow):
         gv = self.gantt_view
         s.setValue("main/status", gv._get_status_filter())
         s.setValue("main/project", gv.pj_combo.currentData() or "")
+        s.setValue("main/col_widths", list(gv.fixed_col_widths))
         rv = self.road_view
         s.setValue("plan/level", rv._current_level)
         s.setValue("plan/unit", rv._cell_unit)
         s.setValue("plan/filter_own", rv._filter_own)
         s.setValue("plan/col_extra", rv._date_col_extra)
+        s.setValue("plan/col_widths", list(rv.fixed_col_widths))
         s.sync()
 
     def restore_ui_state(self) -> None:
@@ -1504,6 +1499,14 @@ class MainWindow(QMainWindow):
         if status in gv._status_radios:
             gv._status_radios[status].setChecked(True)
         gv._initial_pj = s.value("main/project", "", type=str)
+        # ガント・Plan の固定列の幅
+        for view, key in ((gv, "main/col_widths"), (self.road_view, "plan/col_widths")):
+            widths = s.value(key, [], type=list) or []
+            if len(widths) == len(view.fixed_col_widths):
+                try:
+                    view.fixed_col_widths = [max(int(w), 20) for w in widths]
+                except (TypeError, ValueError):
+                    pass
         rv = self.road_view
         rv.apply_saved_view(
             s.value("plan/level", rv._current_level, type=str),

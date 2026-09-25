@@ -721,6 +721,32 @@ def _md_escape(s: str) -> str:
     return str(s).replace("|", "\\|").replace("\n", " ")
 
 
+ANALYSIS_PERIODS = ["全期間", "今週", "先週", "今月", "先月", "今年度"]
+
+
+def analysis_period(name: str, today: Optional[datetime.date] = None) -> tuple:
+    """
+    工数分析の期間プリセットを (開始日, 終了日) の ISO 文字列で返す。
+    全期間は ("", "")。週は月曜始まり、年度は 4 月始まり。
+    """
+    today = today or datetime.date.today()
+    if name == "今週" or name == "先週":
+        start = today - datetime.timedelta(days=today.weekday())
+        if name == "先週":
+            start -= datetime.timedelta(days=7)
+        return start.isoformat(), (start + datetime.timedelta(days=6)).isoformat()
+    if name == "今月" or name == "先月":
+        first = today.replace(day=1)
+        if name == "先月":
+            first = (first - datetime.timedelta(days=1)).replace(day=1)
+        last = first.replace(day=calendar.monthrange(first.year, first.month)[1])
+        return first.isoformat(), last.isoformat()
+    if name == "今年度":
+        fy = today.year if today.month >= 4 else today.year - 1
+        return datetime.date(fy, 4, 1).isoformat(), datetime.date(fy + 1, 3, 31).isoformat()
+    return "", ""
+
+
 def calc_period_hours(df_daily: pd.DataFrame, ticket_idxs: list,
                       date_from: str, date_to: str) -> dict:
     """
