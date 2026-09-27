@@ -1786,7 +1786,16 @@ class AnalysisView(QWidget):
         personal_btn.setToolTip("自分の直近4週の投入工数（Project1 別）と\n"
                                 "完了チケットの見積精度を表示します")
         personal_btn.clicked.connect(self._calc_personal)
-        right.addRow("", personal_btn)
+        # G4: 完了予測（チェックした範囲・選択中の人物の残り作業の推移と完了予想日）
+        burn_btn = QPushButton("📉 完了予測")
+        burn_btn.setStyleSheet(STYLE_BUTTON)
+        burn_btn.setToolTip("チェックした範囲（なし＝全体）・選択中の人物の残り作業の推移と、\n"
+                            "直近 2 週間のペースで進めた場合の完了予想日を表示します")
+        burn_btn.clicked.connect(self._calc_burndown)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(personal_btn)
+        btn_row.addWidget(burn_btn)
+        right.addRow("", btn_row)
 
         right_w = QWidget()
         right_w.setLayout(right)
@@ -2211,6 +2220,34 @@ class AnalysisView(QWidget):
         self.info.set_info(
             f"集計: {len(agg)} ノード / 超過チケット: {len(al_rows)}"
         )
+
+    def _calc_burndown(self) -> None:
+        """G4: 残り作業の推移（実線）と、今のペースでの完了見込み（点線）を描く"""
+        self._recalc_timer.stop()
+        cfg = self.state.config
+        fc = LG.completion_forecast(self.state.df_nodes, self.state.df_daily,
+                                    self._checked_ids() or None, self._selected_users(),
+                                    cfg.holidays)
+        self._fig.clear()
+        ax = self._ax = self._fig.add_subplot(111)
+        self._bar_ids = []   # 棒グラフではないのでドリルダウンしない
+        xs = [d for d, _ in fc["history"]]
+        ys = [v for _, v in fc["history"]]
+        ax.plot(xs, ys, color=C.ACCENT, linewidth=2, label="残り作業（h）")
+        today = datetime.date.today()
+        if fc["forecast"] and fc["forecast"] > today:
+            ax.plot([today, fc["forecast"]], [fc["remaining_now"], 0], "--",
+                    color=C.ACCENT_BORDER, linewidth=2, label="今のペースでの見込み")
+        if fc["deadline"]:
+            ax.axvline(fc["deadline"], color=C.DEADLINE_LINE, linewidth=1, label="納期")
+        ax.set_ylabel("残り (h)", fontsize=9)
+        ax.set_ylim(bottom=0)
+        ax.legend(fontsize=8)
+        self._fig.autofmt_xdate()
+        summary = LG.completion_text(fc)
+        ax.set_title(f"完了予測 — {summary}", fontsize=10)
+        self._canvas.draw()
+        self.info.set_info(f"完了予測: 対象チケット {fc['tickets']} 件 / {summary}")
 
     def _calc_personal(self) -> None:
         """個人振り返り: 選択中メンバーの週別投入工数（P1別）と見積精度を描画する"""

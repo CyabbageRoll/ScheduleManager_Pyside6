@@ -3524,6 +3524,20 @@ class DetailPane(QWidget):
         if basic:
             self.form_box.addWidget(basic)
 
+        # 4.5) 完了予測カード（G4: P1〜Task。配下チケットの残りと直近のペースから）
+        if ntype in ("project1", "project2", "project3", "project4", "task"):
+            fc = LG.completion_forecast(self.state.df_nodes, self.state.df_daily,
+                                        {idx}, None, self.state.config.holidays)
+            if fc["tickets"]:
+                fc_card, fv = self._make_card("完了予測")
+                fl = QLabel(LG.completion_text(fc))
+                fl.setWordWrap(True)
+                late = fc["forecast"] and fc["deadline"] and fc["forecast"] > fc["deadline"]
+                fl.setStyleSheet(qss("QLabel { color:@danger; font-size:9pt; }" if late
+                                     else "QLabel { color:@text; font-size:9pt; }"))
+                fv.addWidget(fl)
+                self.form_box.addWidget(fc_card)
+
         # 5) メモカード（自分のチケットは作業ログの入力欄つき）
         memo = _s("memo")
         can_log = ntype == "ticket" and _s("assigned_to") == self.state.user

@@ -2278,6 +2278,68 @@ def test_i2_rewards(win):
         ng("Today のごほうび表示", e)
 
 
+def test_g4_forecast(win, task_idx):
+    """G4: 完了予測（残りの推移・ペース・完了予想日）"""
+    print("\n[G4] 完了予測テスト")
+    from PySide6.QtWidgets import QLabel
+    import pandas as pd
+    import logic as LG
+    from db import DAILY_TIME_COLS, create_initial_node
+    me = win.state.user
+    try:
+        task = create_initial_node(me, "task", "T", "p", 1)
+        task["deadline"] = "2026-10-09"
+        a = create_initial_node(me, "ticket", "A", task.name, 1)
+        a["estimated_hours"] = 10.0; a["actual_hours"] = 4.0; a["created_at"] = "2026-09-20"
+        b = create_initial_node(me, "ticket", "B", task.name, 2)
+        b["estimated_hours"] = 4.0; b["actual_hours"] = 4.0; b["status"] = "done"
+        b["actual_end"] = "2026-09-29"; b["created_at"] = "2026-09-20"
+        df = pd.DataFrame([task, a, b]).set_index(pd.Index([task.name, a.name, b.name]))
+        rows = {}
+        for d, tk, h in [("2026-09-25", b.name, 4.0), ("2026-09-28", a.name, 2.0), ("2026-09-29", a.name, 2.0)]:
+            r = {c: "" for c in DAILY_TIME_COLS}
+            r["Owner"] = me
+            for c in DAILY_TIME_COLS[36:36 + int(h * 4)]:
+                r[c] = tk
+            rows[f"{d}-{me}"] = r
+        daily = pd.DataFrame.from_dict(rows, orient="index")
+        T = datetime.date(2026, 9, 30)
+        fc = LG.completion_forecast(df, daily, {task.name}, None, ["SAT", "SUN"], T)
+        assert fc["remaining_now"] == 6.0, fc
+        assert fc["pace"] == 0.8, fc                         # 8h ÷ 10 営業日
+        assert fc["forecast"] == datetime.date(2026, 10, 12), fc["forecast"]   # 8 営業日後
+        assert fc["deadline"] == datetime.date(2026, 10, 9)
+        h = dict(fc["history"])
+        assert h[datetime.date(2026, 9, 24)] == 14.0 and h[datetime.date(2026, 9, 25)] == 10.0 \
+            and h[datetime.date(2026, 9, 29)] == 6.0 and h[T] == 6.0, h
+        assert fc["history"][0] == (datetime.date(2026, 9, 19), 0.0), fc["history"][:2]  # 作成前日から
+        c = create_initial_node(me, "ticket", "C", task.name, 3)   # 完了日の記録が無い done
+        c["estimated_hours"] = 3.0; c["status"] = "done"; c["created_at"] = "2026-09-20"
+        df2 = pd.concat([df, pd.DataFrame([c]).set_index(pd.Index([c.name]))])
+        fc2 = LG.completion_forecast(df2, daily, {task.name}, None, ["SAT", "SUN"], T)
+        assert fc2["history"][-1][1] == fc2["remaining_now"] == 6.0, "推移の終点と現在の残りがずれる"
+        txt = LG.completion_text(fc)
+        assert txt.startswith("10/12 完了見込み（納期 10/9 に遅れ ⚠）"), txt
+        empty = LG.completion_forecast(df, pd.DataFrame(), {task.name}, None, ["SAT", "SUN"], T)
+        assert empty["forecast"] is None and "予測できません" in LG.completion_text(empty)
+        ok("残り 6h・ペース 0.8h/日 → 10/12 完了見込み（納期超過を表示）、推移を日ごとに復元")
+    except Exception as e:
+        ng("completion_forecast", e)
+    try:
+        anal = win.anal_view
+        anal._calc_burndown()
+        assert anal._ax.get_title().startswith("完了予測"), anal._ax.get_title()
+        anal._calc()
+        ok("Analyze の「📉 完了予測」グラフ")
+        dp = win.detail_pane
+        dp.update_for_node(task_idx)
+        heads = [w.text() for w in dp.findChildren(QLabel) if w.text() == "完了予測"]
+        assert heads, "詳細ペインに完了予測カードが無い"
+        ok("詳細ペイン（Task）に完了予測カード")
+    except Exception as e:
+        ng("完了予測の表示", e)
+
+
 def test_theme():
     """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
     print("\n[D1] テーマ集約テスト")
@@ -2366,6 +2428,7 @@ def main():
             test_f1_work_log(win, ticket_idx, ticket2_idx)
             test_e2_deadline_risk(win, task_idx)
             test_i2_rewards(win)
+            test_g4_forecast(win, task_idx)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

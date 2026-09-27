@@ -1896,3 +1896,147 @@ def motivation_stats(df_nodes: pd.DataFrame, df_daily: pd.DataFrame, user: str,
                     total += 1
                     hit += abs(act - est) <= est * 0.2
     return {"streak": streak, "week_done": week_done, "bullseye": hit, "bullseye_total": total}
+
+
+# ============================================================
+# G4: 完了予測（バーンダウン）
+# ============================================================
+
+def _scope_tickets(df_nodes: pd.DataFrame, scope: Optional[set], users: Optional[set]) -> pd.DataFrame:
+    """scope（ノード IDX の集合。None=全体）配下で users 担当の有効チケット"""
+    t = df_nodes[(df_nodes["node_type"] == "ticket")
+                 & (~df_nodes["status"].isin(["cancel", "deleted"]))]
+    if users is not None:
+        t = t[t["assigned_to"].isin(users)]
+    if scope:
+        def inside(i) -> bool:
+            cur, seen = str(i), set()
+            while cur and cur not in seen:
+                if cur in scope:
+                    return True
+                if cur not in df_nodes.index:
+                    return False
+                seen.add(cur)
+                cur = str(df_nodes.loc[cur, "parent_id"] or "")
+            return False
+        t = t[t.index.map(inside)]
+    return t
+
+
+def _daily_hours_by_date(df_daily: pd.DataFrame, ticket_ids: set,
+                         since: str = "") -> dict:
+    """{日付: {ticket: 時間}}（日次スケジュールの 15 分スロットを集計）"""
+    out: dict = {}
+    if df_daily.empty or not ticket_ids:
+        return out
+    cols = [c for c in DAILY_TIME_COLS if c in df_daily.columns]
+    for idx, row in df_daily.iterrows():
+        d = str(idx)[:10]
+        if since and d < since:
+            continue
+        for v in row[cols]:
+            if v in ticket_ids:
+                day = out.setdefault(d, {})
+                day[v] = day.get(v, 0.0) + 0.25
+    return out
+
+
+def _add_business_days(start: datetime.date, days: int, holidays) -> datetime.date:
+    """start の翌日から数えて days 営業日目の日付（days<=0 なら start）"""
+    hol = {h.strip().upper() for h in holidays}
+    d, n = start, 0
+    while n < days:
+        d += datetime.timedelta(days=1)
+        if _DAY_ABBR[d.weekday()] not in hol:
+            n += 1
+    return d
+
+
+def completion_forecast(df_nodes: pd.DataFrame, df_daily: pd.DataFrame,
+                        scope: Optional[set], users: Optional[set], holidays,
+                        today: Optional[datetime.date] = None,
+                        pace_days: int = 14, history_days: int = 56) -> dict:
+    """
+    残り作業の推移と完了予想日を返す。
+      remaining_now : 未完了チケットの 見積−実績 の合計(h)
+      pace          : 直近 pace_days 日の実績(h) ÷ その期間の営業日数（h/営業日）
+      forecast      : 今日から ceil(残り÷ペース) 営業日後（ペース 0 なら None、残り 0 なら今日）
+      deadline      : scope ノード自身の納期（無ければ配下チケットの最も遅い納期）
+      history       : [(日付, その日の終わり時点の残り h)]（最大 history_days 日前から今日まで。
+                      残り 0 が続く先頭区間は省く）
+    """
+    today = today or datetime.date.today()
+    tickets = _scope_tickets(df_nodes, scope, users)
+    ids = set(tickets.index)
+    est = {i: float(tickets.loc[i, "estimated_hours"] or 0) for i in ids}
+    act_total = {i: float(tickets.loc[i, "actual_hours"] or 0) for i in ids}
+    # 完了日（完了日の記録が無い done は「最初から完了」扱いにして現在の残りと揃える）
+    done_on = {i: (_date_str(tickets.loc[i, "actual_end"]) or "0000-00-00")
+               if str(tickets.loc[i, "status"]) == "done" else "" for i in ids}
+    open_ids = [i for i in ids if str(tickets.loc[i, "status"]) != "done"]
+    remaining_now = round(sum(max(0.0, est[i] - act_total[i]) for i in open_ids), 2)
+
+    start = today - datetime.timedelta(days=history_days)
+    by_date = _daily_hours_by_date(df_daily, ids, start.isoformat())
+    hol = {h.strip().upper() for h in holidays}
+    pace_from = today - datetime.timedelta(days=pace_days - 1)
+    worked = sum(h for d, day in by_date.items() if d >= pace_from.isoformat()
+                 for h in day.values())
+    bdays = sum(1 for k in range(pace_days)
+                if _DAY_ABBR[(pace_from + datetime.timedelta(days=k)).weekday()] not in hol)
+    pace = round(worked / bdays, 2) if bdays else 0.0
+
+    if remaining_now <= 0:
+        forecast = today
+    elif pace > 0:
+        forecast = _add_business_days(today, math.ceil(remaining_now / pace - 1e-9), holidays)
+    else:
+        forecast = None
+
+    # 推移: 今日の実績合計から日ごとに遡って「その日の終わりの残り」を復元する
+    created = {i: _date_str(tickets.loc[i, "created_at"]) for i in ids}
+    act_until = dict(act_total)
+    history = []
+    d = today
+    while d >= start:
+        ds = d.isoformat()
+        rem = sum(max(0.0, est[i] - act_until[i]) for i in ids
+                  if (not created[i] or created[i] <= ds) and not (done_on[i] and done_on[i] <= ds))
+        history.append((d, round(rem, 2)))
+        for i, h in by_date.get(ds, {}).items():
+            act_until[i] -= h          # 前日の終わり時点へ戻す
+        d -= datetime.timedelta(days=1)
+    history.reverse()
+    # 先頭の「まだチケットが無い（残り 0）」区間は省き、直前の 1 点だけ残す
+    first = next((k for k, (_d, v) in enumerate(history) if v > 0), len(history))
+    history = history[max(0, first - 1):] or history[-1:]
+
+    deadline = None
+    if scope and len(scope) == 1:
+        (only,) = tuple(scope)
+        if only in df_nodes.index:
+            deadline = _parse_date(str(df_nodes.loc[only, "deadline"] or ""))
+    if not deadline:
+        dls = [_parse_date(str(v or "")) for v in tickets["deadline"]] if not tickets.empty else []
+        dls = [x for x in dls if x]
+        deadline = max(dls) if dls else None
+    return {
+        "remaining_now": remaining_now, "pace": pace, "forecast": forecast,
+        "deadline": datetime.date.fromisoformat(deadline) if deadline else None,
+        "history": history, "tickets": len(ids),
+    }
+
+
+def completion_text(fc: dict) -> str:
+    """G4: 完了予測の 1 行表示（例: 10/15 完了見込み（納期 10/20）・残り 12h・ペース 3h/日）"""
+    fmt = lambda d: f"{d.month}/{d.day}"
+    if fc["remaining_now"] <= 0:
+        head = "残り作業なし"
+    elif fc["forecast"] is None:
+        head = "完了日は予測できません（直近 2 週間の実績なし）"
+    else:
+        head = f"{fmt(fc['forecast'])} 完了見込み"
+        if fc["deadline"]:
+            late = fc["forecast"] > fc["deadline"]
+            head += f"（納期 {fmt(fc['deadline'])}{' に遅れ ⚠' if late else ''}）"
+    return f"{head}・残り {fc['remaining_now']:g}h・ペース {fc['pace']:g}h/日"
