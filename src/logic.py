@@ -484,6 +484,185 @@ def fill_deadlines_backward(tickets: pd.DataFrame, daily_h: float = 5.0,
     return df
 
 
+def schedule_tickets(df: pd.DataFrame, member: str, daily_h: float, holidays,
+                     today: Optional[datetime.date] = None, factor: float = 1.0) -> dict:
+    """
+    担当者の全チケット（全Task・全Project横断）を対象に EDF＋整合どりスケジューリングを行う。
+
+    アルゴリズム:
+      ① 各Task配下のチケットごとに仮納期を逆算（fill_deadlines_backward）
+         → 最後のチケットに納期がなければ親Taskの納期を使用
+      ② 全チケットをまとめてEDFソート（仮納期昇順）
+      ③ 1日の作業時間（Configで設定）を使ってグローバルに作業日を割り当て
+         → 開始可能日制約で飛ばしたチケットは優先1で再チェック
+      ④ 作業日が納期より遅い場合はアラート（呼び出し側でd > deadlineで判定）
+
+    factor: 残り工数の見積係数（E2 納期リスク予報用。1.0 ならガントと同じ計算）
+      残り工数 = 見積 × factor − 実績
+
+    Returns:
+        {ticket_idx: (work_days: set[date], start_avail: date|None, deadline: date|None)}
+    """
+    daily_h = max(0.25, float(daily_h))
+    today = today or datetime.date.today()
+
+    holidays_upper = {h.strip().upper() for h in holidays}
+    day_abbrevs = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+
+    def is_holiday(d: datetime.date) -> bool:
+        return day_abbrevs[d.weekday()] in holidays_upper
+
+    def parse_date(val) -> Optional[datetime.date]:
+        if val and str(val) not in ("", "nan", "None"):
+            try:
+                return datetime.date.fromisoformat(str(val))
+            except Exception:
+                pass
+        return None
+
+    # ① 全Taskを横断して担当者のチケットを収集し、Taskごとに仮納期を計算
+    # done/cancel のTaskは完了済みのため除外（配下のチケットもスケジュール不要）
+    all_tasks = df[
+        (df["node_type"] == "task")
+        & (~df["status"].isin(["done", "cancel", "deleted"]))
+    ]
+
+    collected: list[pd.DataFrame] = []
+    for task_idx in all_tasks.index:
+        # このタスク配下で担当者のチケット（done/cancel/deleted除外）
+        # done は既に完了済みのため未来の作業スロットを消費しない
+        tickets = df[
+            (df["parent_id"] == task_idx)
+            & (df["node_type"] == "ticket")
+            & (~df["status"].isin(["done", "cancel", "deleted"]))
+            & (df.get("assigned_to", pd.Series(dtype=str)) == member)
+        ].copy()
+        if tickets.empty:
+            continue
+
+        # 親タスクの納期（最後のチケットに納期がない場合のフォールバック）
+        parent_dl = parse_date(df.loc[task_idx].get("deadline")) if task_idx in df.index else None
+
+        # 仮納期を填入
+        tickets = fill_deadlines_backward(tickets, daily_h, parent_deadline=parent_dl)
+
+        # 同一Task内で開始可能日を後方チケットへ伝播
+        # 例) A:3/3, B:-(なし), C:3/7, D:-(なし) → B:3/3, D:3/7
+        tickets = tickets.sort_values("priority")
+        running_start: Optional[datetime.date] = None
+        for t_idx in tickets.index:
+            raw = tickets.loc[t_idx, "start_available"]
+            explicit: Optional[datetime.date] = None
+            if raw and str(raw) not in ("", "nan", "None"):
+                try:
+                    explicit = datetime.date.fromisoformat(str(raw))
+                except Exception:
+                    pass
+            if explicit is not None:
+                effective = max(running_start, explicit) if running_start else explicit
+                running_start = effective
+                tickets.loc[t_idx, "start_available"] = effective.isoformat()
+            elif running_start is not None:
+                tickets.loc[t_idx, "start_available"] = running_start.isoformat()
+
+        collected.append(tickets)
+
+    if not collected:
+        return {}
+
+    # ② 全チケットをマージしてEDFソート
+    all_tickets = pd.concat(collected)
+    all_tickets["_dl_sort"] = pd.to_datetime(all_tickets["deadline"], errors="coerce")
+    # 納期が過去（today以前）の場合、EDFソートキーをtodayに統一する
+    # → 全ての期限超過チケットを同等の緊急度として扱い、priorityフィールドで順序を決定
+    # ※ アラート表示（d > deadline）は元の納期で正しく評価されるため影響なし
+    pd_today = pd.Timestamp(today)
+    all_tickets["_dl_sort"] = all_tickets["_dl_sort"].clip(lower=pd_today)
+    all_tickets = all_tickets.sort_values(["_dl_sort", "priority"], na_position="last")
+    edf_order = list(all_tickets.index)
+
+    # ③ 整合どりスケジューリング（全チケット横断・1日作業時間=daily_h）
+    unscheduled = list(edf_order)
+    skipped: list = []
+    cursor = today
+    cursor_h = 0.0
+    result = {}
+
+    while unscheduled or skipped:
+        candidates = skipped + [t for t in unscheduled if t not in skipped]
+
+        scheduled_any = False
+
+        for t_idx in candidates:
+            if t_idx not in all_tickets.index:
+                if t_idx in skipped:     skipped.remove(t_idx)
+                if t_idx in unscheduled: unscheduled.remove(t_idx)
+                scheduled_any = True
+                break
+
+            tr = all_tickets.loc[t_idx]
+            start_avail = parse_date(tr.get("start_available"))
+            deadline    = parse_date(tr.get("deadline"))
+
+            if start_avail and cursor < start_avail:
+                if t_idx not in skipped:
+                    skipped.append(t_idx)
+                if t_idx in unscheduled:
+                    unscheduled.remove(t_idx)
+                continue
+
+            if t_idx in skipped:     skipped.remove(t_idx)
+            if t_idx in unscheduled: unscheduled.remove(t_idx)
+
+            est_h      = float(tr.get("estimated_hours", 0) or 0)
+            act_h      = float(tr.get("actual_hours", 0) or 0)
+            remaining_h = max(0.0, est_h * factor - act_h)
+            # todoで残り工数が0以下の場合は0.5hとして作業日を算出
+            t_status = str(tr.get("status", ""))
+            if remaining_h < 0.001 and t_status == "todo":
+                remaining_h = 0.5
+
+            work_days: set = set()
+            if remaining_h > 0.001:
+                h_left   = remaining_h
+                d        = cursor
+                h_in_day = cursor_h
+                itr      = 0
+                while h_left > 0.001 and itr < 1000:
+                    if is_holiday(d):
+                        d += datetime.timedelta(days=1); h_in_day = 0.0; itr += 1; continue
+                    avail = daily_h - h_in_day
+                    if avail <= 0.001:
+                        d += datetime.timedelta(days=1); h_in_day = 0.0; itr += 1; continue
+                    used = min(avail, h_left)
+                    work_days.add(d)
+                    h_left -= used; h_in_day += used
+                    if h_in_day >= daily_h - 0.001:
+                        d += datetime.timedelta(days=1); h_in_day = 0.0
+                    itr += 1
+                cursor   = d
+                cursor_h = h_in_day
+
+            result[t_idx] = (work_days, start_avail, deadline)
+            scheduled_any = True
+            break
+
+        if not scheduled_any:
+            all_pending = list(dict.fromkeys(skipped + unscheduled))
+            next_dates  = [
+                parse_date(all_tickets.loc[t, "start_available"])
+                for t in all_pending if t in all_tickets.index
+            ]
+            next_dates = [nd for nd in next_dates if nd is not None]
+            if next_dates:
+                cursor   = min(next_dates)
+                cursor_h = 0.0
+            else:
+                break
+
+    return result
+
+
 # ---------- 完了チェック（spec 2.2 自動 done 伝播） ----------
 
 def check_auto_done(df_nodes: pd.DataFrame, changed_idx: str) -> List[str]:
@@ -1598,3 +1777,66 @@ def append_work_log(memo: str, text: str, now: Optional[datetime.datetime] = Non
     line = f"[{now:%m/%d %H:%M}] {body}"
     memo = (memo or "").rstrip("\n")
     return f"{memo}\n{line}" if memo else line
+
+
+# ============================================================
+# E2: 納期リスク予報
+# ============================================================
+
+def estimate_factor(df_nodes: pd.DataFrame, user: str, min_count: int = 5,
+                    lo: float = 1.0, hi: float = 2.0) -> tuple:
+    """
+    見積係数（自分の完了チケットの 実績÷見積 の平均）と件数を返す。
+    実績 0（未記録）は除外。件数が min_count 未満なら 1.0。係数は lo〜hi に丸める。
+    """
+    ratios = [a["ratio"] for a in calc_estimate_accuracy(df_nodes, user) if a["actual"] > 0]
+    if len(ratios) < min_count:
+        return 1.0, len(ratios)
+    avg = sum(ratios) / len(ratios)
+    return round(min(hi, max(lo, avg)), 2), len(ratios)
+
+
+def _business_days_between(d_from: datetime.date, d_to: datetime.date, holidays) -> int:
+    """d_from の翌日〜d_to（両端含む側は d_to）の営業日数"""
+    hol = {h.strip().upper() for h in holidays}
+    n, d = 0, d_from
+    while d < d_to:
+        d += datetime.timedelta(days=1)
+        if _DAY_ABBR[d.weekday()] not in hol:
+            n += 1
+    return n
+
+
+def deadline_risks(df_nodes: pd.DataFrame, member: str, daily_h: float, holidays,
+                   today: Optional[datetime.date] = None, factor: float = 1.0) -> List[dict]:
+    """
+    今のペース（1 日 daily_h 時間・残り＝見積×factor−実績）で作業すると、
+    納期（今日以降に設定された実際の納期）に間に合わないチケットを返す。
+    過去の納期は既存の「納期超過」アラートで扱うため含めない。
+    定常（regularly）は繰り返しの仕事のため予報しない。
+    戻り値: [{"idx","title","task","deadline","finish","late_days"}]（納期順）
+    """
+    today = today or datetime.date.today()
+    if df_nodes.empty:
+        return []
+    sched = schedule_tickets(df_nodes, member, daily_h, holidays, today, factor)
+    risks = []
+    for idx, (days, _start, _dl) in sched.items():
+        if idx not in df_nodes.index or str(df_nodes.loc[idx, "status"]) == "regularly":
+            continue
+        real = _parse_date(str(df_nodes.loc[idx, "deadline"] or ""))
+        if not real or not days:
+            continue
+        dl = datetime.date.fromisoformat(real)
+        finish = max(days)
+        if dl < today or finish <= dl:
+            continue
+        risks.append({
+            "idx": idx,
+            "title": str(df_nodes.loc[idx, "title"]),
+            "task": _ancestor_title(df_nodes, idx, "task"),
+            "deadline": dl, "finish": finish,
+            "late_days": _business_days_between(dl, finish, holidays),
+        })
+    risks.sort(key=lambda r: (r["deadline"], r["finish"]))
+    return risks

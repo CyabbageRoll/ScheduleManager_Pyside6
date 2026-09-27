@@ -2139,6 +2139,88 @@ def test_f1_work_log(win, ticket_idx, ticket2_idx):
         ng("他人のチケット", e)
 
 
+def test_e2_deadline_risk(win, task_idx):
+    """E2: 納期リスク予報（見積係数・Today・ガント・Config）"""
+    print("\n[E2] 納期リスク予報テスト")
+    import pandas as pd
+    import logic as LG
+    import ui_sub
+    from db import create_initial_node
+    state = win.state
+    me = state.user
+
+    def frame(rows):
+        return pd.DataFrame([r for r in rows]).set_index(pd.Index([r.name for r in rows]))
+    try:
+        base = []
+        for i, ratio in enumerate([1.2, 1.4, 1.3, 1.1, 1.5]):
+            n = create_initial_node(me, "ticket", f"済{i}", "t", i)
+            n["status"] = "done"; n["estimated_hours"] = 2.0; n["actual_hours"] = 2.0 * ratio
+            base.append(n)
+        df = frame(base)
+        assert LG.estimate_factor(df, me) == (1.3, 5), LG.estimate_factor(df, me)
+        assert LG.estimate_factor(frame(base[:4]), me) == (1.0, 4), "5 件未満は 1.0"
+        base[0]["actual_hours"] = 0.0           # 実績未記録は除外 → 4 件で 1.0
+        assert LG.estimate_factor(frame(base), me) == (1.0, 4)
+        big = frame([create_initial_node(me, "ticket", f"遅{i}", "t", i) for i in range(5)])
+        big["status"] = "done"; big["estimated_hours"] = 1.0; big["actual_hours"] = 5.0
+        assert LG.estimate_factor(big, me)[0] == 2.0, "上限 2.0 に丸めない"
+        ok("見積係数: 実績÷見積の平均（完了 5 件未満・実績 0 は除外、1.0〜2.0 に丸め）")
+    except Exception as e:
+        ng("estimate_factor", e)
+    try:
+        # 月曜 9/28 起点・1 日 5h。納期 9/29(火) の 8h → 係数 1.0 なら間に合う、1.5 なら 12h で 9/30 完了
+        T = datetime.date(2026, 9, 28)
+        task = create_initial_node(me, "task", "T", "p", 1)
+        tk = create_initial_node(me, "ticket", "資料作成", task.name, 1)
+        tk["estimated_hours"] = 8.0; tk["deadline"] = "2026-09-29"
+        df = frame([task, tk])
+        assert LG.deadline_risks(df, me, 5.0, ["SAT", "SUN"], T, 1.0) == []
+        r = LG.deadline_risks(df, me, 5.0, ["SAT", "SUN"], T, 1.5)
+        assert len(r) == 1 and r[0]["finish"] == datetime.date(2026, 9, 30) and r[0]["late_days"] == 1, r
+        assert r[0]["task"] == "T"
+        tk["status"] = "regularly"                # 定常は予報しない
+        assert LG.deadline_risks(frame([task, tk]), me, 5.0, ["SAT", "SUN"], T, 1.5) == []
+        tk["status"] = "todo"
+        tk["deadline"] = "2026-09-25"             # 過去の納期は予報に含めない（超過アラートで扱う）
+        assert LG.deadline_risks(frame([task, tk]), me, 5.0, ["SAT", "SUN"], T, 1.5) == []
+        ok("予報: 見積×係数の残りで間に合わない今日以降の納期だけを返す（営業日で遅れ日数）")
+    except Exception as e:
+        ng("deadline_risks", e)
+    added = None
+    orig = state.config.risk_use_factor
+    try:
+        n = create_initial_node(me, "ticket", "巨大チケット", task_idx, 60)
+        n["estimated_hours"] = 200.0
+        n["deadline"] = (datetime.date.today() + datetime.timedelta(days=3)).isoformat()
+        state.df_nodes.loc[n.name] = n
+        added = n.name
+        dv = win.dashboard_view
+        dv.refresh()
+        lst = dv._cards["edit"]["list"]
+        texts = [lst.item(i).text() for i in range(lst.count())]
+        hits = [t for t in texts if t.startswith("🔮予報") and "巨大チケット" in t]
+        assert len(hits) == 1, texts
+        assert not any(t.startswith("接近") and "巨大チケット" in t for t in texts), "接近と予報が重複"
+        ok("Today の納期アラートに 🔮予報 を表示（接近との重複なし）")
+        gv = win.gantt_view
+        state.current_member = me
+        gv._status_radios["all"].setChecked(True)
+        gv._rebuild_table()
+        titles = [gv.table.item(r, 1).text() for r in range(gv.table.rowCount()) if gv.table.item(r, 1)]
+        assert any("🔮" in t and "巨大チケット" in t for t in titles), titles
+        ok("ガントのタイトルに 🔮 と予報のツールチップ")
+        state.config.risk_use_factor = False
+        assert ui_sub.deadline_risk_forecast(state, me)[1] == 1.0
+        ok("Config risk_use_factor=false で係数 1.0（見積どおり）")
+    except Exception as e:
+        ng("Today・ガントの予報表示", e)
+    finally:
+        state.config.risk_use_factor = orig
+        if added in state.df_nodes.index:
+            state.df_nodes.drop(index=[added], inplace=True)
+
+
 def test_theme():
     """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
     print("\n[D1] テーマ集約テスト")
@@ -2225,6 +2307,7 @@ def main():
             test_analysis_0925(win, pj_idx, task_idx, ticket_idx)
             test_e1_estimate_assist(win, task_idx)
             test_f1_work_log(win, ticket_idx, ticket2_idx)
+            test_e2_deadline_risk(win, task_idx)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

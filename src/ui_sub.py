@@ -33,6 +33,26 @@ from ui_widgets import (
 from theme import C, qss, LEVEL_BG, LEVEL_FG, STYLE_CHIP, STYLE_LABEL_INFO
 
 
+# ---------- E2: 納期リスク予報（Today・ガント共通）----------
+
+def deadline_risk_forecast(state, member: str) -> tuple:
+    """member の納期リスク予報を返す: (risks, 係数, 係数の元になった完了件数)
+    Config の risk_use_factor が false なら係数は 1.0（見積どおり）"""
+    cfg = state.config
+    factor, n = (LG.estimate_factor(state.df_nodes, member) if cfg.risk_use_factor
+                 else (1.0, 0))
+    risks = LG.deadline_risks(state.df_nodes, member, cfg.daily_task_hour,
+                              cfg.holidays, factor=factor)
+    return risks, factor, n
+
+
+def risk_text(r: dict) -> str:
+    """予報 1 件の説明（例: 10/5 完了見込み・納期 10/3 から 2 営業日遅れ）"""
+    f, d = r["finish"], r["deadline"]
+    return (f"{f.month}/{f.day} 完了見込み・納期 {d.month}/{d.day} から"
+            f" {r['late_days']} 営業日遅れ")
+
+
 # ---------- 項目4: ガントチャートセル用デリゲート ----------
 
 class _GanttCellDelegate(QStyledItemDelegate):
@@ -206,180 +226,9 @@ class GanttView(QWidget):
         return "all"
 
     def _compute_all_schedules(self, df: pd.DataFrame, member: str) -> dict:
-        """
-        担当者の全チケット（全Task・全Project横断）を対象に EDF＋整合どりスケジューリングを行う。
-
-        アルゴリズム:
-          ① 各Task配下のチケットごとに仮納期を逆算（fill_deadlines_backward）
-             → 最後のチケットに納期がなければ親Taskの納期を使用
-          ② 全チケットをまとめてEDFソート（仮納期昇順）
-          ③ 1日の作業時間（Configで設定）を使ってグローバルに作業日を割り当て
-             → 開始可能日制約で飛ばしたチケットは優先1で再チェック
-          ④ 作業日が納期より遅い場合はアラート（呼び出し側でd > deadlineで判定）
-
-        Returns:
-            {ticket_idx: (work_days: set[date], start_avail: date|None, deadline: date|None)}
-        """
-        daily_h = max(0.25, float(self.state.config.daily_task_hour))
-        today = datetime.date.today()
-
-        holidays_upper = {h.strip().upper() for h in self.state.config.holidays}
-        day_abbrevs = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-
-        def is_holiday(d: datetime.date) -> bool:
-            return day_abbrevs[d.weekday()] in holidays_upper
-
-        def parse_date(val) -> Optional[datetime.date]:
-            if val and str(val) not in ("", "nan", "None"):
-                try:
-                    return datetime.date.fromisoformat(str(val))
-                except Exception:
-                    pass
-            return None
-
-        import logic as LG
-
-        # ① 全Taskを横断して担当者のチケットを収集し、Taskごとに仮納期を計算
-        # done/cancel のTaskは完了済みのため除外（配下のチケットもスケジュール不要）
-        all_tasks = df[
-            (df["node_type"] == "task")
-            & (~df["status"].isin(["done", "cancel", "deleted"]))
-        ]
-
-        collected: list[pd.DataFrame] = []
-        for task_idx in all_tasks.index:
-            # このタスク配下で担当者のチケット（done/cancel/deleted除外）
-            # done は既に完了済みのため未来の作業スロットを消費しない
-            tickets = df[
-                (df["parent_id"] == task_idx)
-                & (df["node_type"] == "ticket")
-                & (~df["status"].isin(["done", "cancel", "deleted"]))
-                & (df.get("assigned_to", pd.Series(dtype=str)) == member)
-            ].copy()
-            if tickets.empty:
-                continue
-
-            # 親タスクの納期（最後のチケットに納期がない場合のフォールバック）
-            parent_dl = parse_date(df.loc[task_idx].get("deadline")) if task_idx in df.index else None
-
-            # 仮納期を填入
-            tickets = LG.fill_deadlines_backward(tickets, daily_h, parent_deadline=parent_dl)
-
-            # 同一Task内で開始可能日を後方チケットへ伝播
-            # 例) A:3/3, B:-(なし), C:3/7, D:-(なし) → B:3/3, D:3/7
-            tickets = tickets.sort_values("priority")
-            running_start: Optional[datetime.date] = None
-            for t_idx in tickets.index:
-                raw = tickets.loc[t_idx, "start_available"]
-                explicit: Optional[datetime.date] = None
-                if raw and str(raw) not in ("", "nan", "None"):
-                    try:
-                        explicit = datetime.date.fromisoformat(str(raw))
-                    except Exception:
-                        pass
-                if explicit is not None:
-                    effective = max(running_start, explicit) if running_start else explicit
-                    running_start = effective
-                    tickets.loc[t_idx, "start_available"] = effective.isoformat()
-                elif running_start is not None:
-                    tickets.loc[t_idx, "start_available"] = running_start.isoformat()
-
-            collected.append(tickets)
-
-        if not collected:
-            return {}
-
-        # ② 全チケットをマージしてEDFソート
-        all_tickets = pd.concat(collected)
-        all_tickets["_dl_sort"] = pd.to_datetime(all_tickets["deadline"], errors="coerce")
-        # 納期が過去（today以前）の場合、EDFソートキーをtodayに統一する
-        # → 全ての期限超過チケットを同等の緊急度として扱い、priorityフィールドで順序を決定
-        # ※ アラート表示（d > deadline）は元の納期で正しく評価されるため影響なし
-        pd_today = pd.Timestamp(today)
-        all_tickets["_dl_sort"] = all_tickets["_dl_sort"].clip(lower=pd_today)
-        all_tickets = all_tickets.sort_values(["_dl_sort", "priority"], na_position="last")
-        edf_order = list(all_tickets.index)
-
-        # ③ 整合どりスケジューリング（全チケット横断・1日作業時間=daily_h）
-        unscheduled = list(edf_order)
-        skipped: list = []
-        cursor = today
-        cursor_h = 0.0
-        result = {}
-
-        while unscheduled or skipped:
-            candidates = skipped + [t for t in unscheduled if t not in skipped]
-
-            scheduled_any = False
-
-            for t_idx in candidates:
-                if t_idx not in all_tickets.index:
-                    if t_idx in skipped:     skipped.remove(t_idx)
-                    if t_idx in unscheduled: unscheduled.remove(t_idx)
-                    scheduled_any = True
-                    break
-
-                tr = all_tickets.loc[t_idx]
-                start_avail = parse_date(tr.get("start_available"))
-                deadline    = parse_date(tr.get("deadline"))
-
-                if start_avail and cursor < start_avail:
-                    if t_idx not in skipped:
-                        skipped.append(t_idx)
-                    if t_idx in unscheduled:
-                        unscheduled.remove(t_idx)
-                    continue
-
-                if t_idx in skipped:     skipped.remove(t_idx)
-                if t_idx in unscheduled: unscheduled.remove(t_idx)
-
-                est_h      = float(tr.get("estimated_hours", 0) or 0)
-                act_h      = float(tr.get("actual_hours", 0) or 0)
-                remaining_h = max(0.0, est_h - act_h)
-                # todoで残り工数が0以下の場合は0.5hとして作業日を算出
-                t_status = str(tr.get("status", ""))
-                if remaining_h < 0.001 and t_status == "todo":
-                    remaining_h = 0.5
-
-                work_days: set = set()
-                if remaining_h > 0.001:
-                    h_left   = remaining_h
-                    d        = cursor
-                    h_in_day = cursor_h
-                    itr      = 0
-                    while h_left > 0.001 and itr < 1000:
-                        if is_holiday(d):
-                            d += datetime.timedelta(days=1); h_in_day = 0.0; itr += 1; continue
-                        avail = daily_h - h_in_day
-                        if avail <= 0.001:
-                            d += datetime.timedelta(days=1); h_in_day = 0.0; itr += 1; continue
-                        used = min(avail, h_left)
-                        work_days.add(d)
-                        h_left -= used; h_in_day += used
-                        if h_in_day >= daily_h - 0.001:
-                            d += datetime.timedelta(days=1); h_in_day = 0.0
-                        itr += 1
-                    cursor   = d
-                    cursor_h = h_in_day
-
-                result[t_idx] = (work_days, start_avail, deadline)
-                scheduled_any = True
-                break
-
-            if not scheduled_any:
-                all_pending = list(dict.fromkeys(skipped + unscheduled))
-                next_dates  = [
-                    parse_date(all_tickets.loc[t, "start_available"])
-                    for t in all_pending if t in all_tickets.index
-                ]
-                next_dates = [nd for nd in next_dates if nd is not None]
-                if next_dates:
-                    cursor   = min(next_dates)
-                    cursor_h = 0.0
-                else:
-                    break
-
-        return result
+        """担当者の全チケットの作業日を EDF で割り当てる（処理本体は logic.schedule_tickets）"""
+        cfg = self.state.config
+        return LG.schedule_tickets(df, member, cfg.daily_task_hour, cfg.holidays)
 
     def _on_section_resized(self, col: int, _old: int, new: int) -> None:
         """固定列の幅をドラッグで変えたら記憶する（再構築・タブ切替で元に戻さない）"""
@@ -476,6 +325,9 @@ class GanttView(QWidget):
         # 担当者の全チケットを横断してグローバルにスケジューリング（一括計算）
         # 戻り値: {ticket_idx: (work_days: set, start_avail, deadline)}
         global_schedule = self._compute_all_schedules(df, filter_member)
+        # E2: 納期リスク予報（見積係数を反映した見込み）でタイトルに 🔮 を付ける
+        risks, risk_factor, _n = deadline_risk_forecast(self.state, filter_member)
+        risk_map = {r["idx"]: r for r in risks}
 
         tasks = df[
             (df["node_type"] == "task")
@@ -639,12 +491,15 @@ class GanttView(QWidget):
                 ]
                 if memo_str:
                     tip_lines.append(f"Memo      : {memo_str}")
+                risk = risk_map.get(t_idx)
+                if risk:
+                    tip_lines.append(f"🔮 予報    : {risk_text(risk)}（見積係数 ×{risk_factor:g}）")
                 tooltip = "\n".join(tip_lines)
 
                 # ── 固定列を作成（tooltip をアイテム生成時に直接設定）──
                 for c, val in enumerate([
                     f"  {status_icon} Ticket",
-                    f"  {tr.get('title', '')}",
+                    f"  {'🔮 ' if risk else ''}{tr.get('title', '')}",
                     t_status,
                     self.state.display_name(str(tr.get("assigned_to", ""))),
                     f"{est_h:.1f}",
@@ -657,6 +512,8 @@ class GanttView(QWidget):
                         item.setForeground(QColor(C.TEXT_DONE))
                     else:
                         item.setBackground(t_bg)
+                        if risk and c == 1:
+                            item.setForeground(QColor(C.DANGER))
                     self.table.setItem(r2, c, item)
 
                 # ▶（開始可能日）/ 🏁（納期）/ 🔨（作業日）マーカー
@@ -3613,6 +3470,10 @@ class ConfigView(QWidget):
         self._dspin("sch_task_hour", cfg.daily_task_hour,  fl, "daily_task_hour (h/日):", 0.5, 24.0)
         self._text("sch_holidays", ", ".join(cfg.holidays), fl,
                    "holidays (SUN/MON/TUE/WED/THU/FRI/SAT カンマ区切り):")
+        self._choice("sch_risk_factor", "true" if cfg.risk_use_factor else "false", fl,
+                     "risk_use_factor (納期リスク予報):",
+                     [("true", "見積係数を掛ける（実績÷見積の傾向を反映）"),
+                      ("false", "見積どおりに計算する")])
 
     def _build_section_daily_info(self) -> None:
         cfg = self.state.config
@@ -3681,6 +3542,7 @@ class ConfigView(QWidget):
         _set("sch_end",          cfg.daily_end_time)
         _set("sch_task_hour",    cfg.daily_task_hour)
         _set("sch_holidays",     ", ".join(cfg.holidays))
+        _set("sch_risk_factor",  "true" if cfg.risk_use_factor else "false")
         _set("di_health",        ", ".join(cfg.health_options))
         _set("di_workplace",     ", ".join(cfg.work_place_options))
         _set("di_safety",        ", ".join(cfg.safety_options))
@@ -3745,6 +3607,7 @@ class ConfigView(QWidget):
         parser.set("Schedule", "daily_end_time",   self._get("sch_end"))
         parser.set("Schedule", "daily_task_hour",  self._get("sch_task_hour"))
         parser.set("Schedule", "holidays",         self._get("sch_holidays"))
+        parser.set("Schedule", "risk_use_factor",  self._get("sch_risk_factor"))
 
         _ensure("DailyInfoCombo")
         parser.set("DailyInfoCombo", "health_status", self._get("di_health"))
@@ -3918,10 +3781,30 @@ class DashboardView(QWidget):
             item = QListWidgetItem(
                 f"接近 {row['deadline']}  {row['title']}（{row['task']}）")
             item.setForeground(QColor(C.WARNING))
+            item.setData(Qt.ItemDataRole.UserRole, row["ticket_idx"])
             lst.addItem(item)
-        n_alerts = len(alerts["overdue"]) + len(alerts["approaching"])
+        # E2: 納期リスク予報（このペースだと間に合わない。接近と重なるものは予報で表示）
+        risks, factor, n_done = deadline_risk_forecast(self.state, user)
+        risk_ids = {r["idx"] for r in risks}
+        for r in risks:
+            item = QListWidgetItem(f"🔮予報 {risk_text(r)}  {r['title']}（{r['task']}）")
+            item.setForeground(QColor(C.DANGER))
+            item.setToolTip("今のペース（1 日 {:g}h・見積係数 ×{:g}）で進めた場合の見込みです"
+                            .format(self.state.config.daily_task_hour, factor))
+            lst.insertItem(len(alerts["overdue"]), item)   # 超過の次に並べる
+        for i in range(lst.count() - 1, -1, -1):
+            it = lst.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) in risk_ids:
+                lst.takeItem(i)
+        n_alerts = lst.count()
         if n_alerts == 0:
             lst.addItem("納期リスクはありません ✅")
+        elif risks:
+            note = QListWidgetItem(
+                f"　※予報は 1 日 {self.state.config.daily_task_hour:g}h・見積係数 ×{factor:g}"
+                + (f"（完了 {n_done} 件の実績÷見積）" if factor != 1.0 else "") + " で計算")
+            note.setForeground(QColor(C.TEXT_MUTED))
+            lst.addItem(note)
         self._set_badge("edit", n_alerts)
 
         # 3. 未処理の依頼（自分宛 pending）

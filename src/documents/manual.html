@@ -376,7 +376,7 @@
 <table>
   <tr><th>カード</th><th>内容</th><th>「→ 開く」の遷移先</th></tr>
   <tr><td>📅 今日のスケジュール</td><td>当日の予定を時間帯ごとに表示＋合計時間</td><td>Main タブ</td></tr>
-  <tr><td>⏰ 納期アラート</td><td>自分担当の納期超過（赤）・7日以内（橙）チケット</td><td>Edit タブ</td></tr>
+  <tr><td>⏰ 納期アラート</td><td>自分担当の納期超過（赤）・🔮予報（赤）・7日以内（橙）チケット</td><td>Edit タブ</td></tr>
   <tr><td>📨 未処理の依頼</td><td>自分宛の承諾待ち依頼</td><td>Request タブ</td></tr>
   <tr><td>👥 チームの今日</td><td>メンバーの体調・勤務地（未入力者はグレー表示）</td><td>Team タブ</td></tr>
 </table>
@@ -384,6 +384,16 @@
 <div class="card tip">
   <strong>✅ 件数バッジ</strong>: 各カードの件数がひと目で分かります。問題がなければ ✅ が表示されます。
 </div>
+
+<h3 id="deadline-risk">🔮 納期リスク予報</h3>
+<p>残りの作業を<strong>今のペース</strong>（1 日の標準作業時間 <code>[Schedule] daily_task_hour</code>・休日・納期順）で進めた場合に、
+<strong>まだ過ぎていない納期に間に合わない</strong>チケットを「🔮予報 10/1 完了見込み・納期 9/29 から 2 営業日遅れ」のように表示します。
+ガントでもタイトルに 🔮 が付き、マウスを乗せると見込みが出ます。定常（regularly）チケットは対象外です。</p>
+<ul>
+  <li><strong>見積係数</strong>: 自分の完了チケットの「実績÷見積」の平均（例 ×1.3 ＝見積より 3 割多くかかる傾向）を残りの見積に掛けます。
+    完了実績が 5 件未満のときは ×1.0、範囲は ×1.0〜×2.0 です</li>
+  <li>係数を使わず見積どおりに計算したいときは <a href="#config-tab">⚙ Config</a> → <code>[Schedule] risk_use_factor</code> を「見積どおりに計算する」にします</li>
+</ul>
 
 <div class="card info">
   <strong>💡 起動時のタブを変えるには</strong><br>
@@ -982,7 +992,7 @@ ticket_idx: ...</pre>
   <tr><td>[User]</td><td>自分のユーザー名、チームメンバー一覧</td></tr>
   <tr><td>[DisplayNames]</td><td>ユーザー名 → 画面表示名のマッピング</td></tr>
   <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ、<code>start_tab</code>（起動時タブ: Today/Main/Plan/Edit/前回終了時。プルダウンで選択）、<code>detail_pane</code>（詳細ペインの起動時開閉: open/closed）</td></tr>
-  <tr><td>[Schedule]</td><td>営業時間（始業・終業）、1日の標準作業時間、休日</td></tr>
+  <tr><td>[Schedule]</td><td>営業時間（始業・終業）、1日の標準作業時間、休日、<code>risk_use_factor</code>（納期リスク予報で見積係数を掛けるか）</td></tr>
   <tr><td>[DailyInfoCombo]</td><td>健・場・安・残 の選択肢リスト</td></tr>
   <tr><td>[Report]</td><td><code>output_dir</code>: レポート・当日ログの Markdown 出力先フォルダ</td></tr>
   <tr><td>[Pomodoro]</td><td><code>work_minutes</code> / <code>break_minutes</code>: 作業・休憩時間（分）</td></tr>

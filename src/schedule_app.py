@@ -65,6 +65,7 @@ class AppConfig:
     daily_end_time: int = 21
     daily_task_hour: float = 5.0
     holidays: List[str] = field(default_factory=lambda: ["SUN", "SAT"])
+    risk_use_factor: bool = True   # E2 納期リスク予報で見積係数（実績÷見積）を掛けるか
 
     # [DailyInfoCombo]
     health_options: List[str] = field(default_factory=lambda: ["Good", "Bad"])
@@ -149,6 +150,8 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
         cfg.daily_task_hour  = parser.getfloat("Schedule", "daily_task_hour", fallback=cfg.daily_task_hour)
         raw_hol = parser.get("Schedule", "holidays", fallback="SUN,SAT")
         cfg.holidays = [h.strip().upper() for h in raw_hol.split(",") if h.strip()]
+        cfg.risk_use_factor = parser.getboolean("Schedule", "risk_use_factor",
+                                                fallback=cfg.risk_use_factor)
 
     # [DailyInfoCombo]
     if parser.has_section("DailyInfoCombo"):
