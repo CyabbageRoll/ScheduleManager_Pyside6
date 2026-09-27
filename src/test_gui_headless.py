@@ -2483,6 +2483,39 @@ def test_f3_now_window(win, state, version, tmpdir, ticket_idx):
         ng("小窓の状態の記憶", e)
 
 
+def test_i3_dark_mode(win):
+    """I3: ダークモード（配色の切替・Config の選択肢・起動時の判定）"""
+    print("\n[I3] ダークモードテスト")
+    import theme
+    from schedule_app import AppConfig
+    light = {k: getattr(theme.C, k) for k in vars(theme.C) if k.isupper()}
+    btn, level = theme.STYLE_BUTTON, theme.LEVEL_BG
+    try:
+        theme.set_mode("dark")
+        assert theme.MODE == "dark" and theme.C.SURFACE == theme.DARK["SURFACE"]
+        assert theme.STYLE_BUTTON != btn and "#2A2640" in theme.STYLE_BUTTON, "共通スタイルが作り直されない"
+        assert theme.LEVEL_BG is level and level["task"] == theme.DARK["TASK_BG"], "階層色の辞書が更新されない"
+        assert theme.mpl_style()["axes.facecolor"] == theme.DARK["SURFACE"]
+        assert theme.C.NODE_DEFAULT == light["NODE_DEFAULT"], "ダークに無いトークンはライトの値を使う"
+        theme.set_mode("light")
+        assert {k: getattr(theme.C, k) for k in light} == light and theme.STYLE_BUTTON == btn
+        ok("set_mode: ダーク⇄ライトで色・共通スタイル・階層色・グラフ色が切り替わり、元に戻る")
+    except Exception as e:
+        ng("set_mode", e)
+    finally:
+        theme.set_mode("light")
+    try:
+        R = theme.resolve_mode
+        assert R("dark", False) == "dark" and R("light", True) == "light"
+        assert R("system", True) == "dark" and R("system", False) == "light" and R("", True) == "light"
+        assert AppConfig().theme == "light"
+        w = win.config_view._fields["gui_theme"]
+        assert [w.itemData(i) for i in range(w.count())] == ["light", "dark", "system"]
+        ok("Config の theme（ライト／ダーク／OS に合わせる、既定ライト）と起動時の判定")
+    except Exception as e:
+        ng("theme 設定", e)
+
+
 def test_theme():
     """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
     print("\n[D1] テーマ集約テスト")
@@ -2574,6 +2607,7 @@ def main():
             test_g4_forecast(win, task_idx)
             test_g2_achievement(win)
             test_f3_now_window(win, state, version, tmpdir, ticket_idx)
+            test_i3_dark_mode(win)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

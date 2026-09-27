@@ -405,6 +405,12 @@
 </ul>
 
 <div class="card info">
+  <strong>🌙 ダークモード</strong><br>
+  <a href="#config-tab">⚙ Config タブ</a> → <code>[GUI] theme</code> で「🌙 ダーク」を選び、config.ini に保存してアプリを再起動すると夜用の暗い配色になります。
+  「OS の設定に合わせる」にすると、Windows の「アプリ モード」（ライト／ダーク）に合わせて起動時に切り替わります。
+</div>
+
+<div class="card info">
   <strong>💡 起動時のタブを変えるには</strong><br>
   <a href="#config-tab">⚙ Config タブ</a> → <code>[GUI] start_tab</code> のプルダウンで Today / Main / Plan / Edit / 前回終了時のタブ から選択（既定は Today）。
 </div>
@@ -1028,7 +1034,7 @@ ticket_idx: ...</pre>
   <tr><td>[Database]</td><td>DB 保存フォルダのパス</td></tr>
   <tr><td>[User]</td><td>自分のユーザー名、チームメンバー一覧</td></tr>
   <tr><td>[DisplayNames]</td><td>ユーザー名 → 画面表示名のマッピング</td></tr>
-  <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ、<code>start_tab</code>（起動時タブ: Today/Main/Plan/Edit/前回終了時。プルダウンで選択）、<code>detail_pane</code>（詳細ペインの起動時開閉: open/closed）</td></tr>
+  <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ、<code>start_tab</code>（起動時タブ: Today/Main/Plan/Edit/前回終了時。プルダウンで選択）、<code>theme</code>（配色: ☀ ライト / 🌙 ダーク / OS の設定に合わせる。再起動で反映）、<code>detail_pane</code>（詳細ペインの起動時開閉: open/closed）</td></tr>
   <tr><td>[Schedule]</td><td>営業時間（始業・終業）、1日の標準作業時間、休日、<code>risk_use_factor</code>（納期リスク予報で見積係数を掛けるか）</td></tr>
   <tr><td>[DailyInfoCombo]</td><td>健・場・安・残 の選択肢リスト</td></tr>
   <tr><td>[Report]</td><td><code>output_dir</code>: レポート・当日ログの Markdown 出力先フォルダ</td></tr>

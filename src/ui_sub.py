@@ -1779,6 +1779,8 @@ class AnalysisView(QWidget):
         _candidates = ["Hiragino Sans", "Yu Gothic", "Noto Sans CJK JP", "sans-serif"]
         matplotlib.rcParams["font.family"] = [f for f in _candidates
                                                if f in _installed or f == "sans-serif"]
+        from theme import mpl_style
+        matplotlib.rcParams.update(mpl_style())   # ライト／ダークの配色に合わせる
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -3625,6 +3627,8 @@ class ConfigView(QWidget):
         self._spin("gui_font_size",     cfg.font_size,     fl, "font_size:",     6, 24)
         self._choice("gui_start_tab", cfg.start_tab, fl, "start_tab (起動時のタブ):",
                      self._START_TAB_OPTIONS)
+        self._choice("gui_theme", cfg.theme, fl, "theme (配色・再起動で反映):",
+                     [("light", "☀ ライト"), ("dark", "🌙 ダーク"), ("system", "OS の設定に合わせる")])
         self._text("gui_detail_pane",
                    "open" if cfg.detail_pane_open else "closed", fl,
                    "detail_pane (open/closed):")
@@ -3716,6 +3720,7 @@ class ConfigView(QWidget):
         _set("di_overwork",      ", ".join(cfg.overwork_options))
         _set("report_output_dir", cfg.report_output_dir)
         _set("gui_start_tab",    cfg.start_tab)
+        _set("gui_theme",        cfg.theme)
         _set("gui_detail_pane",  "open" if cfg.detail_pane_open else "closed")
         _set("pomo_work",        cfg.pomodoro_work_minutes)
         _set("pomo_break",       cfg.pomodoro_break_minutes)
@@ -3767,6 +3772,7 @@ class ConfigView(QWidget):
         parser.set("GUI", "window_height", self._get("gui_window_height"))
         parser.set("GUI", "font_size",     self._get("gui_font_size"))
         parser.set("GUI", "start_tab",     self._get("gui_start_tab"))
+        parser.set("GUI", "theme",         self._get("gui_theme"))
         parser.set("GUI", "detail_pane",   self._get("gui_detail_pane"))
 
         _ensure("Schedule")

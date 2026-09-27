@@ -57,6 +57,7 @@ class AppConfig:
     font_size: int = 9
     # 起動時に表示するタブ（today / main / edit / plan / last=前回終了時のタブ）
     start_tab: str = "today"
+    theme: str = "light"   # I3: light / dark / system（再起動で反映）
     # 詳細ペインを起動時に開くか（True=開く / False=閉じる）
     detail_pane_open: bool = False
 
@@ -140,6 +141,7 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
         cfg.window_height = parser.getint("GUI", "window_height", fallback=cfg.window_height)
         cfg.font_size     = parser.getint("GUI", "font_size",     fallback=cfg.font_size)
         cfg.start_tab     = parser.get("GUI", "start_tab", fallback=cfg.start_tab).strip().lower()
+        cfg.theme         = parser.get("GUI", "theme", fallback=cfg.theme).strip().lower()
         cfg.detail_pane_open = (parser.get("GUI", "detail_pane", fallback="closed")
                                 .strip().lower() == "open")
 
@@ -610,13 +612,20 @@ def main() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
     # ライトモード強制（ダークモード環境でも常にライトで表示）
     app.setStyle("Fusion")
+    # 配色（theme.py）: Config の theme（light / dark / system）で決め、UI を作る前に切り替える
+    import theme
     try:
-        app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+        system_dark = app.styleHints().colorScheme() == Qt.ColorScheme.Dark
+    except AttributeError:
+        system_dark = False
+    theme.set_mode(theme.resolve_mode(config.theme, system_dark))
+    try:
+        # 標準ダイアログ等も選んだ配色に揃える（OS がダークでもライト設定ならライト）
+        app.styleHints().setColorScheme(
+            Qt.ColorScheme.Dark if theme.MODE == "dark" else Qt.ColorScheme.Light)
     except AttributeError:
         pass
-    # 配色・共通スタイル（theme.py）
-    from theme import apply_app_theme
-    apply_app_theme(app)
+    theme.apply_app_theme(app)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
 
