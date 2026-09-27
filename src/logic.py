@@ -1531,3 +1531,51 @@ def suggest_task(df_nodes: pd.DataFrame, title: str, memo: str = "",
         if best_key is None or key > best_key:
             best, best_key = idx, key
     return best
+
+
+# ============================================================
+# E1: 見積アシスト（似た仕事の実績）
+# ============================================================
+
+def similar_ticket_hours(df_nodes: pd.DataFrame, title: str, user: str,
+                         exclude_idx: str = "", threshold: float = 0.4,
+                         limit: int = 3) -> Optional[dict]:
+    """
+    自分（user）の完了チケットから、タイトルが似ているものの実績を返す。
+    類似度は文字 2-gram の Dice 係数。該当なしは None。
+    戻り値: {"items": [{"idx","title","est","actual","score"}], "avg_actual", "avg_est", "suggest"}
+      suggest = 実績平均を 15 分単位に切り上げた見積の提案値
+    """
+    src = _bigrams(title)
+    if not src or df_nodes.empty:
+        return None
+    done = df_nodes[(df_nodes["node_type"] == "ticket") & (df_nodes["status"] == "done")
+                    & (df_nodes["assigned_to"] == user)]
+    hits = []
+    for idx, r in done.iterrows():
+        if idx == exclude_idx:
+            continue
+        actual = float(r.get("actual_hours", 0) or 0)
+        if actual <= 0:
+            continue
+        other = _bigrams(str(r.get("title", "")))
+        if not other:
+            continue
+        score = 2 * len(src & other) / (len(src) + len(other))
+        if score >= threshold:
+            hits.append({"idx": idx, "title": str(r.get("title", "")), "score": score,
+                         "est": float(r.get("estimated_hours", 0) or 0), "actual": actual,
+                         "end": str(r.get("actual_end", "") or "")})
+    if not hits:
+        return None
+    # 似ている順、同点は新しい完了を優先
+    hits.sort(key=lambda h: (h["score"], h["end"]), reverse=True)
+    items = hits[:limit]
+    avg_actual = sum(h["actual"] for h in items) / len(items)
+    ests = [h["est"] for h in items if h["est"] > 0]
+    return {
+        "items": items,
+        "avg_actual": round(avg_actual, 2),
+        "avg_est": round(sum(ests) / len(ests), 2) if ests else None,
+        "suggest": math.ceil(avg_actual * 4 - 1e-9) / 4,
+    }

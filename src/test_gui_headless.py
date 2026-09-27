@@ -2030,6 +2030,62 @@ def test_analysis_0925(win, pj_idx, task_idx, ticket_idx):
         ng("見積の表示切替", e)
 
 
+def test_e1_estimate_assist(win, task_idx):
+    """E1: 見積アシスト（自分の完了チケットのうち似たものの実績）"""
+    print("\n[E1] 見積アシストテスト")
+    import logic as LG
+    import ui_main as M
+    from db import create_initial_node
+    state = win.state
+    me = state.user
+    added = []
+    try:
+        for title, est, act, owner in [("議事録作成 A社", 1.0, 1.5, me), ("議事録作成 B社", 1.0, 2.0, me),
+                                       ("議事録作成 C社", 1.0, 9.0, "tanaka@email.com")]:
+            n = create_initial_node(owner, "ticket", title, task_idx, 50)
+            n["status"] = "done"; n["estimated_hours"] = est; n["actual_hours"] = act
+            state.df_nodes.loc[n.name] = n
+            added.append(n.name)
+        a = LG.similar_ticket_hours(state.df_nodes, "議事録作成 D社", me)
+        assert a and len(a["items"]) == 2, a            # 他人（tanaka）の分は含めない
+        assert a["avg_actual"] == 1.75 and a["suggest"] == 1.75 and a["avg_est"] == 1.0, a
+        assert LG.similar_ticket_hours(state.df_nodes, "まったく別の件", me) is None
+        ok("自分の完了チケットだけから似た仕事の実績を平均（提案 1.75h）")
+    except Exception as e:
+        ng("similar_ticket_hours", e)
+    try:
+        d = M.QuickAddDialog(state, parent=win)
+        d.edit.setText("議事録作成 D社 #メモ")
+        assert d.assist_btn.isVisible() or not d.isVisible()  # 非表示ダイアログでも状態は持つ
+        assert d._assist and d.assist_btn.isEnabled()
+        d._apply_assist()
+        assert d.edit.text() == "議事録作成 D社 1.75h #メモ", d.edit.text()
+        assert d._parsed["hours"] == 1.75 and d._parsed["memo"] == "メモ"
+        assert not d.assist_btn.isEnabled(), "工数を書いた後も上書きできる"
+        d.close()
+        ok("クイック追加: 提案の工数をメモの手前に書き足せる")
+    except Exception as e:
+        ng("クイック追加の見積アシスト", e)
+    try:
+        d = M._NodeEditDialog(task_idx, "ticket", state, parent=win)
+        d.f_title.setText("議事録作成 E社")
+        assert d._assist is not None and "1.75h を使う" in d.assist_use.text()
+        d.assist_use.click()
+        assert d.f_est.value() == 1.75
+        d.f_title.setText("関係ない名前")
+        assert d._assist is None
+        d.close()
+        d2 = M._NodeEditDialog("0", "project1", state, parent=win)
+        d2.f_title.setText("議事録作成")
+        assert d2._assist is None, "チケット以外にも表示された"
+        d2.close()
+        ok("新規作成ダイアログ: 似た仕事の実績を表示し「使う」で見積に反映（チケットのみ）")
+    except Exception as e:
+        ng("編集ダイアログの見積アシスト", e)
+    finally:
+        state.df_nodes.drop(index=[i for i in added if i in state.df_nodes.index], inplace=True)
+
+
 def test_theme():
     """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
     print("\n[D1] テーマ集約テスト")
@@ -2114,6 +2170,7 @@ def main():
             test_theme()
             test_requests_0925(win)
             test_analysis_0925(win, pj_idx, task_idx, ticket_idx)
+            test_e1_estimate_assist(win, task_idx)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

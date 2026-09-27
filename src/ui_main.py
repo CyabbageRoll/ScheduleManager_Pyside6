@@ -32,7 +32,7 @@ from ui_widgets import (
     AutoCombo, ScrollableTable, Separator, PomodoroWidget,
     COLOR_OPTIONS, STYLE_BUTTON,
 )
-from theme import C, qss, LEVEL_BG, LEVEL_FG, STYLE_CHIP
+from theme import C, qss, LEVEL_BG, LEVEL_FG, STYLE_CHIP, STYLE_LABEL_INFO
 
 # 画面インデックス（QStackedWidget）
 IDX_MAIN    = 0
@@ -3788,10 +3788,29 @@ class _NodeEditDialog(QDialog):
         self.f_memo = QTextEdit()
         self.f_memo.setMaximumHeight(80)
 
+        # E1: 似た仕事（自分の完了チケット）の実績。チケットのみ表示
+        ntype = (str(state.df_nodes.loc[edit_idx, "node_type"]) if is_edit
+                 else (node_type or "ticket"))
+        self._assist: Optional[dict] = None
+        self.assist_lbl = QLabel()
+        self.assist_lbl.setWordWrap(True)
+        self.assist_lbl.setStyleSheet(STYLE_LABEL_INFO)
+        self.assist_use = QPushButton("使う")
+        self.assist_use.setStyleSheet(STYLE_BUTTON)
+        self.assist_use.clicked.connect(
+            lambda: self._assist and self.f_est.setValue(self._assist["suggest"]))
+        assist_row = QWidget()
+        assist_lay = QHBoxLayout(assist_row)
+        assist_lay.setContentsMargins(0, 0, 0, 0)
+        assist_lay.addWidget(self.assist_lbl, stretch=1)
+        assist_lay.addWidget(self.assist_use)
+        self._assist_row = assist_row
+
         form.addRow("タイトル *:",   self.f_title)
         form.addRow("順序:",         self.f_priority)
         form.addRow("ステータス:",   self.f_status)
         form.addRow("見積工数(h):",  self.f_est)
+        form.addRow("",              assist_row)
         form.addRow("開始可能日:",   start_row)
         form.addRow("納期:",         deadline_row)
         form.addRow("表示色:",       self.f_color)
@@ -3821,6 +3840,23 @@ class _NodeEditDialog(QDialog):
             self.f_memo.setPlainText(str(row.get("memo", "")))
         else:
             self.f_color.set_color(default_color)
+
+        self._assist_enabled = ntype == "ticket"
+        self.f_title.textChanged.connect(self._update_assist)
+        self._update_assist()
+
+    def _update_assist(self) -> None:
+        """E1: タイトルが似た自分の完了チケットの実績を表示する"""
+        title = self.f_title.text().strip()
+        self._assist = (LG.similar_ticket_hours(self.state.df_nodes, title, self.state.user,
+                                                exclude_idx=self._edit_idx or "")
+                        if self._assist_enabled and len(title) >= 2 else None)
+        a = self._assist
+        self._assist_row.setVisible(a is not None)
+        if a is not None:
+            self.assist_lbl.setText(assist_summary(a))
+            self.assist_lbl.setToolTip(assist_detail(a))
+            self.assist_use.setText(f"{a['suggest']:g}h を使う")
 
     def _on_accept(self) -> None:
         if not self.f_title.text().strip():
@@ -3875,6 +3911,20 @@ class _NodeEditDialog(QDialog):
 
 # ---------- クイック追加ダイアログ（Ctrl+N） ----------
 
+def assist_summary(a: dict) -> str:
+    """E1: 見積アシストの 1 行表示"""
+    txt = f"💡 似た仕事の実績（自分・{len(a['items'])}件）: 平均 {a['avg_actual']:g}h"
+    if a["avg_est"] is not None:
+        txt += f"（見積 平均 {a['avg_est']:g}h）"
+    return txt
+
+
+def assist_detail(a: dict) -> str:
+    """E1: 見積アシストの内訳（ツールチップ用）"""
+    return "\n".join(f"・{h['title']}  見積 {h['est']:g}h → 実績 {h['actual']:g}h"
+                     + (f"（{h['end']} 完了）" if h["end"] else "") for h in a["items"])
+
+
 class QuickAddDialog(QDialog):
     """
     1 行入力でチケットを作るダイアログ（B2）。
@@ -3919,6 +3969,14 @@ class QuickAddDialog(QDialog):
             "QLabel { background:@surface_alt; border:1px solid @border_light;"
             " border-radius:6px; padding:6px; }"))
         lay.addWidget(self.preview)
+
+        # E1: 似た仕事（自分の完了チケット）の実績から見積を提案
+        self.assist_btn = QPushButton()
+        self.assist_btn.setStyleSheet(STYLE_BUTTON)
+        self.assist_btn.setVisible(False)
+        self.assist_btn.clicked.connect(self._apply_assist)
+        lay.addWidget(self.assist_btn)
+        self._assist: Optional[dict] = None
 
         help_lbl = QLabel(self._HELP)
         help_lbl.setWordWrap(True)
@@ -4003,6 +4061,30 @@ class QuickAddDialog(QDialog):
             html += f"<br>{chip('✖ ' + self._esc(e), C.DANGER)}"
         self.preview.setText(html)
         self.btns.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not errors)
+        self._update_assist(p)
+
+    def _update_assist(self, p: dict) -> None:
+        """E1: タイトルが似た自分の完了チケットの実績を示し、見積に使えるようにする"""
+        self._assist = (LG.similar_ticket_hours(self.state.df_nodes, p["title"], self.state.user)
+                        if len(p["title"]) >= 2 else None)
+        a = self._assist
+        self.assist_btn.setVisible(a is not None)
+        if a is None:
+            return
+        self.assist_btn.setText(assist_summary(a) + (f" → 見積 {a['suggest']:g}h を使う"
+                                                     if p["hours"] is None else ""))
+        self.assist_btn.setToolTip(assist_detail(a))
+        self.assist_btn.setEnabled(p["hours"] is None)   # 工数を書いた後は上書きしない
+
+    def _apply_assist(self) -> None:
+        """提案の見積をメモ（#以降）の手前に工数として書き足す"""
+        if not self._assist:
+            return
+        text = self.edit.text()
+        memo_m = re.search(r"(?:^|\s)[#＃]", text)
+        pos = memo_m.start() if memo_m else len(text)
+        token = f" {self._assist['suggest']:g}h"
+        self.edit.setText(text[:pos].rstrip() + token + (" " + text[pos:].lstrip() if memo_m else ""))
 
     @staticmethod
     def _esc(s: str) -> str:
