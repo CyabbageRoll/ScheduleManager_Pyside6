@@ -1622,6 +1622,129 @@ class RoadmapView(QWidget):
 
 # ---------- 工数分析 ----------
 
+class AchievementDialog(QDialog):
+    """G2: 成果のまとめ（評価面談用）。メンバーと期間を選び、Markdown 表示・AI 用コピー・保存"""
+
+    _PROMPT = ("以下は{name}さんの{period}の業務実績データです。評価面談で使う自己評価の下書きを、"
+               "敬体で作成してください。\n"
+               "構成: 1) 主な成果（数値を添えて） 2) 工夫したこと・貢献 3) 課題と反省 4) 次期の目標（叩き台）\n"
+               "データにない事実は創作せず、推測で補う箇所は【要確認】と明記してください。\n\n")
+
+    def __init__(self, state, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self.setWindowTitle("📋 成果のまとめ（評価面談用）")
+        self.resize(820, 640)
+        lay = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.member = UserCombo(state.members, {m: state.display_name(m) for m in state.members})
+        self.member.set_user(state.user)
+        self.member.user_changed.connect(lambda _m: self._rebuild())
+        form.addRow("メンバー:", self.member)
+
+        prow = QHBoxLayout()
+        self._preset_btns: dict = {}
+        grp = QButtonGroup(self)
+        for name in ("上期", "下期", "年度"):
+            b = QPushButton(name)
+            b.setCheckable(True)
+            b.setStyleSheet(STYLE_CHIP)
+            d_from, d_to = LG.review_period(name)
+            b.setToolTip(f"{d_from} 〜 {d_to}")
+            b.clicked.connect(lambda _=False, n=name: self._set_preset(n))
+            grp.addButton(b)
+            prow.addWidget(b)
+            self._preset_btns[name] = b
+        self.p_from = DateButton()
+        self.p_to = DateButton()
+        self.p_from.date_changed.connect(lambda _d: self._on_custom())
+        self.p_to.date_changed.connect(lambda _d: self._on_custom())
+        prow.addSpacing(12)
+        prow.addWidget(self.p_from)
+        prow.addWidget(QLabel("〜"))
+        prow.addWidget(self.p_to)
+        prow.addStretch()
+        form.addRow("期間:", prow)
+        lay.addLayout(form)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        lay.addWidget(self.view, stretch=1)
+
+        brow = QHBoxLayout()
+        copy_btn = QPushButton("🤖 AI 用にコピー（自己評価の下書き依頼）")
+        copy_btn.setStyleSheet(STYLE_BUTTON)
+        copy_btn.clicked.connect(self._copy_for_ai)
+        save_btn = QPushButton("💾 Markdown で保存")
+        save_btn.setStyleSheet(STYLE_BUTTON)
+        save_btn.clicked.connect(self._save)
+        close_btn = QPushButton("閉じる")
+        close_btn.setStyleSheet(STYLE_BUTTON)
+        close_btn.clicked.connect(self.accept)
+        brow.addWidget(copy_btn)
+        brow.addWidget(save_btn)
+        brow.addStretch()
+        brow.addWidget(close_btn)
+        lay.addLayout(brow)
+        self.info = InfoLabel()
+        lay.addWidget(self.info)
+
+        self.markdown = ""
+        self._set_preset("上期")
+
+    def _set_preset(self, name: str) -> None:
+        d_from, d_to = LG.review_period(name)
+        self._suspend = True
+        self.p_from.set_date(d_from)
+        self.p_to.set_date(d_to)
+        self._suspend = False
+        self._preset_btns[name].setChecked(True)
+        self._period_label = name
+        self._rebuild()
+
+    def _on_custom(self) -> None:
+        """カレンダーで期間を変えたら任意期間として作り直す"""
+        if getattr(self, "_suspend", False):
+            return
+        for b in self._preset_btns.values():
+            b.group().setExclusive(False)
+            b.setChecked(False)
+            b.group().setExclusive(True)
+        self._period_label = f"{self.p_from.get_date()}〜{self.p_to.get_date()}"
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        d_from, d_to = self.p_from.get_date(), self.p_to.get_date()
+        if d_from > d_to:
+            self.info.set_error("期間の開始が終了より後になっています")
+            return
+        user = self.member.current_user() or self.state.user
+        data = LG.achievement_summary(self.state.df_nodes, self.state.df_daily, user, d_from, d_to)
+        self.markdown = LG.build_achievement_markdown(data, self.state.display_name(user))
+        self.view.setPlainText(self.markdown)
+        self.info.set_info(f"投入 {data['total_hours']:g}h・完了 {len(data['completed'])} 件")
+
+    def _copy_for_ai(self) -> None:
+        user = self.member.current_user() or self.state.user
+        prompt = self._PROMPT.format(name=self.state.display_name(user), period=self._period_label)
+        QApplication.clipboard().setText(prompt + self.markdown)
+        self.info.set_info("AI 用の依頼文と実績データをクリップボードにコピーしました")
+
+    def _save(self) -> None:
+        user = self.member.current_user() or self.state.user
+        name = LG._safe_name(self.state.display_name(user))
+        default = f"成果のまとめ_{name}_{self.p_from.get_date()}_{self.p_to.get_date()}.md"
+        base = self.state.config.report_output_dir
+        if base and Path(base).is_dir():
+            default = str(Path(base) / default)
+        path, _ = QFileDialog.getSaveFileName(self, "成果のまとめを保存", default, "Markdown (*.md)")
+        if not path:
+            return
+        Path(path).write_text(self.markdown, encoding="utf-8")
+        self.info.set_info(f"保存しました: {path}")
+
+
 class AnalysisView(QWidget):
     """
     工数分析タブ。
@@ -1792,9 +1915,16 @@ class AnalysisView(QWidget):
         burn_btn.setToolTip("チェックした範囲（なし＝全体）・選択中の人物の残り作業の推移と、\n"
                             "直近 2 週間のペースで進めた場合の完了予想日を表示します")
         burn_btn.clicked.connect(self._calc_burndown)
+        # G2: 成果のまとめ（評価面談用）
+        review_btn = QPushButton("📋 成果のまとめ")
+        review_btn.setStyleSheet(STYLE_BUTTON)
+        review_btn.setToolTip("半期・年度などの期間で、投入時間・完了チケット・時間をかけた仕事・\n"
+                              "見積精度をまとめます（評価面談の準備・AI での自己評価の下書き用）")
+        review_btn.clicked.connect(lambda: AchievementDialog(self.state, self).exec())
         btn_row = QHBoxLayout()
         btn_row.addWidget(personal_btn)
         btn_row.addWidget(burn_btn)
+        btn_row.addWidget(review_btn)
         right.addRow("", btn_row)
 
         right_w = QWidget()

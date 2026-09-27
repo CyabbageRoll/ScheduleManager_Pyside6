@@ -2340,6 +2340,86 @@ def test_g4_forecast(win, task_idx):
         ng("完了予測の表示", e)
 
 
+def test_g2_achievement(win):
+    """G2: 成果のまとめ（期間プリセット・集計・Markdown・ダイアログ）"""
+    print("\n[G2] 成果のまとめテスト")
+    import pandas as pd
+    import logic as LG
+    import ui_sub
+    from PySide6.QtWidgets import QApplication
+    from db import DAILY_TIME_COLS, create_initial_node
+    me = win.state.user
+    try:
+        R = lambda n, d: LG.review_period(n, d)
+        oct5, jul1, feb1 = datetime.date(2026, 10, 5), datetime.date(2026, 7, 1), datetime.date(2027, 2, 1)
+        assert R("上期", oct5) == ("2026-04-01", "2026-09-30")
+        assert R("下期", oct5) == ("2026-10-01", "2027-03-31")
+        assert R("年度", oct5) == ("2026-04-01", "2027-03-31")
+        assert R("下期", jul1) == ("2025-10-01", "2026-03-31"), "上期中の「下期」は直近の前年度下期"
+        assert R("上期", feb1) == ("2026-04-01", "2026-09-30") and R("下期", feb1) == ("2026-10-01", "2027-03-31")
+        ok("期間プリセット: 上期／下期は今日を含む・直近の半期、年度は 4 月始まり")
+    except Exception as e:
+        ng("review_period", e)
+    try:
+        memo = "[12/20 10:00] 年末の調整\n[01/10 09:00] 年明けの対応\n[06/01 09:00] 期間外\n普通のメモ"
+        assert LG._work_logs_in_period(memo, "2026-12-01", "2027-01-31") == \
+            ["[12/20 10:00] 年末の調整", "[01/10 09:00] 年明けの対応"]
+        ok("作業ログは年をまたぐ期間でも月日から期間内を判定")
+    except Exception as e:
+        ng("作業ログの期間抽出", e)
+    try:
+        p1a = create_initial_node(me, "project1", "案件A", "0", 1)
+        p1b = create_initial_node(me, "project1", "案件B", "0", 2)
+        ta = create_initial_node(me, "task", "設計", p1a.name, 1)
+        tb = create_initial_node(me, "task", "運用", p1b.name, 1)
+        k1 = create_initial_node(me, "ticket", "基本設計", ta.name, 1)
+        k1.update({"status": "done", "actual_end": "2026-05-20", "estimated_hours": 4.0,
+                   "actual_hours": 5.0, "memo": "[05/10 10:00] レビュー指摘を反映"})
+        k2 = create_initial_node(me, "ticket", "月次運用", tb.name, 1)
+        k3 = create_initial_node(me, "ticket", "昨年度の件", ta.name, 2)
+        k3.update({"status": "done", "actual_end": "2026-03-30"})
+        nodes = [p1a, p1b, ta, tb, k1, k2, k3]
+        df = pd.DataFrame(nodes).set_index(pd.Index([n.name for n in nodes]))
+        rows = {}
+        for d, tk, h in [("2026-05-10", k1.name, 3.0), ("2026-05-11", k1.name, 2.0),
+                         ("2026-06-01", k2.name, 1.0), ("2026-03-30", k3.name, 8.0)]:
+            r = {c: "" for c in DAILY_TIME_COLS}
+            r["Owner"] = me
+            for c in DAILY_TIME_COLS[36:36 + int(h * 4)]:
+                r[c] = tk
+            rows[f"{d}-{me}"] = r
+        daily = pd.DataFrame.from_dict(rows, orient="index")
+        data = LG.achievement_summary(df, daily, me, "2026-04-01", "2026-09-30")
+        assert data["total_hours"] == 6.0 and data["days_worked"] == 3, data   # 3/30 は期間外
+        assert data["by_p1"] == [("案件A", 5.0), ("案件B", 1.0)], data["by_p1"]
+        assert [t["hours"] for t in data["top"]] == [5.0, 1.0] and data["top"][0]["path"] == "案件A ＞ 設計 ＞ 基本設計"
+        assert data["top"][0]["logs"] == ["[05/10 10:00] レビュー指摘を反映"]
+        assert [c["title"] for c in data["completed"]] == ["基本設計"], data["completed"]
+        assert data["accuracy"] == 1.25 and data["accuracy_by_month"] == {"2026-05": (1, 1.25)}
+        md = LG.build_achievement_markdown(data, "山田")
+        for key in ("# 成果のまとめ（山田）", "## プロジェクト別の投入時間", "| 案件A | 5h | 83% |",
+                    "## 時間をかけた仕事 上位 5 件", "   - [05/10 10:00] レビュー指摘を反映",
+                    "### 案件A", "- 2026-05-20 基本設計（見積 4h → 実績 5h）", "## 見積精度の推移（月別）"):
+            assert key in md, key
+        ok("投入時間・プロジェクト別・上位 5 件（作業ログ付き）・完了一覧・見積精度を Markdown に")
+    except Exception as e:
+        ng("achievement_summary", e)
+    try:
+        d = ui_sub.AchievementDialog(win.state, win)
+        assert d._preset_btns["上期"].isChecked() and d.markdown.startswith("# 成果のまとめ")
+        d.member.set_user("tanaka@email.com")
+        assert win.state.display_name("tanaka@email.com") in d.markdown.splitlines()[0]
+        d._copy_for_ai()
+        clip = QApplication.clipboard().text()
+        assert "自己評価の下書き" in clip and "# 成果のまとめ" in clip
+        d.p_from.set_date("2026-01-01"); d._on_custom()
+        assert not any(b.isChecked() for b in d._preset_btns.values())
+        d.close()
+        ok("ダイアログ: メンバー切替・任意期間・AI 用コピー（依頼文＋データ）")
+    except Exception as e:
+        ng("成果のまとめダイアログ", e)
+
+
 def test_theme():
     """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
     print("\n[D1] テーマ集約テスト")
@@ -2429,6 +2509,7 @@ def main():
             test_e2_deadline_risk(win, task_idx)
             test_i2_rewards(win)
             test_g4_forecast(win, task_idx)
+            test_g2_achievement(win)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

@@ -2040,3 +2040,156 @@ def completion_text(fc: dict) -> str:
             late = fc["forecast"] > fc["deadline"]
             head += f"（納期 {fmt(fc['deadline'])}{' に遅れ ⚠' if late else ''}）"
     return f"{head}・残り {fc['remaining_now']:g}h・ペース {fc['pace']:g}h/日"
+
+
+# ============================================================
+# G2: 成果のまとめ（評価面談用）
+# ============================================================
+
+def review_period(name: str, today: Optional[datetime.date] = None) -> tuple:
+    """
+    成果のまとめの期間プリセット（年度は 4 月始まり）を (開始, 終了) の ISO 文字列で返す。
+      上期: 今日を含む／直近の 4/1〜9/30、下期: 今日を含む／直近の 10/1〜3/31、年度: 今年度
+    """
+    today = today or datetime.date.today()
+    fy = today.year if today.month >= 4 else today.year - 1
+    if name == "上期":
+        return datetime.date(fy, 4, 1).isoformat(), datetime.date(fy, 9, 30).isoformat()
+    if name == "下期":
+        y = fy if today.month >= 10 or today.month <= 3 else fy - 1
+        return datetime.date(y, 10, 1).isoformat(), datetime.date(y + 1, 3, 31).isoformat()
+    if name == "年度":
+        return datetime.date(fy, 4, 1).isoformat(), datetime.date(fy + 1, 3, 31).isoformat()
+    return "", ""
+
+
+def _work_logs_in_period(memo: str, d_from: str, d_to: str) -> List[str]:
+    """メモ中の作業ログ（[MM/DD HH:MM] 本文）のうち期間内のものを返す（年は期間から推定）"""
+    out = []
+    years = range(int(d_from[:4]), int(d_to[:4]) + 1)
+    for line in str(memo or "").splitlines():
+        m = WORK_LOG_RE.match(line.strip())
+        if not m:
+            continue
+        for y in years:
+            try:
+                d = datetime.date(y, int(m.group(1)), int(m.group(2))).isoformat()
+            except ValueError:
+                continue
+            if d_from <= d <= d_to:
+                out.append(line.strip())
+                break
+    return out
+
+
+def achievement_summary(df_nodes: pd.DataFrame, df_daily: pd.DataFrame, user: str,
+                        d_from: str, d_to: str) -> dict:
+    """
+    user の期間 d_from〜d_to の成果を集計する。
+    投入時間は日次スケジュール、完了は実績完了日（actual_end）で判定する。
+    """
+    hours_by_ticket: dict = {}
+    days_worked: set = set()
+    month_hours: dict = {}
+    if not df_daily.empty and "Owner" in df_daily.columns:
+        mine = df_daily[df_daily["Owner"] == user]
+        cols = [c for c in DAILY_TIME_COLS if c in mine.columns]
+        for idx, row in mine.iterrows():
+            d = str(idx)[:10]
+            if not (d_from <= d <= d_to):
+                continue
+            for v in row[cols]:
+                if v and v in df_nodes.index:
+                    hours_by_ticket[v] = hours_by_ticket.get(v, 0.0) + 0.25
+                    days_worked.add(d)
+                    month_hours[d[:7]] = month_hours.get(d[:7], 0.0) + 0.25
+    total = sum(hours_by_ticket.values())
+
+    def p1_title(i: str) -> str:
+        if str(df_nodes.loc[i, "parent_id"]) == INBOX_PARENT:
+            return "Inbox（Task 未設定）"
+        p1 = ancestor_of_type(df_nodes, i, "project1")
+        return str(df_nodes.loc[p1, "title"]) if p1 else "（プロジェクト外）"
+
+    by_p1: dict = {}
+    for i, h in hours_by_ticket.items():
+        by_p1[p1_title(i)] = by_p1.get(p1_title(i), 0.0) + h
+
+    top = sorted(hours_by_ticket.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top_items = [{
+        "idx": i, "path": " ＞ ".join(node_path_titles(df_nodes, i)), "hours": h,
+        "status": str(df_nodes.loc[i, "status"]),
+        "logs": _work_logs_in_period(str(df_nodes.loc[i, "memo"] or ""), d_from, d_to),
+    } for i, h in top]
+
+    done = df_nodes[(df_nodes["node_type"] == "ticket") & (df_nodes["status"] == "done")
+                    & (df_nodes["assigned_to"] == user)] if not df_nodes.empty else df_nodes
+    completed = []
+    for i, r in done.iterrows():
+        end = _date_str(r.get("actual_end"))
+        if end and d_from <= end <= d_to:
+            completed.append({"idx": i, "title": str(r.get("title", "")), "p1": p1_title(i),
+                              "end": end, "est": float(r.get("estimated_hours", 0) or 0),
+                              "actual": float(r.get("actual_hours", 0) or 0)})
+    completed.sort(key=lambda c: (c["p1"], c["end"]))
+
+    acc_by_month: dict = {}
+    for c in completed:
+        if c["est"] > 0 and c["actual"] > 0:
+            acc_by_month.setdefault(c["end"][:7], []).append(c["actual"] / c["est"])
+    ratios = [x for v in acc_by_month.values() for x in v]
+    return {
+        "user": user, "from": d_from, "to": d_to,
+        "total_hours": round(total, 2), "days_worked": len(days_worked),
+        "by_p1": sorted(((k, round(v, 2)) for k, v in by_p1.items()), key=lambda kv: kv[1], reverse=True),
+        "top": top_items, "completed": completed,
+        "accuracy": round(sum(ratios) / len(ratios), 2) if ratios else None,
+        "accuracy_by_month": {m: (len(v), round(sum(v) / len(v), 2))
+                              for m, v in sorted(acc_by_month.items())},
+        "month_hours": {m: round(h, 2) for m, h in sorted(month_hours.items())},
+    }
+
+
+def build_achievement_markdown(data: dict, display_name: str = "") -> str:
+    """成果のまとめを Markdown にする（評価面談の準備・AI への入力用）"""
+    name = display_name or data["user"]
+    lines = [f"# 成果のまとめ（{name}）", "",
+             f"- 期間: {data['from']} 〜 {data['to']}",
+             f"- 投入時間: {data['total_hours']:g}h（記録のある日 {data['days_worked']} 日）",
+             f"- 完了したチケット: {len(data['completed'])} 件"]
+    if data["accuracy"] is not None:
+        lines.append(f"- 見積精度（実績÷見積の平均）: {data['accuracy']:g}"
+                     "（1 に近いほど見積どおり、1 超は見積より時間がかかった）")
+    lines += ["", "## プロジェクト別の投入時間", ""]
+    if data["by_p1"]:
+        lines += ["| プロジェクト | 時間 | 割合 |", "|---|---:|---:|"]
+        for p, h in data["by_p1"]:
+            pct = round(h / data["total_hours"] * 100) if data["total_hours"] else 0
+            lines.append(f"| {_md_escape(p)} | {h:g}h | {pct}% |")
+    else:
+        lines.append("（期間内の記録なし）")
+    if data["month_hours"]:
+        lines += ["", "## 月別の投入時間", "", "| 月 | 時間 |", "|---|---:|"]
+        lines += [f"| {m} | {h:g}h |" for m, h in data["month_hours"].items()]
+    lines += ["", "## 時間をかけた仕事 上位 5 件", ""]
+    for n, t in enumerate(data["top"], 1):
+        lines.append(f"{n}. {_md_escape(t['path'])} — {t['hours']:g}h（{t['status']}）")
+        for log in t["logs"][-5:]:
+            lines.append(f"   - {_md_escape(log)}")
+    if not data["top"]:
+        lines.append("（期間内の記録なし）")
+    lines += ["", "## 完了したチケット", ""]
+    cur = None
+    for c in data["completed"]:
+        if c["p1"] != cur:
+            cur = c["p1"]
+            lines += ["", f"### {_md_escape(cur)}"]
+        est = f"見積 {c['est']:g}h → " if c["est"] else ""
+        lines.append(f"- {c['end']} {_md_escape(c['title'])}（{est}実績 {c['actual']:g}h）")
+    if not data["completed"]:
+        lines.append("（期間内に完了したチケットなし）")
+    if data["accuracy_by_month"]:
+        lines += ["", "## 見積精度の推移（月別）", "", "| 月 | 完了件数 | 実績÷見積 |", "|---|---:|---:|"]
+        for m, (n, r) in data["accuracy_by_month"].items():
+            lines.append(f"| {m} | {n} | {r:g} |")
+    return "\n".join(lines) + "\n"
