@@ -1840,3 +1840,59 @@ def deadline_risks(df_nodes: pd.DataFrame, member: str, daily_h: float, holidays
         })
     risks.sort(key=lambda r: (r["deadline"], r["finish"]))
     return risks
+
+
+# ============================================================
+# I2: 小さなごほうび（続ける動機になる指標）
+# ============================================================
+
+def motivation_stats(df_nodes: pd.DataFrame, df_daily: pd.DataFrame, user: str,
+                     holidays, today: Optional[datetime.date] = None) -> dict:
+    """
+    Today に出す 3 つの指標を返す。
+      streak     : 日次スケジュールを記録した日の連続日数（記録の無い休日は飛ばす。今日が未記録なら昨日から）
+      week_done  : 今週（月曜始まり）に完了したチケット数
+      bullseye   : 今月完了したうち実績が見積の ±20% に収まった件数 / 見積のある完了件数
+    """
+    today = today or datetime.date.today()
+    hol = {h.strip().upper() for h in holidays}
+
+    # 記録のある日（スロットに 1 つでも入っている日）
+    recorded: set = set()
+    if not df_daily.empty and "Owner" in df_daily.columns:
+        mine = df_daily[df_daily["Owner"] == user]
+        cols = [c for c in DAILY_TIME_COLS if c in mine.columns]
+        for idx, row in mine.iterrows():
+            if any(str(v or "") not in ("", "nan", "None") for v in row[cols]):
+                recorded.add(str(idx)[:10])
+    streak, d = 0, today
+    if d.isoformat() not in recorded:
+        d -= datetime.timedelta(days=1)   # 今日はまだ記録前でも途切れない
+    for _ in range(3660):
+        if d.isoformat() not in recorded:
+            if _DAY_ABBR[d.weekday()] in hol:   # 記録の無い休日は飛ばす（休日出勤の記録は数える）
+                d -= datetime.timedelta(days=1)
+                continue
+            break
+        streak += 1
+        d -= datetime.timedelta(days=1)
+
+    week_start = (today - datetime.timedelta(days=today.weekday())).isoformat()
+    month_start = today.replace(day=1).isoformat()
+    week_done, hit, total = 0, 0, 0
+    if not df_nodes.empty:
+        done = df_nodes[(df_nodes["node_type"] == "ticket") & (df_nodes["status"] == "done")
+                        & (df_nodes["assigned_to"] == user)]
+        for _, r in done.iterrows():
+            end = _date_str(r.get("actual_end"))
+            if not end:
+                continue
+            if week_start <= end <= today.isoformat():
+                week_done += 1
+            if month_start <= end <= today.isoformat():
+                est = float(r.get("estimated_hours", 0) or 0)
+                act = float(r.get("actual_hours", 0) or 0)
+                if est > 0 and act > 0:
+                    total += 1
+                    hit += abs(act - est) <= est * 0.2
+    return {"streak": streak, "week_done": week_done, "bullseye": hit, "bullseye_total": total}

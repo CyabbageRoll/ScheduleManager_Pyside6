@@ -2221,6 +2221,63 @@ def test_e2_deadline_risk(win, task_idx):
             state.df_nodes.drop(index=[added], inplace=True)
 
 
+def test_i2_rewards(win):
+    """I2: 小さなごほうび（連続記録・今週の完了・見積ぴったり）"""
+    print("\n[I2] 小さなごほうびテスト")
+    import pandas as pd
+    import logic as LG
+    from db import DAILY_TIME_COLS, create_initial_node
+    me = win.state.user
+    try:
+        def daily(dates):
+            rows = {}
+            for d in dates:
+                r = {c: "" for c in DAILY_TIME_COLS}
+                r["Owner"] = me
+                r["C0900"] = "tk"
+                rows[f"{d}-{me}"] = r
+            return pd.DataFrame.from_dict(rows, orient="index")
+        T = datetime.date(2026, 9, 28)   # 月曜
+        hol = ["SAT", "SUN"]
+        empty = pd.DataFrame(columns=["node_type"])
+        dd = daily(["2026-09-24", "2026-09-25"])          # 木・金（土日は休日）
+        assert LG.motivation_stats(empty, dd, me, hol, T)["streak"] == 2, "今日未記録なら昨日から数える"
+        dd = daily(["2026-09-24", "2026-09-25", "2026-09-28"])
+        assert LG.motivation_stats(empty, dd, me, hol, T)["streak"] == 3
+        dd = daily(["2026-09-23", "2026-09-25", "2026-09-28"])   # 木が抜け
+        assert LG.motivation_stats(empty, dd, me, hol, T)["streak"] == 2
+        dd = daily(["2026-09-25", "2026-09-27"])           # 日曜の休日出勤も数える
+        assert LG.motivation_stats(empty, dd, me, hol, datetime.date(2026, 9, 27))["streak"] == 2
+        ok("連続記録: 記録の無い休日は飛ばし休日出勤は数える・今日の記録前は昨日まで")
+    except Exception as e:
+        ng("連続記録", e)
+    try:
+        T = datetime.date(2026, 9, 30)   # 水曜
+        rows = []
+        for i, (end, est, act) in enumerate([("2026-09-28", 2.0, 2.2), ("2026-09-30", 2.0, 3.0),
+                                             ("2026-09-25", 1.0, 1.0), ("2026-08-31", 1.0, 1.0)]):
+            n = create_initial_node(me, "ticket", f"t{i}", "t", i)
+            n["status"] = "done"; n["actual_end"] = end
+            n["estimated_hours"] = est; n["actual_hours"] = act
+            rows.append(n)
+        df = pd.DataFrame(rows).set_index(pd.Index([r.name for r in rows]))
+        st = LG.motivation_stats(df, pd.DataFrame(), me, ["SAT", "SUN"], T)
+        assert st["week_done"] == 2, st                   # 9/28・9/30
+        assert (st["bullseye"], st["bullseye_total"]) == (2, 3), st   # 今月 3 件中 ±20% は 2 件
+        ok("今週の完了数・今月の見積ぴったり（±20%）")
+    except Exception as e:
+        ng("完了数・見積ぴったり", e)
+    try:
+        dv = win.dashboard_view
+        dv.refresh()
+        texts = [l.text() for l in dv._reward_lbls.values()]
+        assert texts[0].startswith("🔥 連続記録") and texts[1].startswith("✅ 今週の完了") \
+            and texts[2].startswith("🎯 見積ぴったり"), texts
+        ok("Today のヘッダーに 3 つのごほうび表示")
+    except Exception as e:
+        ng("Today のごほうび表示", e)
+
+
 def test_theme():
     """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
     print("\n[D1] テーマ集約テスト")
@@ -2308,6 +2365,7 @@ def main():
             test_e1_estimate_assist(win, task_idx)
             test_f1_work_log(win, ticket_idx, ticket2_idx)
             test_e2_deadline_risk(win, task_idx)
+            test_i2_rewards(win)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

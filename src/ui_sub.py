@@ -3660,7 +3660,25 @@ class DashboardView(QWidget):
         layout.setSpacing(6)
 
         self.header_lbl = QLabel("🏠 Today")
-        layout.addWidget(self.header_lbl)
+        head_row = QHBoxLayout()
+        head_row.addWidget(self.header_lbl)
+        head_row.addStretch()
+        # I2: 小さなごほうび（連続記録・今週の完了・見積ぴったり）
+        self._reward_lbls: dict = {}
+        for key, bg, fg, tip in [
+            ("streak", "@warning_bg", "@warning_dark",
+             "日次スケジュールを記録した日の連続日数（記録の無い休日は飛ばす・今日の記録前は昨日まで）"),
+            ("week", "@success_bg", "@success", "今週（月曜から）完了したチケット数"),
+            ("bull", "@accent_bg", "@accent_dark",
+             "今月完了したチケットのうち、実績が見積の ±20% に収まった件数"),
+        ]:
+            lbl = QLabel("")
+            lbl.setToolTip(tip)
+            lbl.setStyleSheet(qss(f"QLabel {{ background:{bg}; color:{fg}; border-radius:9px;"
+                                  " padding:2px 10px; font-weight:bold; }"))
+            head_row.addWidget(lbl)
+            self._reward_lbls[key] = lbl
+        layout.addLayout(head_row)
         layout.addWidget(Separator())
 
         # 📥 Inbox バナー（Task 未設定チケットがあるときだけ表示）
@@ -3739,6 +3757,15 @@ class DashboardView(QWidget):
         df_nodes = self.state.df_nodes
         self.header_lbl.setText(
             f"🏠 Today {today}  [{self.state.display_name(user)}]")
+
+        # I2: 小さなごほうび
+        st = LG.motivation_stats(df_nodes, self.state.df_daily, user, self.state.config.holidays)
+        streak = st["streak"]
+        cheer = " 🎉" if streak >= 20 else " ✨" if streak >= 5 else ""
+        self._reward_lbls["streak"].setText(f"🔥 連続記録 {streak} 日{cheer}")
+        self._reward_lbls["week"].setText(f"✅ 今週の完了 {st['week_done']} 件")
+        self._reward_lbls["bull"].setText(
+            f"🎯 見積ぴったり {st['bullseye']}/{st['bullseye_total']} 件（今月）")
 
         # 0. Inbox バナー
         cfg = self.state.config
