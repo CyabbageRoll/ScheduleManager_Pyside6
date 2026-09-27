@@ -169,6 +169,7 @@ class DailyScheduleWidget(QWidget):
     """
     # 選択スロットで「新しいチケットを作って割り当て」（行番号リスト）
     quick_add_requested = Signal(list)
+    worklog_requested = Signal(str)   # 右クリックした枠のチケットに作業ログを追加
 
     def __init__(self, state):
         super().__init__()
@@ -379,6 +380,14 @@ class DailyScheduleWidget(QWidget):
 
         df = self.state.df_nodes
         menu = QMenu(self)
+        # 右クリックした枠のチケットに作業ログを残す（F1）
+        clicked = self.schedule_table.item(self.schedule_table.rowAt(pos.y()), 1)
+        log_idx = clicked.data(Qt.ItemDataRole.UserRole) if clicked else None
+        if log_idx and log_idx in df.index and log_idx != "hour":
+            log_act = menu.addAction(f"📝 作業ログを追加: {df.loc[log_idx, 'title']}")
+            log_act.triggered.connect(
+                lambda checked=False, ti=log_idx: self.worklog_requested.emit(ti))
+            menu.addSeparator()
         # チケットが無いことに気づいたらその場で作って割り当てる（Ctrl+N と同じ）
         new_act = menu.addAction("＋ 新しいチケットを作成して割り当て…  (Ctrl+N)")
         new_act.triggered.connect(
@@ -1048,6 +1057,10 @@ class MainWindow(QMainWindow):
         self.main_pane.table_pane.schedule_refresh.connect(self.schedule_panel.refresh)
         self.gantt_view.ticket_clicked.connect(self.schedule_panel.assign_ticket)
         self.schedule_panel.quick_add_requested.connect(self._on_quick_add)
+        # F1: 作業ログ（日次・ガントの右クリック → 詳細ペインの入力欄へ）
+        self.schedule_panel.worklog_requested.connect(self._on_worklog_requested)
+        self.gantt_view.worklog_requested.connect(self._on_worklog_requested)
+        self.detail_pane.nodes_changed.connect(self._on_detail_nodes_changed)
         self.gantt_view.edit_requested.connect(self._on_gantt_edit_requested)
         self.road_view.edit_requested.connect(self._on_gantt_edit_requested)
         self.road_view.edit_popup_requested.connect(self._on_roadmap_edit_popup)
@@ -1615,6 +1628,26 @@ class MainWindow(QMainWindow):
         """AI取込完了後に Edit タブへ切替し取り込みキューをセットする"""
         self._switch_view(IDX_MAIN)
         self.main_pane.tree_pane.start_import_queue(idxs)
+
+    def _on_worklog_requested(self, idx: str) -> None:
+        """F1: 詳細ペインを開いてそのチケットの作業ログ入力欄にカーソルを置く"""
+        if self.stack.currentIndex() not in (IDX_MAIN, IDX_GANTT, IDX_ROADMAP):
+            self._switch_view(IDX_GANTT)
+        self.detail_toggle_btn.setChecked(True)
+        self.detail_pane.focus_work_log(idx)
+
+    def _on_detail_nodes_changed(self) -> None:
+        """詳細ペインでの変更（作業ログ）を Edit の表・ツリー・表示中ビューへ反映する。
+        再構築に伴う「選択」シグナルで詳細ペインが別ノードへ切り替わらないよう止めて更新する"""
+        for pane in (self.main_pane.tree_pane, self.main_pane.table_pane):
+            pane.blockSignals(True)
+            try:
+                pane.refresh()
+            finally:
+                pane.blockSignals(False)
+        cur = self.stack.currentWidget()
+        if hasattr(cur, "refresh") and cur is not self.main_pane:
+            cur.refresh()
 
     def _on_nodes_changed(self) -> None:
         """Edit のインメモリ変更をツリーと現在表示中ビューへ伝播する。
@@ -3124,6 +3157,8 @@ class DetailPane(QWidget):
     """ノード詳細 + レポート編集（上: 詳細/本日レポート編集、下: 過去レポート閲覧）。
     Plan/Gantt/Edit のノード選択に連動し、選択ノードの日付付きレポートを管理する。"""
 
+    nodes_changed = Signal()   # 作業ログの追記などでノードを変更した
+
     # LLM 文章化プロンプトのテンプレート（ユーザーがカスタマイズ可能）
     _LLM_TEMPLATE_PATH = Path(__file__).parent / "documents" / "llm_report.md"
     _LLM_FALLBACK = (
@@ -3489,17 +3524,50 @@ class DetailPane(QWidget):
         if basic:
             self.form_box.addWidget(basic)
 
-        # 5) メモカード
+        # 5) メモカード（自分のチケットは作業ログの入力欄つき）
         memo = _s("memo")
-        if memo:
-            memo_card, mv = self._make_card("メモ")
-            mlbl = QLabel(memo)
-            mlbl.setWordWrap(True)
-            mlbl.setStyleSheet(qss("QLabel { color:@text; font-size:9pt; }"))
-            mv.addWidget(mlbl)
+        can_log = ntype == "ticket" and _s("assigned_to") == self.state.user
+        self.log_edit = None
+        if memo or can_log:
+            memo_card, mv = self._make_card("メモ・作業ログ" if can_log else "メモ")
+            if memo:
+                mlbl = QLabel(memo)
+                mlbl.setWordWrap(True)
+                mlbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                mlbl.setStyleSheet(qss("QLabel { color:@text; font-size:9pt; }"))
+                mv.addWidget(mlbl)
+            if can_log:
+                self.log_edit = QLineEdit()
+                self.log_edit.setPlaceholderText("📝 作業ログを追加（Enter で時刻つきで記録）")
+                self.log_edit.returnPressed.connect(self._on_add_work_log)
+                mv.addWidget(self.log_edit)
             self.form_box.addWidget(memo_card)
 
         self.form_box.addStretch()
+
+    def _on_add_work_log(self) -> None:
+        """F1: 入力した一言を「[MM/DD HH:MM] 本文」としてメモ欄の末尾へ追記する"""
+        idx = self._node_idx
+        df = self.state.df_nodes
+        if self.log_edit is None or not idx or idx not in df.index:
+            return
+        text = self.log_edit.text().strip()
+        if not text:
+            return
+        df.loc[idx, "memo"] = LG.append_work_log(str(df.loc[idx, "memo"] or ""), text)
+        df.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
+        self._rebuild_form(idx)
+        self.nodes_changed.emit()
+        if self.log_edit is not None:
+            self.log_edit.setFocus()   # 続けて書けるように
+
+    def focus_work_log(self, idx: str) -> None:
+        """指定チケットを表示して作業ログの入力欄にカーソルを置く"""
+        self.update_for_node(idx)
+        if self.log_edit is not None:
+            self.log_edit.setFocus()
 
     def _open_link(self, link: str) -> None:
         """リンク先を OS の既定アプリで開く。URL とローカルパスの両方に対応。"""

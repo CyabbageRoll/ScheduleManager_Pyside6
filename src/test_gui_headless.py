@@ -2086,6 +2086,59 @@ def test_e1_estimate_assist(win, task_idx):
         state.df_nodes.drop(index=[i for i in added if i in state.df_nodes.index], inplace=True)
 
 
+def test_f1_work_log(win, ticket_idx, ticket2_idx):
+    """F1: 作業ログ（メモ欄へ時刻つきで追記）"""
+    print("\n[F1] 作業ログテスト")
+    import logic as LG
+    from PySide6.QtWidgets import QApplication
+    import ui_main as M
+    state = win.state
+    try:
+        now = datetime.datetime(2026, 9, 27, 10, 5)
+        assert LG.append_work_log("", "先方回答待ち", now) == "[09/27 10:05] 先方回答待ち"
+        assert LG.append_work_log("既存メモ\n", " 2 行\nにまたがる ", now) == "既存メモ\n[09/27 10:05] 2 行 にまたがる"
+        assert LG.append_work_log("既存", "   ", now) == "既存"
+        assert LG.WORK_LOG_RE.match("[09/27 10:05] 先方回答待ち")
+        ok("append_work_log: 末尾に [MM/DD HH:MM] 本文 を 1 行追記")
+    except Exception as e:
+        ng("append_work_log", e)
+    orig_memo = state.df_nodes.loc[ticket_idx, "memo"]
+    try:
+        win._switch_view(M.IDX_TODAY)
+        state.nodes_modified = False
+        win._on_worklog_requested(ticket_idx)
+        dp = win.detail_pane
+        assert win.stack.currentIndex() == M.IDX_GANTT and win.detail_toggle_btn.isChecked()
+        assert dp._node_idx == ticket_idx and dp.log_edit is not None
+        # Edit で親 Task を選び表に子チケットが並んだ状態でも、追記後に詳細ペインが切り替わらないこと
+        tp = win.main_pane.tree_pane
+        parent_task = str(state.df_nodes.loc[ticket_idx, "parent_id"])
+        tp.tree.setCurrentItem(tp._find_item(tp.tree.invisibleRootItem(), parent_task))
+        assert win.main_pane.table_pane.table.rowCount() > 1
+        win._on_worklog_requested(ticket_idx)
+        for text in ("資料の叩き台を作成", "先方回答待ち"):
+            dp.log_edit.setText(text)
+            dp._on_add_work_log()
+            QApplication.processEvents()
+            assert dp._node_idx == ticket_idx, f"追記後に詳細ペインが {dp._node_idx} へ切り替わった"
+        lines = str(state.df_nodes.loc[ticket_idx, "memo"]).splitlines()[-2:]
+        got = [LG.WORK_LOG_RE.match(l).group(5) for l in lines]
+        assert got == ["資料の叩き台を作成", "先方回答待ち"], lines
+        assert state.nodes_modified, "作業ログ追記で未保存にならない"
+        assert dp.log_edit is not None and dp.log_edit.text() == "", "続けて入力できない"
+        ok("右クリック→詳細ペインの入力欄で作業ログを追記（未保存扱い・続けて入力可）")
+    except Exception as e:
+        ng("詳細ペインの作業ログ", e)
+    finally:
+        state.df_nodes.loc[ticket_idx, "memo"] = orig_memo
+    try:
+        win.detail_pane.update_for_node(ticket2_idx)   # tanaka 担当
+        assert win.detail_pane.log_edit is None, "他人のチケットにも入力欄が出た"
+        ok("他人のチケットには作業ログの入力欄を出さない")
+    except Exception as e:
+        ng("他人のチケット", e)
+
+
 def test_theme():
     """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
     print("\n[D1] テーマ集約テスト")
@@ -2171,6 +2224,7 @@ def main():
             test_requests_0925(win)
             test_analysis_0925(win, pj_idx, task_idx, ticket_idx)
             test_e1_estimate_assist(win, task_idx)
+            test_f1_work_log(win, ticket_idx, ticket2_idx)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

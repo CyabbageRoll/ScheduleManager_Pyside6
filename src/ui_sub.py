@@ -70,6 +70,7 @@ class GanttView(QWidget):
     ticket_clicked    = Signal(str)  # チケット行クリック時に IDX を送出
     edit_requested    = Signal(str)  # Edit メニュー選択時に IDX を送出
     request_requested = Signal(str)  # 項目3: Request メニュー選択時に IDX を送出
+    worklog_requested = Signal(str)  # F1: 作業ログ追加メニュー選択時に IDX を送出
 
     _FIXED_COLS = 5   # 種別/タイトル/ステータス/担当者/見積h
     _COL_WIDTH_DATE = 28  # 日付列の幅(px)
@@ -816,6 +817,8 @@ class GanttView(QWidget):
         # 自分のチケット: 全メニューを表示
         menu = QMenu(self)
         menu.addAction(QAction("✏ Edit", self, triggered=lambda: self.edit_requested.emit(idx)))
+        menu.addAction(QAction("📝 作業ログを追加", self,
+                                triggered=lambda: self.worklog_requested.emit(idx)))
         menu.addSeparator()
         menu.addAction(QAction("📅 開始可能日変更", self,
                                 triggered=lambda: _change_date("start_available")))

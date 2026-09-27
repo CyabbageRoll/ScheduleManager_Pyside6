@@ -1579,3 +1579,22 @@ def similar_ticket_hours(df_nodes: pd.DataFrame, title: str, user: str,
         "avg_est": round(sum(ests) / len(ests), 2) if ests else None,
         "suggest": math.ceil(avg_actual * 4 - 1e-9) / 4,
     }
+
+
+# ============================================================
+# F1: 作業ログ（チケットのメモ欄へ時刻つきで追記）
+# ============================================================
+
+# 追記した 1 行の形式: [MM/DD HH:MM] 本文（成果のまとめ等で抽出に使う）
+WORK_LOG_RE = re.compile(r"^\[(\d{2})/(\d{2}) (\d{2}):(\d{2})\] (.+)$")
+
+
+def append_work_log(memo: str, text: str, now: Optional[datetime.datetime] = None) -> str:
+    """メモの末尾に「[MM/DD HH:MM] 本文」を 1 行追記した文字列を返す（本文の改行は空白に）"""
+    now = now or datetime.datetime.now()
+    body = " ".join(str(text).split())
+    if not body:
+        return memo or ""
+    line = f"[{now:%m/%d %H:%M}] {body}"
+    memo = (memo or "").rstrip("\n")
+    return f"{memo}\n{line}" if memo else line
