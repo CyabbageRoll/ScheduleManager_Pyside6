@@ -2420,6 +2420,69 @@ def test_g2_achievement(win):
         ng("成果のまとめダイアログ", e)
 
 
+def test_f3_now_window(win, state, version, tmpdir, ticket_idx):
+    """F3: 「いま」の小窓（いま・次・残り分、ON/OFF、状態の記憶）"""
+    print("\n[F3] いまの小窓テスト")
+    import pandas as pd
+    import logic as LG
+    from PySide6.QtCore import QSettings, QPoint
+    from PySide6.QtWidgets import QApplication
+    from db import DAILY_TIME_COLS, create_initial_node
+    me = state.user
+    try:
+        a = create_initial_node(me, "ticket", "仕様レビュー", "t", 1)
+        b = create_initial_node(me, "ticket", "定例", "t", 2)
+        nodes = pd.DataFrame([a, b]).set_index(pd.Index([a.name, b.name]))
+        r = {c: "" for c in DAILY_TIME_COLS}
+        r["Owner"] = me
+        for c in DAILY_TIME_COLS[40:44]:   # 10:00〜11:00
+            r[c] = a.name
+        for c in DAILY_TIME_COLS[46:48]:   # 11:30〜12:00
+            r[c] = b.name
+        daily = pd.DataFrame.from_dict({f"2026-09-28-{me}": r}, orient="index")
+        at = lambda h, m: LG.now_and_next(daily, nodes, me, datetime.datetime(2026, 9, 28, h, m))
+        x = at(10, 40)
+        assert x["now"]["title"] == "仕様レビュー" and x["left_min"] == 20 and x["next"]["title"] == "定例", x
+        x = at(11, 10)
+        assert x["now"] is None and x["next"]["from"] == "11:30", x
+        x = at(12, 0)
+        assert x["now"] is None and x["next"] is None, x
+        ok("いま（残り分）と次の予定を今日の日次スケジュールから求める")
+    except Exception as e:
+        ng("now_and_next", e)
+    try:
+        nw = win.now_window
+        win.now_btn.setChecked(True)
+        assert nw.isVisible()
+        nw.update_view()
+        assert nw.now_lbl.text().startswith("いま: ") and nw.next_lbl.text().startswith("次: ")
+        nw._on_close()
+        assert not nw.isVisible() and not win.now_btn.isChecked(), "× で閉じてもボタンが ON のまま"
+        ok("ツールバーの 📌 いま で表示・× で閉じるとボタンも OFF")
+    except Exception as e:
+        ng("小窓の表示切替", e)
+    try:
+        from ui_main import MainWindow
+        QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, tmpdir)
+        screen = QApplication.primaryScreen().availableGeometry()
+        target = screen.topLeft() + QPoint(40, 50)
+        win.now_btn.setChecked(True)
+        win.now_window.move(target)
+        state.nodes_modified = False
+        state.schedule_modified = False
+        win.save_ui_state()
+        win.now_btn.setChecked(False)
+        w2 = MainWindow(state, version)
+        w2.restore_ui_state()
+        assert w2.now_btn.isChecked() and w2.now_window.isVisible(), "表示状態が戻らない"
+        assert w2.now_window.pos() == target, (w2.now_window.pos(), target)
+        w2.now_btn.setChecked(False)
+        w2.hide(); w2.deleteLater()
+        ok("小窓の表示状態と位置を次回起動時に復元")
+    except Exception as e:
+        ng("小窓の状態の記憶", e)
+
+
 def test_theme():
     """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
     print("\n[D1] テーマ集約テスト")
@@ -2510,6 +2573,7 @@ def main():
             test_i2_rewards(win)
             test_g4_forecast(win, task_idx)
             test_g2_achievement(win)
+            test_f3_now_window(win, state, version, tmpdir, ticket_idx)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

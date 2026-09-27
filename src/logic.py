@@ -2193,3 +2193,29 @@ def build_achievement_markdown(data: dict, display_name: str = "") -> str:
         for m, (n, r) in data["accuracy_by_month"].items():
             lines.append(f"| {m} | {n} | {r:g} |")
     return "\n".join(lines) + "\n"
+
+
+# ============================================================
+# F3: 「いま」の小窓
+# ============================================================
+
+def now_and_next(df_daily: pd.DataFrame, df_nodes: pd.DataFrame, user: str,
+                 now: Optional[datetime.datetime] = None) -> dict:
+    """
+    今日の日次スケジュールから「いま」の予定と「次」の予定を返す。
+    戻り値: {"now": 区間 or None, "left_min": 残り分, "next": 区間 or None}
+    区間は collect_daily_segments の要素（from / to / title / task）。
+    """
+    now = now or datetime.datetime.now()
+    hhmm = f"{now:%H:%M}"
+    cur, nxt = None, None
+    for seg in collect_daily_segments(df_daily, df_nodes, now.date().isoformat(), user):
+        if seg["from"] <= hhmm < seg["to"]:
+            cur = seg
+        elif seg["from"] > hhmm and nxt is None:
+            nxt = seg
+    left = None
+    if cur:
+        h, m = (24, 0) if cur["to"] == "24:00" else map(int, cur["to"].split(":"))
+        left = h * 60 + m - (now.hour * 60 + now.minute)
+    return {"now": cur, "left_min": left, "next": nxt}
