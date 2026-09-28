@@ -4144,7 +4144,7 @@ class QuickAddDialog(QDialog):
     """
 
     _HELP = ("工数: 2h 30m 1.5 1時間半 ／ 納期: 明日 金 来週水 9/30 月末 5日 ／ "
-             "範囲: 9/28〜10/2 ／ @Task（なしは Inbox） ／ #以降はメモ ／ 「」で囲むとタイトル")
+             "範囲: 9/28〜10/2 ／ @Task（なしは Inbox。同名は @案件/Task） ／ #以降はメモ ／ 「」で囲むとタイトル")
 
     def __init__(self, state, default_hours: Optional[float] = None,
                  recent_tasks=(), parent=None):
@@ -4232,7 +4232,8 @@ class QuickAddDialog(QDialog):
                 show_cands = True
                 if self._task_idx is None:
                     errors.append("該当する Task がありません" if n == 0
-                                  else f"Task 候補 {n} 件 — ↑↓ で選んで Enter")
+                                  else f"Task 候補 {n} 件 — ↑↓ で選んで Enter"
+                                       "（同名は @親の名前/Task でも指定できます）")
         self._fill_candidates(q if show_cands else None)
 
         if not p["title"]:
@@ -4326,7 +4327,8 @@ class QuickAddDialog(QDialog):
         if item is None:
             return
         idx = item.data(Qt.ItemDataRole.UserRole)
-        title = re.sub(r"\s+", "", str(self.state.df_nodes.loc[idx, "title"]))
+        # 同名の Task があれば「@案件B/設計」のように親の名前付きにして、入力欄でも区別できるようにする
+        title = LG.task_query_label(self.state.df_nodes, idx, self.state.user)
         text = self.edit.text()
         memo_m = re.search(r"(?:^|\s)[#＃]", text)
         body_end = memo_m.start() if memo_m else len(text)
@@ -4339,6 +4341,8 @@ class QuickAddDialog(QDialog):
         self._chosen[LG.norm_key(title)] = idx
         self.edit.setText(new_text)
         self.edit.setCursorPosition(m.start() + 1 + len(title))
+        # 入力が変わらない場合（同名 Task を名前どおり入力済み等）も選択を反映する
+        self._update()
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self.edit and event.type() == QEvent.Type.KeyPress:

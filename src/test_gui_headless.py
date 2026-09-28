@@ -2516,6 +2516,52 @@ def test_i3_dark_mode(win):
         ng("theme 設定", e)
 
 
+def test_quick_add_same_task_name(win):
+    """クイック追加: 別プロジェクトに同名 Task があっても選べる（@親/Task）"""
+    print("\n[B2+] 同名 Task のクイック追加テスト")
+    import logic as LG
+    import ui_main as M
+    from db import create_initial_node
+    state = win.state
+    me = state.user
+    added = []
+    try:
+        ids = {}
+        for pj in ("案件A", "案件B"):
+            p = create_initial_node(me, "project1", pj, "0", 90)
+            t = create_initial_node(me, "task", "設計 レビュー", p.name, 1)
+            for n in (p, t):
+                state.df_nodes.loc[n.name] = n
+                added.append(n.name)
+            ids[pj] = t.name
+        df = state.df_nodes
+        assert LG.resolve_task_query(df, "設計レビュー", me) == (None, 2), "同名なのに確定した"
+        assert LG.resolve_task_query(df, "案件B/設計レビュー", me)[0] == ids["案件B"]
+        assert LG.resolve_task_query(df, "ｂ＞設計", me)[0] == ids["案件B"], "親の部分一致・全角区切り"
+        assert LG.resolve_task_query(df, "案件C/設計", me) == (None, 0)
+        assert LG.task_query_label(df, ids["案件A"], me) == "案件A/設計レビュー"
+        ok("同名 Task は @親の名前/Task で絞り込み・確定（親は部分一致、/ ／ > ＞ 区切り）")
+    except Exception as e:
+        ng("同名 Task の解決", e)
+    try:
+        d = M.QuickAddDialog(state, parent=win)
+        d.edit.setText("資料作成 @設計レビュー #メモ")
+        rows = [d.cands.item(i).data(0x0100) for i in range(d.cands.count())]
+        d.cands.setCurrentRow(rows.index(ids["案件B"]))
+        d._choose_candidate()
+        assert d._task_idx == ids["案件B"], "候補を選んでも Task が確定しない"
+        assert d.edit.text() == "資料作成 @案件B/設計レビュー #メモ", d.edit.text()
+        assert d.btns.button(d.btns.StandardButton.Ok).isEnabled()
+        d.edit.setText("資料作成 @案件a/設計 #メモ")
+        assert d._task_idx == ids["案件A"]
+        d.close()
+        ok("候補から選ぶと @案件B/設計 に書き換えて確定・手入力の @案件a/設計 も確定")
+    except Exception as e:
+        ng("同名 Task の候補選択", e)
+    finally:
+        state.df_nodes.drop(index=[i for i in added if i in state.df_nodes.index], inplace=True)
+
+
 def test_theme():
     """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
     print("\n[D1] テーマ集約テスト")
@@ -2595,6 +2641,7 @@ def main():
             test_undo_redo(win, task_idx, ticket_idx)
             test_quick_add_parse()
             test_quick_add_inbox(win, task_idx, tmpdir)
+            test_quick_add_same_task_name(win)
             test_save_load(state)
             test_ui_state(state, version, win, tmpdir)
             test_theme()

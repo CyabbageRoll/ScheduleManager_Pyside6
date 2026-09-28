@@ -1608,19 +1608,47 @@ def _open_tasks(df_nodes: pd.DataFrame) -> pd.DataFrame:
                     & (~df_nodes["status"].isin(["done", "cancel", "deleted"]))]
 
 
+# @親/Task の区切り（全角・半角のスラッシュと ＞）
+_TASK_PATH_SEP = re.compile(r"[/／>＞]")
+
+
+def _split_task_query(query: str) -> List[str]:
+    """「案件B/設計」→ ["案件b", "設計"]（照合用キー。空の区切りは無視）"""
+    return [norm_key(p) for p in _TASK_PATH_SEP.split(query or "") if norm_key(p)]
+
+
+def _ancestors_match(df_nodes: pd.DataFrame, idx: str, parents: List[str]) -> bool:
+    """idx の祖先タイトル（ルート→親）に parents の各語が順番どおり部分一致で含まれるか"""
+    anc = [norm_key(t) for t in node_path_titles(df_nodes, idx)[:-1]]
+    pos = 0
+    for p in parents:
+        while pos < len(anc) and p not in anc[pos]:
+            pos += 1
+        if pos >= len(anc):
+            return False
+        pos += 1
+    return True
+
+
 def quick_add_task_candidates(df_nodes: pd.DataFrame, query: str, user: str = "",
                               recent=(), limit: int = 10) -> List[tuple]:
     """
     @指定の Task 候補を [(task_idx, 階層パス), ...] で順位順に返す。
     順位: タイトル完全一致 → 前方一致 → 部分一致 → パス一致。
     同順位は最近使った Task・自分担当・パス順。完了/中止 Task は除外。
+    「@案件B/設計」のように親の名前（部分一致・順不同不可）を / や ＞ で前に付けると、
+    同名の Task をその親の配下に絞り込む。
     """
     if df_nodes.empty:
         return []
-    q = norm_key(query or "")
+    segs = _split_task_query(query)
+    q = segs[-1] if segs else ""
+    parents = segs[:-1]
     recent = list(recent)
     scored = []
     for idx, r in _open_tasks(df_nodes).iterrows():
+        if parents and not _ancestors_match(df_nodes, idx, parents):
+            continue
         title_k = norm_key(r.get("title", ""))
         path = " ＞ ".join(node_path_titles(df_nodes, idx))
         if not q:
@@ -1631,7 +1659,7 @@ def quick_add_task_candidates(df_nodes: pd.DataFrame, query: str, user: str = ""
             score = 1
         elif q in title_k:
             score = 2
-        elif q in norm_key(path):
+        elif not parents and q in norm_key(path):
             score = 3
         else:
             continue
@@ -1645,15 +1673,32 @@ def quick_add_task_candidates(df_nodes: pd.DataFrame, query: str, user: str = ""
 def resolve_task_query(df_nodes: pd.DataFrame, query: str, user: str = "",
                        recent=()) -> tuple:
     """@指定を 1 つの Task に確定する。(task_idx or None, 候補数) を返す。
-    候補が 1 件、またはタイトル完全一致が 1 件なら確定する。"""
+    候補が 1 件、またはタイトル完全一致が 1 件なら確定する（同名が複数なら確定しない）。"""
     cands = quick_add_task_candidates(df_nodes, query, user, recent, limit=1000)
     if len(cands) == 1:
         return cands[0][0], 1
-    q = norm_key(query or "")
+    segs = _split_task_query(query)
+    q = segs[-1] if segs else ""
     exact = [i for i, _ in cands if norm_key(df_nodes.loc[i, "title"]) == q]
     if q and len(exact) == 1:
         return exact[0], len(cands)
     return None, len(cands)
+
+
+def task_query_label(df_nodes: pd.DataFrame, idx: str, user: str = "") -> str:
+    """
+    Task を @指定で一意に表す最短の文字列（@ は含まない）。
+    同名が無ければ Task 名だけ、同名があれば「案件B/設計」のように親の名前を前に足していく。
+    （@語には空白を含められないため、名前の空白は除く）
+    """
+    names = [re.sub(r"\s+", "", t) for t in node_path_titles(df_nodes, idx)]
+    if not names:
+        return ""
+    for k in range(1, len(names) + 1):
+        label = "/".join(names[-k:])
+        if resolve_task_query(df_nodes, label, user)[0] == idx:
+            return label
+    return "/".join(names)
 
 
 def inbox_tickets(df_nodes: pd.DataFrame, user: str) -> pd.DataFrame:

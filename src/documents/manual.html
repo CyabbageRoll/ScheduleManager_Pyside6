@@ -607,7 +607,9 @@ Main タブのガントや日次スケジュールの予定を右クリック �
   <tr><td>工数</td><td><code>2h</code> <code>2.5</code> <code>30分</code> <code>1時間半</code></td><td>見積工数（15分単位に切上げ。整数だけの <code>3</code> はタイトル扱い → <code>3h</code> と入力）</td></tr>
   <tr><td>納期</td><td><code>明日</code> <code>金</code> <code>来週水</code> <code>9/30</code> <code>5日</code> <code>月末</code> <code>今週中</code></td><td>曜日は今日を含む最も近い日。過去の月日は60日以内なら今年、それより前は来年</td></tr>
   <tr><td>期間</td><td><code>9/28〜10/2</code></td><td>開始可能日〜納期</td></tr>
-  <tr><td>Task</td><td><code>@設計</code></td><td>候補から ↑↓ で選んで <kbd>Enter</kbd>。<strong>省略すると Inbox</strong></td></tr>
+  <tr><td>Task</td><td><code>@設計</code><br><code>@案件B/設計</code></td><td>候補から ↑↓ で選んで <kbd>Enter</kbd>。<strong>省略すると Inbox</strong>。
+    別のプロジェクトに<strong>同じ名前の Task</strong> があるときは、候補から選ぶと <code>@案件B/設計</code> のように親の名前付きに書き換わります。
+    直接 <code>@案件B/設計</code>（区切りは <code>/</code> <code>＞</code>、親の名前は一部でも可）と入力しても指定できます</td></tr>
   <tr><td>メモ</td><td><code>#先方確認済み</code></td><td>空白の後の <code>#</code> から行末まで（中身は解析しない）</td></tr>
   <tr><td>そのまま</td><td><code>「水」</code></td><td>「」で囲んだ語は必ずタイトル</td></tr>
 </table>
