@@ -2030,6 +2030,538 @@ def test_analysis_0925(win, pj_idx, task_idx, ticket_idx):
         ng("見積の表示切替", e)
 
 
+def test_e1_estimate_assist(win, task_idx):
+    """E1: 見積アシスト（自分の完了チケットのうち似たものの実績）"""
+    print("\n[E1] 見積アシストテスト")
+    import logic as LG
+    import ui_main as M
+    from db import create_initial_node
+    state = win.state
+    me = state.user
+    added = []
+    try:
+        for title, est, act, owner in [("議事録作成 A社", 1.0, 1.5, me), ("議事録作成 B社", 1.0, 2.0, me),
+                                       ("議事録作成 C社", 1.0, 9.0, "tanaka@email.com")]:
+            n = create_initial_node(owner, "ticket", title, task_idx, 50)
+            n["status"] = "done"; n["estimated_hours"] = est; n["actual_hours"] = act
+            state.df_nodes.loc[n.name] = n
+            added.append(n.name)
+        a = LG.similar_ticket_hours(state.df_nodes, "議事録作成 D社", me)
+        assert a and len(a["items"]) == 2, a            # 他人（tanaka）の分は含めない
+        assert a["avg_actual"] == 1.75 and a["suggest"] == 1.75 and a["avg_est"] == 1.0, a
+        assert LG.similar_ticket_hours(state.df_nodes, "まったく別の件", me) is None
+        ok("自分の完了チケットだけから似た仕事の実績を平均（提案 1.75h）")
+    except Exception as e:
+        ng("similar_ticket_hours", e)
+    try:
+        d = M.QuickAddDialog(state, parent=win)
+        d.edit.setText("議事録作成 D社 #メモ")
+        assert d.assist_btn.isVisible() or not d.isVisible()  # 非表示ダイアログでも状態は持つ
+        assert d._assist and d.assist_btn.isEnabled()
+        d._apply_assist()
+        assert d.edit.text() == "議事録作成 D社 1.75h #メモ", d.edit.text()
+        assert d._parsed["hours"] == 1.75 and d._parsed["memo"] == "メモ"
+        assert not d.assist_btn.isEnabled(), "工数を書いた後も上書きできる"
+        d.close()
+        ok("クイック追加: 提案の工数をメモの手前に書き足せる")
+    except Exception as e:
+        ng("クイック追加の見積アシスト", e)
+    try:
+        d = M._NodeEditDialog(task_idx, "ticket", state, parent=win)
+        d.f_title.setText("議事録作成 E社")
+        assert d._assist is not None and "1.75h を使う" in d.assist_use.text()
+        d.assist_use.click()
+        assert d.f_est.value() == 1.75
+        d.f_title.setText("関係ない名前")
+        assert d._assist is None
+        d.close()
+        d2 = M._NodeEditDialog("0", "project1", state, parent=win)
+        d2.f_title.setText("議事録作成")
+        assert d2._assist is None, "チケット以外にも表示された"
+        d2.close()
+        ok("新規作成ダイアログ: 似た仕事の実績を表示し「使う」で見積に反映（チケットのみ）")
+    except Exception as e:
+        ng("編集ダイアログの見積アシスト", e)
+    finally:
+        state.df_nodes.drop(index=[i for i in added if i in state.df_nodes.index], inplace=True)
+
+
+def test_f1_work_log(win, ticket_idx, ticket2_idx):
+    """F1: 作業ログ（メモ欄へ時刻つきで追記）"""
+    print("\n[F1] 作業ログテスト")
+    import logic as LG
+    from PySide6.QtWidgets import QApplication
+    import ui_main as M
+    state = win.state
+    try:
+        now = datetime.datetime(2026, 9, 27, 10, 5)
+        assert LG.append_work_log("", "先方回答待ち", now) == "[09/27 10:05] 先方回答待ち"
+        assert LG.append_work_log("既存メモ\n", " 2 行\nにまたがる ", now) == "既存メモ\n[09/27 10:05] 2 行 にまたがる"
+        assert LG.append_work_log("既存", "   ", now) == "既存"
+        assert LG.WORK_LOG_RE.match("[09/27 10:05] 先方回答待ち")
+        ok("append_work_log: 末尾に [MM/DD HH:MM] 本文 を 1 行追記")
+    except Exception as e:
+        ng("append_work_log", e)
+    orig_memo = state.df_nodes.loc[ticket_idx, "memo"]
+    try:
+        win._switch_view(M.IDX_TODAY)
+        state.nodes_modified = False
+        win._on_worklog_requested(ticket_idx)
+        dp = win.detail_pane
+        assert win.stack.currentIndex() == M.IDX_GANTT and win.detail_toggle_btn.isChecked()
+        assert dp._node_idx == ticket_idx and dp.log_edit is not None
+        # Edit で親 Task を選び表に子チケットが並んだ状態でも、追記後に詳細ペインが切り替わらないこと
+        tp = win.main_pane.tree_pane
+        parent_task = str(state.df_nodes.loc[ticket_idx, "parent_id"])
+        tp.tree.setCurrentItem(tp._find_item(tp.tree.invisibleRootItem(), parent_task))
+        assert win.main_pane.table_pane.table.rowCount() > 1
+        win._on_worklog_requested(ticket_idx)
+        for text in ("資料の叩き台を作成", "先方回答待ち"):
+            dp.log_edit.setText(text)
+            dp._on_add_work_log()
+            QApplication.processEvents()
+            assert dp._node_idx == ticket_idx, f"追記後に詳細ペインが {dp._node_idx} へ切り替わった"
+        lines = str(state.df_nodes.loc[ticket_idx, "memo"]).splitlines()[-2:]
+        got = [LG.WORK_LOG_RE.match(l).group(5) for l in lines]
+        assert got == ["資料の叩き台を作成", "先方回答待ち"], lines
+        assert state.nodes_modified, "作業ログ追記で未保存にならない"
+        assert dp.log_edit is not None and dp.log_edit.text() == "", "続けて入力できない"
+        ok("右クリック→詳細ペインの入力欄で作業ログを追記（未保存扱い・続けて入力可）")
+    except Exception as e:
+        ng("詳細ペインの作業ログ", e)
+    finally:
+        state.df_nodes.loc[ticket_idx, "memo"] = orig_memo
+    try:
+        win.detail_pane.update_for_node(ticket2_idx)   # tanaka 担当
+        assert win.detail_pane.log_edit is None, "他人のチケットにも入力欄が出た"
+        ok("他人のチケットには作業ログの入力欄を出さない")
+    except Exception as e:
+        ng("他人のチケット", e)
+
+
+def test_e2_deadline_risk(win, task_idx):
+    """E2: 納期リスク予報（見積係数・Today・ガント・Config）"""
+    print("\n[E2] 納期リスク予報テスト")
+    import pandas as pd
+    import logic as LG
+    import ui_sub
+    from db import create_initial_node
+    state = win.state
+    me = state.user
+
+    def frame(rows):
+        return pd.DataFrame([r for r in rows]).set_index(pd.Index([r.name for r in rows]))
+    try:
+        base = []
+        for i, ratio in enumerate([1.2, 1.4, 1.3, 1.1, 1.5]):
+            n = create_initial_node(me, "ticket", f"済{i}", "t", i)
+            n["status"] = "done"; n["estimated_hours"] = 2.0; n["actual_hours"] = 2.0 * ratio
+            base.append(n)
+        df = frame(base)
+        assert LG.estimate_factor(df, me) == (1.3, 5), LG.estimate_factor(df, me)
+        assert LG.estimate_factor(frame(base[:4]), me) == (1.0, 4), "5 件未満は 1.0"
+        base[0]["actual_hours"] = 0.0           # 実績未記録は除外 → 4 件で 1.0
+        assert LG.estimate_factor(frame(base), me) == (1.0, 4)
+        big = frame([create_initial_node(me, "ticket", f"遅{i}", "t", i) for i in range(5)])
+        big["status"] = "done"; big["estimated_hours"] = 1.0; big["actual_hours"] = 5.0
+        assert LG.estimate_factor(big, me)[0] == 2.0, "上限 2.0 に丸めない"
+        ok("見積係数: 実績÷見積の平均（完了 5 件未満・実績 0 は除外、1.0〜2.0 に丸め）")
+    except Exception as e:
+        ng("estimate_factor", e)
+    try:
+        # 月曜 9/28 起点・1 日 5h。納期 9/29(火) の 8h → 係数 1.0 なら間に合う、1.5 なら 12h で 9/30 完了
+        T = datetime.date(2026, 9, 28)
+        task = create_initial_node(me, "task", "T", "p", 1)
+        tk = create_initial_node(me, "ticket", "資料作成", task.name, 1)
+        tk["estimated_hours"] = 8.0; tk["deadline"] = "2026-09-29"
+        df = frame([task, tk])
+        assert LG.deadline_risks(df, me, 5.0, ["SAT", "SUN"], T, 1.0) == []
+        r = LG.deadline_risks(df, me, 5.0, ["SAT", "SUN"], T, 1.5)
+        assert len(r) == 1 and r[0]["finish"] == datetime.date(2026, 9, 30) and r[0]["late_days"] == 1, r
+        assert r[0]["task"] == "T"
+        tk["status"] = "regularly"                # 定常は予報しない
+        assert LG.deadline_risks(frame([task, tk]), me, 5.0, ["SAT", "SUN"], T, 1.5) == []
+        tk["status"] = "todo"
+        tk["deadline"] = "2026-09-25"             # 過去の納期は予報に含めない（超過アラートで扱う）
+        assert LG.deadline_risks(frame([task, tk]), me, 5.0, ["SAT", "SUN"], T, 1.5) == []
+        ok("予報: 見積×係数の残りで間に合わない今日以降の納期だけを返す（営業日で遅れ日数）")
+    except Exception as e:
+        ng("deadline_risks", e)
+    added = None
+    orig = state.config.risk_use_factor
+    try:
+        n = create_initial_node(me, "ticket", "巨大チケット", task_idx, 60)
+        n["estimated_hours"] = 200.0
+        n["deadline"] = (datetime.date.today() + datetime.timedelta(days=3)).isoformat()
+        state.df_nodes.loc[n.name] = n
+        added = n.name
+        dv = win.dashboard_view
+        dv.refresh()
+        lst = dv._cards["edit"]["list"]
+        texts = [lst.item(i).text() for i in range(lst.count())]
+        hits = [t for t in texts if t.startswith("🔮予報") and "巨大チケット" in t]
+        assert len(hits) == 1, texts
+        assert not any(t.startswith("接近") and "巨大チケット" in t for t in texts), "接近と予報が重複"
+        ok("Today の納期アラートに 🔮予報 を表示（接近との重複なし）")
+        gv = win.gantt_view
+        state.current_member = me
+        gv._status_radios["all"].setChecked(True)
+        gv._rebuild_table()
+        titles = [gv.table.item(r, 1).text() for r in range(gv.table.rowCount()) if gv.table.item(r, 1)]
+        assert any("🔮" in t and "巨大チケット" in t for t in titles), titles
+        ok("ガントのタイトルに 🔮 と予報のツールチップ")
+        state.config.risk_use_factor = False
+        assert ui_sub.deadline_risk_forecast(state, me)[1] == 1.0
+        ok("Config risk_use_factor=false で係数 1.0（見積どおり）")
+    except Exception as e:
+        ng("Today・ガントの予報表示", e)
+    finally:
+        state.config.risk_use_factor = orig
+        if added in state.df_nodes.index:
+            state.df_nodes.drop(index=[added], inplace=True)
+
+
+def test_i2_rewards(win):
+    """I2: 小さなごほうび（連続記録・今週の完了・見積ぴったり）"""
+    print("\n[I2] 小さなごほうびテスト")
+    import pandas as pd
+    import logic as LG
+    from db import DAILY_TIME_COLS, create_initial_node
+    me = win.state.user
+    try:
+        def daily(dates):
+            rows = {}
+            for d in dates:
+                r = {c: "" for c in DAILY_TIME_COLS}
+                r["Owner"] = me
+                r["C0900"] = "tk"
+                rows[f"{d}-{me}"] = r
+            return pd.DataFrame.from_dict(rows, orient="index")
+        T = datetime.date(2026, 9, 28)   # 月曜
+        hol = ["SAT", "SUN"]
+        empty = pd.DataFrame(columns=["node_type"])
+        dd = daily(["2026-09-24", "2026-09-25"])          # 木・金（土日は休日）
+        assert LG.motivation_stats(empty, dd, me, hol, T)["streak"] == 2, "今日未記録なら昨日から数える"
+        dd = daily(["2026-09-24", "2026-09-25", "2026-09-28"])
+        assert LG.motivation_stats(empty, dd, me, hol, T)["streak"] == 3
+        dd = daily(["2026-09-23", "2026-09-25", "2026-09-28"])   # 木が抜け
+        assert LG.motivation_stats(empty, dd, me, hol, T)["streak"] == 2
+        dd = daily(["2026-09-25", "2026-09-27"])           # 日曜の休日出勤も数える
+        assert LG.motivation_stats(empty, dd, me, hol, datetime.date(2026, 9, 27))["streak"] == 2
+        ok("連続記録: 記録の無い休日は飛ばし休日出勤は数える・今日の記録前は昨日まで")
+    except Exception as e:
+        ng("連続記録", e)
+    try:
+        T = datetime.date(2026, 9, 30)   # 水曜
+        rows = []
+        for i, (end, est, act) in enumerate([("2026-09-28", 2.0, 2.2), ("2026-09-30", 2.0, 3.0),
+                                             ("2026-09-25", 1.0, 1.0), ("2026-08-31", 1.0, 1.0)]):
+            n = create_initial_node(me, "ticket", f"t{i}", "t", i)
+            n["status"] = "done"; n["actual_end"] = end
+            n["estimated_hours"] = est; n["actual_hours"] = act
+            rows.append(n)
+        df = pd.DataFrame(rows).set_index(pd.Index([r.name for r in rows]))
+        st = LG.motivation_stats(df, pd.DataFrame(), me, ["SAT", "SUN"], T)
+        assert st["week_done"] == 2, st                   # 9/28・9/30
+        assert (st["bullseye"], st["bullseye_total"]) == (2, 3), st   # 今月 3 件中 ±20% は 2 件
+        ok("今週の完了数・今月の見積ぴったり（±20%）")
+    except Exception as e:
+        ng("完了数・見積ぴったり", e)
+    try:
+        dv = win.dashboard_view
+        dv.refresh()
+        texts = [l.text() for l in dv._reward_lbls.values()]
+        assert texts[0].startswith("🔥 連続記録") and texts[1].startswith("✅ 今週の完了") \
+            and texts[2].startswith("🎯 見積ぴったり"), texts
+        ok("Today のヘッダーに 3 つのごほうび表示")
+    except Exception as e:
+        ng("Today のごほうび表示", e)
+
+
+def test_g4_forecast(win, task_idx):
+    """G4: 完了予測（残りの推移・ペース・完了予想日）"""
+    print("\n[G4] 完了予測テスト")
+    from PySide6.QtWidgets import QLabel
+    import pandas as pd
+    import logic as LG
+    from db import DAILY_TIME_COLS, create_initial_node
+    me = win.state.user
+    try:
+        task = create_initial_node(me, "task", "T", "p", 1)
+        task["deadline"] = "2026-10-09"
+        a = create_initial_node(me, "ticket", "A", task.name, 1)
+        a["estimated_hours"] = 10.0; a["actual_hours"] = 4.0; a["created_at"] = "2026-09-20"
+        b = create_initial_node(me, "ticket", "B", task.name, 2)
+        b["estimated_hours"] = 4.0; b["actual_hours"] = 4.0; b["status"] = "done"
+        b["actual_end"] = "2026-09-29"; b["created_at"] = "2026-09-20"
+        df = pd.DataFrame([task, a, b]).set_index(pd.Index([task.name, a.name, b.name]))
+        rows = {}
+        for d, tk, h in [("2026-09-25", b.name, 4.0), ("2026-09-28", a.name, 2.0), ("2026-09-29", a.name, 2.0)]:
+            r = {c: "" for c in DAILY_TIME_COLS}
+            r["Owner"] = me
+            for c in DAILY_TIME_COLS[36:36 + int(h * 4)]:
+                r[c] = tk
+            rows[f"{d}-{me}"] = r
+        daily = pd.DataFrame.from_dict(rows, orient="index")
+        T = datetime.date(2026, 9, 30)
+        fc = LG.completion_forecast(df, daily, {task.name}, None, ["SAT", "SUN"], T)
+        assert fc["remaining_now"] == 6.0, fc
+        assert fc["pace"] == 0.8, fc                         # 8h ÷ 10 営業日
+        assert fc["forecast"] == datetime.date(2026, 10, 12), fc["forecast"]   # 8 営業日後
+        assert fc["deadline"] == datetime.date(2026, 10, 9)
+        h = dict(fc["history"])
+        assert h[datetime.date(2026, 9, 24)] == 14.0 and h[datetime.date(2026, 9, 25)] == 10.0 \
+            and h[datetime.date(2026, 9, 29)] == 6.0 and h[T] == 6.0, h
+        assert fc["history"][0] == (datetime.date(2026, 9, 19), 0.0), fc["history"][:2]  # 作成前日から
+        c = create_initial_node(me, "ticket", "C", task.name, 3)   # 完了日の記録が無い done
+        c["estimated_hours"] = 3.0; c["status"] = "done"; c["created_at"] = "2026-09-20"
+        df2 = pd.concat([df, pd.DataFrame([c]).set_index(pd.Index([c.name]))])
+        fc2 = LG.completion_forecast(df2, daily, {task.name}, None, ["SAT", "SUN"], T)
+        assert fc2["history"][-1][1] == fc2["remaining_now"] == 6.0, "推移の終点と現在の残りがずれる"
+        txt = LG.completion_text(fc)
+        assert txt.startswith("10/12 完了見込み（納期 10/9 に遅れ ⚠）"), txt
+        empty = LG.completion_forecast(df, pd.DataFrame(), {task.name}, None, ["SAT", "SUN"], T)
+        assert empty["forecast"] is None and "予測できません" in LG.completion_text(empty)
+        ok("残り 6h・ペース 0.8h/日 → 10/12 完了見込み（納期超過を表示）、推移を日ごとに復元")
+    except Exception as e:
+        ng("completion_forecast", e)
+    try:
+        anal = win.anal_view
+        anal._calc_burndown()
+        assert anal._ax.get_title().startswith("完了予測"), anal._ax.get_title()
+        anal._calc()
+        ok("Analyze の「📉 完了予測」グラフ")
+        dp = win.detail_pane
+        dp.update_for_node(task_idx)
+        heads = [w.text() for w in dp.findChildren(QLabel) if w.text() == "完了予測"]
+        assert heads, "詳細ペインに完了予測カードが無い"
+        ok("詳細ペイン（Task）に完了予測カード")
+    except Exception as e:
+        ng("完了予測の表示", e)
+
+
+def test_g2_achievement(win):
+    """G2: 成果のまとめ（期間プリセット・集計・Markdown・ダイアログ）"""
+    print("\n[G2] 成果のまとめテスト")
+    import pandas as pd
+    import logic as LG
+    import ui_sub
+    from PySide6.QtWidgets import QApplication
+    from db import DAILY_TIME_COLS, create_initial_node
+    me = win.state.user
+    try:
+        R = lambda n, d: LG.review_period(n, d)
+        oct5, jul1, feb1 = datetime.date(2026, 10, 5), datetime.date(2026, 7, 1), datetime.date(2027, 2, 1)
+        assert R("上期", oct5) == ("2026-04-01", "2026-09-30")
+        assert R("下期", oct5) == ("2026-10-01", "2027-03-31")
+        assert R("年度", oct5) == ("2026-04-01", "2027-03-31")
+        assert R("下期", jul1) == ("2025-10-01", "2026-03-31"), "上期中の「下期」は直近の前年度下期"
+        assert R("上期", feb1) == ("2026-04-01", "2026-09-30") and R("下期", feb1) == ("2026-10-01", "2027-03-31")
+        ok("期間プリセット: 上期／下期は今日を含む・直近の半期、年度は 4 月始まり")
+    except Exception as e:
+        ng("review_period", e)
+    try:
+        memo = "[12/20 10:00] 年末の調整\n[01/10 09:00] 年明けの対応\n[06/01 09:00] 期間外\n普通のメモ"
+        assert LG._work_logs_in_period(memo, "2026-12-01", "2027-01-31") == \
+            ["[12/20 10:00] 年末の調整", "[01/10 09:00] 年明けの対応"]
+        ok("作業ログは年をまたぐ期間でも月日から期間内を判定")
+    except Exception as e:
+        ng("作業ログの期間抽出", e)
+    try:
+        p1a = create_initial_node(me, "project1", "案件A", "0", 1)
+        p1b = create_initial_node(me, "project1", "案件B", "0", 2)
+        ta = create_initial_node(me, "task", "設計", p1a.name, 1)
+        tb = create_initial_node(me, "task", "運用", p1b.name, 1)
+        k1 = create_initial_node(me, "ticket", "基本設計", ta.name, 1)
+        k1.update({"status": "done", "actual_end": "2026-05-20", "estimated_hours": 4.0,
+                   "actual_hours": 5.0, "memo": "[05/10 10:00] レビュー指摘を反映"})
+        k2 = create_initial_node(me, "ticket", "月次運用", tb.name, 1)
+        k3 = create_initial_node(me, "ticket", "昨年度の件", ta.name, 2)
+        k3.update({"status": "done", "actual_end": "2026-03-30"})
+        nodes = [p1a, p1b, ta, tb, k1, k2, k3]
+        df = pd.DataFrame(nodes).set_index(pd.Index([n.name for n in nodes]))
+        rows = {}
+        for d, tk, h in [("2026-05-10", k1.name, 3.0), ("2026-05-11", k1.name, 2.0),
+                         ("2026-06-01", k2.name, 1.0), ("2026-03-30", k3.name, 8.0)]:
+            r = {c: "" for c in DAILY_TIME_COLS}
+            r["Owner"] = me
+            for c in DAILY_TIME_COLS[36:36 + int(h * 4)]:
+                r[c] = tk
+            rows[f"{d}-{me}"] = r
+        daily = pd.DataFrame.from_dict(rows, orient="index")
+        data = LG.achievement_summary(df, daily, me, "2026-04-01", "2026-09-30")
+        assert data["total_hours"] == 6.0 and data["days_worked"] == 3, data   # 3/30 は期間外
+        assert data["by_p1"] == [("案件A", 5.0), ("案件B", 1.0)], data["by_p1"]
+        assert [t["hours"] for t in data["top"]] == [5.0, 1.0] and data["top"][0]["path"] == "案件A ＞ 設計 ＞ 基本設計"
+        assert data["top"][0]["logs"] == ["[05/10 10:00] レビュー指摘を反映"]
+        assert [c["title"] for c in data["completed"]] == ["基本設計"], data["completed"]
+        assert data["accuracy"] == 1.25 and data["accuracy_by_month"] == {"2026-05": (1, 1.25)}
+        md = LG.build_achievement_markdown(data, "山田")
+        for key in ("# 成果のまとめ（山田）", "## プロジェクト別の投入時間", "| 案件A | 5h | 83% |",
+                    "## 時間をかけた仕事 上位 5 件", "   - [05/10 10:00] レビュー指摘を反映",
+                    "### 案件A", "- 2026-05-20 基本設計（見積 4h → 実績 5h）", "## 見積精度の推移（月別）"):
+            assert key in md, key
+        ok("投入時間・プロジェクト別・上位 5 件（作業ログ付き）・完了一覧・見積精度を Markdown に")
+    except Exception as e:
+        ng("achievement_summary", e)
+    try:
+        d = ui_sub.AchievementDialog(win.state, win)
+        assert d._preset_btns["上期"].isChecked() and d.markdown.startswith("# 成果のまとめ")
+        d.member.set_user("tanaka@email.com")
+        assert win.state.display_name("tanaka@email.com") in d.markdown.splitlines()[0]
+        d._copy_for_ai()
+        clip = QApplication.clipboard().text()
+        assert "自己評価の下書き" in clip and "# 成果のまとめ" in clip
+        d.p_from.set_date("2026-01-01"); d._on_custom()
+        assert not any(b.isChecked() for b in d._preset_btns.values())
+        d.close()
+        ok("ダイアログ: メンバー切替・任意期間・AI 用コピー（依頼文＋データ）")
+    except Exception as e:
+        ng("成果のまとめダイアログ", e)
+
+
+def test_f3_now_window(win, state, version, tmpdir, ticket_idx):
+    """F3: 「いま」の小窓（いま・次・残り分、ON/OFF、状態の記憶）"""
+    print("\n[F3] いまの小窓テスト")
+    import pandas as pd
+    import logic as LG
+    from PySide6.QtCore import QSettings, QPoint
+    from PySide6.QtWidgets import QApplication
+    from db import DAILY_TIME_COLS, create_initial_node
+    me = state.user
+    try:
+        a = create_initial_node(me, "ticket", "仕様レビュー", "t", 1)
+        b = create_initial_node(me, "ticket", "定例", "t", 2)
+        nodes = pd.DataFrame([a, b]).set_index(pd.Index([a.name, b.name]))
+        r = {c: "" for c in DAILY_TIME_COLS}
+        r["Owner"] = me
+        for c in DAILY_TIME_COLS[40:44]:   # 10:00〜11:00
+            r[c] = a.name
+        for c in DAILY_TIME_COLS[46:48]:   # 11:30〜12:00
+            r[c] = b.name
+        daily = pd.DataFrame.from_dict({f"2026-09-28-{me}": r}, orient="index")
+        at = lambda h, m: LG.now_and_next(daily, nodes, me, datetime.datetime(2026, 9, 28, h, m))
+        x = at(10, 40)
+        assert x["now"]["title"] == "仕様レビュー" and x["left_min"] == 20 and x["next"]["title"] == "定例", x
+        x = at(11, 10)
+        assert x["now"] is None and x["next"]["from"] == "11:30", x
+        x = at(12, 0)
+        assert x["now"] is None and x["next"] is None, x
+        ok("いま（残り分）と次の予定を今日の日次スケジュールから求める")
+    except Exception as e:
+        ng("now_and_next", e)
+    try:
+        nw = win.now_window
+        win.now_btn.setChecked(True)
+        assert nw.isVisible()
+        nw.update_view()
+        assert nw.now_lbl.text().startswith("いま: ") and nw.next_lbl.text().startswith("次: ")
+        nw._on_close()
+        assert not nw.isVisible() and not win.now_btn.isChecked(), "× で閉じてもボタンが ON のまま"
+        ok("ツールバーの 📌 いま で表示・× で閉じるとボタンも OFF")
+    except Exception as e:
+        ng("小窓の表示切替", e)
+    try:
+        from ui_main import MainWindow
+        QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, tmpdir)
+        screen = QApplication.primaryScreen().availableGeometry()
+        target = screen.topLeft() + QPoint(40, 50)
+        win.now_btn.setChecked(True)
+        win.now_window.move(target)
+        state.nodes_modified = False
+        state.schedule_modified = False
+        win.save_ui_state()
+        win.now_btn.setChecked(False)
+        w2 = MainWindow(state, version)
+        w2.restore_ui_state()
+        assert w2.now_btn.isChecked() and w2.now_window.isVisible(), "表示状態が戻らない"
+        assert w2.now_window.pos() == target, (w2.now_window.pos(), target)
+        w2.now_btn.setChecked(False)
+        w2.hide(); w2.deleteLater()
+        ok("小窓の表示状態と位置を次回起動時に復元")
+    except Exception as e:
+        ng("小窓の状態の記憶", e)
+
+
+def test_i3_dark_mode(win):
+    """I3: ダークモード（配色の切替・Config の選択肢・起動時の判定）"""
+    print("\n[I3] ダークモードテスト")
+    import theme
+    from schedule_app import AppConfig
+    light = {k: getattr(theme.C, k) for k in vars(theme.C) if k.isupper()}
+    btn, level = theme.STYLE_BUTTON, theme.LEVEL_BG
+    try:
+        theme.set_mode("dark")
+        assert theme.MODE == "dark" and theme.C.SURFACE == theme.DARK["SURFACE"]
+        assert theme.STYLE_BUTTON != btn and "#2A2640" in theme.STYLE_BUTTON, "共通スタイルが作り直されない"
+        assert theme.LEVEL_BG is level and level["task"] == theme.DARK["TASK_BG"], "階層色の辞書が更新されない"
+        assert theme.mpl_style()["axes.facecolor"] == theme.DARK["SURFACE"]
+        assert theme.C.NODE_DEFAULT == light["NODE_DEFAULT"], "ダークに無いトークンはライトの値を使う"
+        theme.set_mode("light")
+        assert {k: getattr(theme.C, k) for k in light} == light and theme.STYLE_BUTTON == btn
+        ok("set_mode: ダーク⇄ライトで色・共通スタイル・階層色・グラフ色が切り替わり、元に戻る")
+    except Exception as e:
+        ng("set_mode", e)
+    finally:
+        theme.set_mode("light")
+    try:
+        R = theme.resolve_mode
+        assert R("dark", False) == "dark" and R("light", True) == "light"
+        assert R("system", True) == "dark" and R("system", False) == "light" and R("", True) == "light"
+        assert AppConfig().theme == "light"
+        w = win.config_view._fields["gui_theme"]
+        assert [w.itemData(i) for i in range(w.count())] == ["light", "dark", "system"]
+        ok("Config の theme（ライト／ダーク／OS に合わせる、既定ライト）と起動時の判定")
+    except Exception as e:
+        ng("theme 設定", e)
+
+
+def test_quick_add_same_task_name(win):
+    """クイック追加: 別プロジェクトに同名 Task があっても選べる（@親/Task）"""
+    print("\n[B2+] 同名 Task のクイック追加テスト")
+    import logic as LG
+    import ui_main as M
+    from db import create_initial_node
+    state = win.state
+    me = state.user
+    added = []
+    try:
+        ids = {}
+        for pj in ("案件A", "案件B"):
+            p = create_initial_node(me, "project1", pj, "0", 90)
+            t = create_initial_node(me, "task", "設計 レビュー", p.name, 1)
+            for n in (p, t):
+                state.df_nodes.loc[n.name] = n
+                added.append(n.name)
+            ids[pj] = t.name
+        df = state.df_nodes
+        assert LG.resolve_task_query(df, "設計レビュー", me) == (None, 2), "同名なのに確定した"
+        assert LG.resolve_task_query(df, "案件B/設計レビュー", me)[0] == ids["案件B"]
+        assert LG.resolve_task_query(df, "ｂ＞設計", me)[0] == ids["案件B"], "親の部分一致・全角区切り"
+        assert LG.resolve_task_query(df, "案件C/設計", me) == (None, 0)
+        assert LG.task_query_label(df, ids["案件A"], me) == "案件A/設計レビュー"
+        ok("同名 Task は @親の名前/Task で絞り込み・確定（親は部分一致、/ ／ > ＞ 区切り）")
+    except Exception as e:
+        ng("同名 Task の解決", e)
+    try:
+        d = M.QuickAddDialog(state, parent=win)
+        d.edit.setText("資料作成 @設計レビュー #メモ")
+        rows = [d.cands.item(i).data(0x0100) for i in range(d.cands.count())]
+        d.cands.setCurrentRow(rows.index(ids["案件B"]))
+        d._choose_candidate()
+        assert d._task_idx == ids["案件B"], "候補を選んでも Task が確定しない"
+        assert d.edit.text() == "資料作成 @案件B/設計レビュー #メモ", d.edit.text()
+        assert d.btns.button(d.btns.StandardButton.Ok).isEnabled()
+        d.edit.setText("資料作成 @案件a/設計 #メモ")
+        assert d._task_idx == ids["案件A"]
+        d.close()
+        ok("候補から選ぶと @案件B/設計 に書き換えて確定・手入力の @案件a/設計 も確定")
+    except Exception as e:
+        ng("同名 Task の候補選択", e)
+    finally:
+        state.df_nodes.drop(index=[i for i in added if i in state.df_nodes.index], inplace=True)
+
+
 def test_theme():
     """D1: 色は theme.py に集約（ui_*.py に色コードを直書きしない・@トークンは全て定義済み）"""
     print("\n[D1] テーマ集約テスト")
@@ -2109,11 +2641,20 @@ def main():
             test_undo_redo(win, task_idx, ticket_idx)
             test_quick_add_parse()
             test_quick_add_inbox(win, task_idx, tmpdir)
+            test_quick_add_same_task_name(win)
             test_save_load(state)
             test_ui_state(state, version, win, tmpdir)
             test_theme()
             test_requests_0925(win)
             test_analysis_0925(win, pj_idx, task_idx, ticket_idx)
+            test_e1_estimate_assist(win, task_idx)
+            test_f1_work_log(win, ticket_idx, ticket2_idx)
+            test_e2_deadline_risk(win, task_idx)
+            test_i2_rewards(win)
+            test_g4_forecast(win, task_idx)
+            test_g2_achievement(win)
+            test_f3_now_window(win, state, version, tmpdir, ticket_idx)
+            test_i3_dark_mode(win)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

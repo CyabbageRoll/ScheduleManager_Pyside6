@@ -333,6 +333,7 @@
   <tr><td><kbd>💾 保存 (Ctrl+S)</kbd></td><td>現在の編集内容をDBに保存</td></tr>
   <tr><td><kbd>🔄 読込 (Ctrl+R)</kbd></td><td>DBから最新データを読み込む</td></tr>
   <tr><td>タブボタン群</td><td>各機能タブへの切替（下記参照）</td></tr>
+  <tr><td><kbd>📌 いま</kbd></td><td>いまの予定と次の予定を常に手前の小窓に表示（通知なし）。<a href="#now-window">詳細</a></td></tr>
   <tr><td><kbd>🔎 詳細</kbd></td><td>右側の詳細ペイン（ノード詳細＋レポート）の表示/非表示を切替（Main/Plan/Edit で有効）。<a href="#detail-pane">詳細</a></td></tr>
   <tr><td><kbd>📖 Manual</kbd></td><td>このマニュアルをブラウザで開く</td></tr>
   <tr><td><kbd>📥 Inbox n</kbd></td><td>Task 未設定チケットの件数。クリックで振り分け画面。<a href="#inbox">詳細</a></td></tr>
@@ -376,13 +377,37 @@
 <table>
   <tr><th>カード</th><th>内容</th><th>「→ 開く」の遷移先</th></tr>
   <tr><td>📅 今日のスケジュール</td><td>当日の予定を時間帯ごとに表示＋合計時間</td><td>Main タブ</td></tr>
-  <tr><td>⏰ 納期アラート</td><td>自分担当の納期超過（赤）・7日以内（橙）チケット</td><td>Edit タブ</td></tr>
+  <tr><td>⏰ 納期アラート</td><td>自分担当の納期超過（赤）・🔮予報（赤）・7日以内（橙）チケット</td><td>Edit タブ</td></tr>
   <tr><td>📨 未処理の依頼</td><td>自分宛の承諾待ち依頼</td><td>Request タブ</td></tr>
   <tr><td>👥 チームの今日</td><td>メンバーの体調・勤務地（未入力者はグレー表示）</td><td>Team タブ</td></tr>
 </table>
 
 <div class="card tip">
   <strong>✅ 件数バッジ</strong>: 各カードの件数がひと目で分かります。問題がなければ ✅ が表示されます。
+</div>
+
+<h3 id="rewards">🔥 小さなごほうび</h3>
+<p>Today の右上に、続ける励みになる 3 つの数字を表示します（マウスを乗せると定義が出ます）。</p>
+<ul>
+  <li><strong>🔥 連続記録</strong>: 日次スケジュールを記録した日の連続日数。記録の無い休日は飛ばし、休日出勤の記録は数えます。今日の記録前は昨日までで数えるので、朝に 0 へ戻ることはありません（5 日で ✨、20 日で 🎉）</li>
+  <li><strong>✅ 今週の完了</strong>: 今週（月曜から）完了したチケット数</li>
+  <li><strong>🎯 見積ぴったり</strong>: 今月完了したチケットのうち、実績が見積の ±20% に収まった件数</li>
+</ul>
+
+<h3 id="deadline-risk">🔮 納期リスク予報</h3>
+<p>残りの作業を<strong>今のペース</strong>（1 日の標準作業時間 <code>[Schedule] daily_task_hour</code>・休日・納期順）で進めた場合に、
+<strong>まだ過ぎていない納期に間に合わない</strong>チケットを「🔮予報 10/1 完了見込み・納期 9/29 から 2 営業日遅れ」のように表示します。
+ガントでもタイトルに 🔮 が付き、マウスを乗せると見込みが出ます。定常（regularly）チケットは対象外です。</p>
+<ul>
+  <li><strong>見積係数</strong>: 自分の完了チケットの「実績÷見積」の平均（例 ×1.3 ＝見積より 3 割多くかかる傾向）を残りの見積に掛けます。
+    完了実績が 5 件未満のときは ×1.0、範囲は ×1.0〜×2.0 です</li>
+  <li>係数を使わず見積どおりに計算したいときは <a href="#config-tab">⚙ Config</a> → <code>[Schedule] risk_use_factor</code> を「見積どおりに計算する」にします</li>
+</ul>
+
+<div class="card info">
+  <strong>🌙 ダークモード</strong><br>
+  <a href="#config-tab">⚙ Config タブ</a> → <code>[GUI] theme</code> で「🌙 ダーク」を選び、config.ini に保存してアプリを再起動すると夜用の暗い配色になります。
+  「OS の設定に合わせる」にすると、Windows の「アプリ モード」（ライト／ダーク）に合わせて起動時に切り替わります。
 </div>
 
 <div class="card info">
@@ -515,6 +540,21 @@
 <h3>上段：ノード詳細</h3>
 <p>Plan のツリー・ガント・ロードマップなどでノードを選択すると、その種類・タイトル・ステータス・担当者・見積/実績工数・各種日付・メモが一覧表示されます（読み取り専用。編集は Edit タブで行います）。</p>
 
+<h4 id="now-window">📌 「いま」の小窓</h4>
+<p>ツールバーの <kbd>📌 いま</kbd> を押すと、画面の端に<strong>常に手前に出る小さな窓</strong>を表示します。
+今日の日次スケジュールから「いま: 仕様レビュー」「10:00〜11:00（残り 20 分）」「次: 11:30 定例」を表示します（30 秒ごとに更新）。</p>
+<ul>
+  <li>表示するだけで、<strong>音やポップアップの通知はしません</strong></li>
+  <li>ドラッグで移動、クリックでメイン画面を前面に出します。× で閉じるとボタンも OFF になります</li>
+  <li>表示していたかどうかと位置は、次回起動時に復元します</li>
+</ul>
+
+<h4 id="work-log">📝 作業ログ</h4>
+<p>自分のチケットでは「メモ・作業ログ」カードに入力欄があり、一言入れて <kbd>Enter</kbd> を押すと
+<code>[09/27 10:30] 先方回答待ち</code> のように<strong>時刻つきでメモ欄の末尾に追記</strong>します（Ctrl+S で保存・Ctrl+Z で取消）。
+Main タブのガントや日次スケジュールの予定を右クリック →「📝 作業ログを追加」でも、そのチケットの入力欄が開きます。
+貯まったログは週報・引継ぎ・成果のまとめの材料になります。</p>
+
 <h3>下段：レポート（月次・Project2 単位）</h3>
 <p>レポートは <strong>月 × Project2 ごとに 1 つの Markdown ファイル</strong> に集約され、ファイル内はアイテムごとに <code>### IDX_…</code> セクションで区切られます。GUI は選択したアイテムのセクションだけを読み書きします。</p>
 
@@ -567,7 +607,9 @@
   <tr><td>工数</td><td><code>2h</code> <code>2.5</code> <code>30分</code> <code>1時間半</code></td><td>見積工数（15分単位に切上げ。整数だけの <code>3</code> はタイトル扱い → <code>3h</code> と入力）</td></tr>
   <tr><td>納期</td><td><code>明日</code> <code>金</code> <code>来週水</code> <code>9/30</code> <code>5日</code> <code>月末</code> <code>今週中</code></td><td>曜日は今日を含む最も近い日。過去の月日は60日以内なら今年、それより前は来年</td></tr>
   <tr><td>期間</td><td><code>9/28〜10/2</code></td><td>開始可能日〜納期</td></tr>
-  <tr><td>Task</td><td><code>@設計</code></td><td>候補から ↑↓ で選んで <kbd>Enter</kbd>。<strong>省略すると Inbox</strong></td></tr>
+  <tr><td>Task</td><td><code>@設計</code><br><code>@案件B/設計</code></td><td>候補から ↑↓ で選んで <kbd>Enter</kbd>。<strong>省略すると Inbox</strong>。
+    別のプロジェクトに<strong>同じ名前の Task</strong> があるときは、候補から選ぶと <code>@案件B/設計</code> のように親の名前付きに書き換わります。
+    直接 <code>@案件B/設計</code>（区切りは <code>/</code> <code>＞</code>、親の名前は一部でも可）と入力しても指定できます</td></tr>
   <tr><td>メモ</td><td><code>#先方確認済み</code></td><td>空白の後の <code>#</code> から行末まで（中身は解析しない）</td></tr>
   <tr><td>そのまま</td><td><code>「水」</code></td><td>「」で囲んだ語は必ずタイトル</td></tr>
 </table>
@@ -576,6 +618,12 @@
 <div class="card tip">
   <strong>✅ 朝のスケジュール入力と連携</strong>: Main タブの日次スケジュールで時間帯を選んだまま <kbd>Ctrl</kbd>+<kbd>N</kbd>（または右クリック「＋ 新しいチケットを作成して割り当て」）で、
   作成と同時にその時間帯へ割り当てます。工数を省略すると選んだ時間が見積になります。
+</div>
+
+<div class="card info">
+  <strong>💡 見積アシスト</strong>: タイトルを入力すると、<strong>自分の完了チケット</strong>のうち名前が似ているものの実績を
+  「💡 似た仕事の実績（自分・2件）: 平均 1.75h」のように表示します。ボタンを押すと、その時間（15分単位に切上げ）を見積として書き足します。
+  チケットの新規作成・編集ダイアログにも同じ表示があり、「使う」で見積工数に反映できます（マウスを乗せると内訳が出ます）。
 </div>
 
 <h3 id="inbox">📥 Inbox（Task 未設定チケット）</h3>
@@ -935,6 +983,25 @@ ticket_idx: ...</pre>
 <h4>見積 vs 実績（超過チケット）</h4>
 <p>実績が見積を超えているチケット（要注意チケット）を一覧表示します。自分のチケットはメモ欄をダブルクリックで編集できます。</p>
 
+<h3 id="analyze-forecast">📉 完了予測</h3>
+<p>「📉 完了予測」ボタンで、<strong>チェックした範囲（なし＝全体）・選択中の人物</strong>の残り作業の推移（実線）と、
+<strong>直近 2 週間のペース</strong>で進めた場合の見込み（点線）、納期（赤線）を表示します。
+タイトルに「10/15 完了見込み（納期 10/20）・残り 12h・ペース 3h/日」のように要約が出ます。</p>
+<ul>
+  <li>残り＝未完了チケットの「見積 − 実績」の合計、ペース＝直近 2 週間の実績時間 ÷ 営業日数</li>
+  <li>直近 2 週間に実績が無いときは「予測できません」と表示します</li>
+  <li>詳細ペインで P1〜Task を選ぶと「完了予測」カードに同じ 1 行が出ます（全メンバー分。納期に遅れる見込みは赤）</li>
+</ul>
+
+<h3 id="analyze-review">📋 成果のまとめ（評価面談用）</h3>
+<p>「📋 成果のまとめ」ボタンで、<strong>メンバー</strong>（既定は自分）と<strong>期間</strong>を選び、評価面談の材料を Markdown でまとめます。</p>
+<ul>
+  <li>期間: <strong>上期</strong>（4〜9 月）／<strong>下期</strong>（10〜3 月）は今日を含む、または直近の半期。<strong>年度</strong>は今年度。📅 で任意の期間も指定できます</li>
+  <li>内容: 投入時間の合計と記録日数、プロジェクト別・月別の投入時間、時間をかけた仕事の上位 5 件（期間内の📝作業ログ付き）、完了したチケット一覧、見積精度（月別）</li>
+  <li>「🤖 AI 用にコピー」: 自己評価の下書きを頼む依頼文とデータをまとめてコピーします。AI チャットに貼り付けて使います</li>
+  <li>「💾 Markdown で保存」: <code>[Report] output_dir</code> が設定されていればそこを初期表示にして保存します</li>
+</ul>
+
 <h3 id="analyze-personal">🔍 個人振り返り</h3>
 <p>「🔍 個人振り返り」ボタンで、時間の使い方と見積精度を可視化します。<strong>集計対象は画面上部で選択中のメンバー</strong>です。</p>
 <ul>
@@ -969,8 +1036,8 @@ ticket_idx: ...</pre>
   <tr><td>[Database]</td><td>DB 保存フォルダのパス</td></tr>
   <tr><td>[User]</td><td>自分のユーザー名、チームメンバー一覧</td></tr>
   <tr><td>[DisplayNames]</td><td>ユーザー名 → 画面表示名のマッピング</td></tr>
-  <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ、<code>start_tab</code>（起動時タブ: Today/Main/Plan/Edit/前回終了時。プルダウンで選択）、<code>detail_pane</code>（詳細ペインの起動時開閉: open/closed）</td></tr>
-  <tr><td>[Schedule]</td><td>営業時間（始業・終業）、1日の標準作業時間、休日</td></tr>
+  <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ、<code>start_tab</code>（起動時タブ: Today/Main/Plan/Edit/前回終了時。プルダウンで選択）、<code>theme</code>（配色: ☀ ライト / 🌙 ダーク / OS の設定に合わせる。再起動で反映）、<code>detail_pane</code>（詳細ペインの起動時開閉: open/closed）</td></tr>
+  <tr><td>[Schedule]</td><td>営業時間（始業・終業）、1日の標準作業時間、休日、<code>risk_use_factor</code>（納期リスク予報で見積係数を掛けるか）</td></tr>
   <tr><td>[DailyInfoCombo]</td><td>健・場・安・残 の選択肢リスト</td></tr>
   <tr><td>[Report]</td><td><code>output_dir</code>: レポート・当日ログの Markdown 出力先フォルダ</td></tr>
   <tr><td>[Pomodoro]</td><td><code>work_minutes</code> / <code>break_minutes</code>: 作業・休憩時間（分）</td></tr>

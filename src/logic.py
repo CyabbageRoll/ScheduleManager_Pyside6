@@ -484,6 +484,185 @@ def fill_deadlines_backward(tickets: pd.DataFrame, daily_h: float = 5.0,
     return df
 
 
+def schedule_tickets(df: pd.DataFrame, member: str, daily_h: float, holidays,
+                     today: Optional[datetime.date] = None, factor: float = 1.0) -> dict:
+    """
+    担当者の全チケット（全Task・全Project横断）を対象に EDF＋整合どりスケジューリングを行う。
+
+    アルゴリズム:
+      ① 各Task配下のチケットごとに仮納期を逆算（fill_deadlines_backward）
+         → 最後のチケットに納期がなければ親Taskの納期を使用
+      ② 全チケットをまとめてEDFソート（仮納期昇順）
+      ③ 1日の作業時間（Configで設定）を使ってグローバルに作業日を割り当て
+         → 開始可能日制約で飛ばしたチケットは優先1で再チェック
+      ④ 作業日が納期より遅い場合はアラート（呼び出し側でd > deadlineで判定）
+
+    factor: 残り工数の見積係数（E2 納期リスク予報用。1.0 ならガントと同じ計算）
+      残り工数 = 見積 × factor − 実績
+
+    Returns:
+        {ticket_idx: (work_days: set[date], start_avail: date|None, deadline: date|None)}
+    """
+    daily_h = max(0.25, float(daily_h))
+    today = today or datetime.date.today()
+
+    holidays_upper = {h.strip().upper() for h in holidays}
+    day_abbrevs = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+
+    def is_holiday(d: datetime.date) -> bool:
+        return day_abbrevs[d.weekday()] in holidays_upper
+
+    def parse_date(val) -> Optional[datetime.date]:
+        if val and str(val) not in ("", "nan", "None"):
+            try:
+                return datetime.date.fromisoformat(str(val))
+            except Exception:
+                pass
+        return None
+
+    # ① 全Taskを横断して担当者のチケットを収集し、Taskごとに仮納期を計算
+    # done/cancel のTaskは完了済みのため除外（配下のチケットもスケジュール不要）
+    all_tasks = df[
+        (df["node_type"] == "task")
+        & (~df["status"].isin(["done", "cancel", "deleted"]))
+    ]
+
+    collected: list[pd.DataFrame] = []
+    for task_idx in all_tasks.index:
+        # このタスク配下で担当者のチケット（done/cancel/deleted除外）
+        # done は既に完了済みのため未来の作業スロットを消費しない
+        tickets = df[
+            (df["parent_id"] == task_idx)
+            & (df["node_type"] == "ticket")
+            & (~df["status"].isin(["done", "cancel", "deleted"]))
+            & (df.get("assigned_to", pd.Series(dtype=str)) == member)
+        ].copy()
+        if tickets.empty:
+            continue
+
+        # 親タスクの納期（最後のチケットに納期がない場合のフォールバック）
+        parent_dl = parse_date(df.loc[task_idx].get("deadline")) if task_idx in df.index else None
+
+        # 仮納期を填入
+        tickets = fill_deadlines_backward(tickets, daily_h, parent_deadline=parent_dl)
+
+        # 同一Task内で開始可能日を後方チケットへ伝播
+        # 例) A:3/3, B:-(なし), C:3/7, D:-(なし) → B:3/3, D:3/7
+        tickets = tickets.sort_values("priority")
+        running_start: Optional[datetime.date] = None
+        for t_idx in tickets.index:
+            raw = tickets.loc[t_idx, "start_available"]
+            explicit: Optional[datetime.date] = None
+            if raw and str(raw) not in ("", "nan", "None"):
+                try:
+                    explicit = datetime.date.fromisoformat(str(raw))
+                except Exception:
+                    pass
+            if explicit is not None:
+                effective = max(running_start, explicit) if running_start else explicit
+                running_start = effective
+                tickets.loc[t_idx, "start_available"] = effective.isoformat()
+            elif running_start is not None:
+                tickets.loc[t_idx, "start_available"] = running_start.isoformat()
+
+        collected.append(tickets)
+
+    if not collected:
+        return {}
+
+    # ② 全チケットをマージしてEDFソート
+    all_tickets = pd.concat(collected)
+    all_tickets["_dl_sort"] = pd.to_datetime(all_tickets["deadline"], errors="coerce")
+    # 納期が過去（today以前）の場合、EDFソートキーをtodayに統一する
+    # → 全ての期限超過チケットを同等の緊急度として扱い、priorityフィールドで順序を決定
+    # ※ アラート表示（d > deadline）は元の納期で正しく評価されるため影響なし
+    pd_today = pd.Timestamp(today)
+    all_tickets["_dl_sort"] = all_tickets["_dl_sort"].clip(lower=pd_today)
+    all_tickets = all_tickets.sort_values(["_dl_sort", "priority"], na_position="last")
+    edf_order = list(all_tickets.index)
+
+    # ③ 整合どりスケジューリング（全チケット横断・1日作業時間=daily_h）
+    unscheduled = list(edf_order)
+    skipped: list = []
+    cursor = today
+    cursor_h = 0.0
+    result = {}
+
+    while unscheduled or skipped:
+        candidates = skipped + [t for t in unscheduled if t not in skipped]
+
+        scheduled_any = False
+
+        for t_idx in candidates:
+            if t_idx not in all_tickets.index:
+                if t_idx in skipped:     skipped.remove(t_idx)
+                if t_idx in unscheduled: unscheduled.remove(t_idx)
+                scheduled_any = True
+                break
+
+            tr = all_tickets.loc[t_idx]
+            start_avail = parse_date(tr.get("start_available"))
+            deadline    = parse_date(tr.get("deadline"))
+
+            if start_avail and cursor < start_avail:
+                if t_idx not in skipped:
+                    skipped.append(t_idx)
+                if t_idx in unscheduled:
+                    unscheduled.remove(t_idx)
+                continue
+
+            if t_idx in skipped:     skipped.remove(t_idx)
+            if t_idx in unscheduled: unscheduled.remove(t_idx)
+
+            est_h      = float(tr.get("estimated_hours", 0) or 0)
+            act_h      = float(tr.get("actual_hours", 0) or 0)
+            remaining_h = max(0.0, est_h * factor - act_h)
+            # todoで残り工数が0以下の場合は0.5hとして作業日を算出
+            t_status = str(tr.get("status", ""))
+            if remaining_h < 0.001 and t_status == "todo":
+                remaining_h = 0.5
+
+            work_days: set = set()
+            if remaining_h > 0.001:
+                h_left   = remaining_h
+                d        = cursor
+                h_in_day = cursor_h
+                itr      = 0
+                while h_left > 0.001 and itr < 1000:
+                    if is_holiday(d):
+                        d += datetime.timedelta(days=1); h_in_day = 0.0; itr += 1; continue
+                    avail = daily_h - h_in_day
+                    if avail <= 0.001:
+                        d += datetime.timedelta(days=1); h_in_day = 0.0; itr += 1; continue
+                    used = min(avail, h_left)
+                    work_days.add(d)
+                    h_left -= used; h_in_day += used
+                    if h_in_day >= daily_h - 0.001:
+                        d += datetime.timedelta(days=1); h_in_day = 0.0
+                    itr += 1
+                cursor   = d
+                cursor_h = h_in_day
+
+            result[t_idx] = (work_days, start_avail, deadline)
+            scheduled_any = True
+            break
+
+        if not scheduled_any:
+            all_pending = list(dict.fromkeys(skipped + unscheduled))
+            next_dates  = [
+                parse_date(all_tickets.loc[t, "start_available"])
+                for t in all_pending if t in all_tickets.index
+            ]
+            next_dates = [nd for nd in next_dates if nd is not None]
+            if next_dates:
+                cursor   = min(next_dates)
+                cursor_h = 0.0
+            else:
+                break
+
+    return result
+
+
 # ---------- 完了チェック（spec 2.2 自動 done 伝播） ----------
 
 def check_auto_done(df_nodes: pd.DataFrame, changed_idx: str) -> List[str]:
@@ -1429,19 +1608,47 @@ def _open_tasks(df_nodes: pd.DataFrame) -> pd.DataFrame:
                     & (~df_nodes["status"].isin(["done", "cancel", "deleted"]))]
 
 
+# @親/Task の区切り（全角・半角のスラッシュと ＞）
+_TASK_PATH_SEP = re.compile(r"[/／>＞]")
+
+
+def _split_task_query(query: str) -> List[str]:
+    """「案件B/設計」→ ["案件b", "設計"]（照合用キー。空の区切りは無視）"""
+    return [norm_key(p) for p in _TASK_PATH_SEP.split(query or "") if norm_key(p)]
+
+
+def _ancestors_match(df_nodes: pd.DataFrame, idx: str, parents: List[str]) -> bool:
+    """idx の祖先タイトル（ルート→親）に parents の各語が順番どおり部分一致で含まれるか"""
+    anc = [norm_key(t) for t in node_path_titles(df_nodes, idx)[:-1]]
+    pos = 0
+    for p in parents:
+        while pos < len(anc) and p not in anc[pos]:
+            pos += 1
+        if pos >= len(anc):
+            return False
+        pos += 1
+    return True
+
+
 def quick_add_task_candidates(df_nodes: pd.DataFrame, query: str, user: str = "",
                               recent=(), limit: int = 10) -> List[tuple]:
     """
     @指定の Task 候補を [(task_idx, 階層パス), ...] で順位順に返す。
     順位: タイトル完全一致 → 前方一致 → 部分一致 → パス一致。
     同順位は最近使った Task・自分担当・パス順。完了/中止 Task は除外。
+    「@案件B/設計」のように親の名前（部分一致・順不同不可）を / や ＞ で前に付けると、
+    同名の Task をその親の配下に絞り込む。
     """
     if df_nodes.empty:
         return []
-    q = norm_key(query or "")
+    segs = _split_task_query(query)
+    q = segs[-1] if segs else ""
+    parents = segs[:-1]
     recent = list(recent)
     scored = []
     for idx, r in _open_tasks(df_nodes).iterrows():
+        if parents and not _ancestors_match(df_nodes, idx, parents):
+            continue
         title_k = norm_key(r.get("title", ""))
         path = " ＞ ".join(node_path_titles(df_nodes, idx))
         if not q:
@@ -1452,7 +1659,7 @@ def quick_add_task_candidates(df_nodes: pd.DataFrame, query: str, user: str = ""
             score = 1
         elif q in title_k:
             score = 2
-        elif q in norm_key(path):
+        elif not parents and q in norm_key(path):
             score = 3
         else:
             continue
@@ -1466,15 +1673,32 @@ def quick_add_task_candidates(df_nodes: pd.DataFrame, query: str, user: str = ""
 def resolve_task_query(df_nodes: pd.DataFrame, query: str, user: str = "",
                        recent=()) -> tuple:
     """@指定を 1 つの Task に確定する。(task_idx or None, 候補数) を返す。
-    候補が 1 件、またはタイトル完全一致が 1 件なら確定する。"""
+    候補が 1 件、またはタイトル完全一致が 1 件なら確定する（同名が複数なら確定しない）。"""
     cands = quick_add_task_candidates(df_nodes, query, user, recent, limit=1000)
     if len(cands) == 1:
         return cands[0][0], 1
-    q = norm_key(query or "")
+    segs = _split_task_query(query)
+    q = segs[-1] if segs else ""
     exact = [i for i, _ in cands if norm_key(df_nodes.loc[i, "title"]) == q]
     if q and len(exact) == 1:
         return exact[0], len(cands)
     return None, len(cands)
+
+
+def task_query_label(df_nodes: pd.DataFrame, idx: str, user: str = "") -> str:
+    """
+    Task を @指定で一意に表す最短の文字列（@ は含まない）。
+    同名が無ければ Task 名だけ、同名があれば「案件B/設計」のように親の名前を前に足していく。
+    （@語には空白を含められないため、名前の空白は除く）
+    """
+    names = [re.sub(r"\s+", "", t) for t in node_path_titles(df_nodes, idx)]
+    if not names:
+        return ""
+    for k in range(1, len(names) + 1):
+        label = "/".join(names[-k:])
+        if resolve_task_query(df_nodes, label, user)[0] == idx:
+            return label
+    return "/".join(names)
 
 
 def inbox_tickets(df_nodes: pd.DataFrame, user: str) -> pd.DataFrame:
@@ -1531,3 +1755,512 @@ def suggest_task(df_nodes: pd.DataFrame, title: str, memo: str = "",
         if best_key is None or key > best_key:
             best, best_key = idx, key
     return best
+
+
+# ============================================================
+# E1: 見積アシスト（似た仕事の実績）
+# ============================================================
+
+def similar_ticket_hours(df_nodes: pd.DataFrame, title: str, user: str,
+                         exclude_idx: str = "", threshold: float = 0.4,
+                         limit: int = 3) -> Optional[dict]:
+    """
+    自分（user）の完了チケットから、タイトルが似ているものの実績を返す。
+    類似度は文字 2-gram の Dice 係数。該当なしは None。
+    戻り値: {"items": [{"idx","title","est","actual","score"}], "avg_actual", "avg_est", "suggest"}
+      suggest = 実績平均を 15 分単位に切り上げた見積の提案値
+    """
+    src = _bigrams(title)
+    if not src or df_nodes.empty:
+        return None
+    done = df_nodes[(df_nodes["node_type"] == "ticket") & (df_nodes["status"] == "done")
+                    & (df_nodes["assigned_to"] == user)]
+    hits = []
+    for idx, r in done.iterrows():
+        if idx == exclude_idx:
+            continue
+        actual = float(r.get("actual_hours", 0) or 0)
+        if actual <= 0:
+            continue
+        other = _bigrams(str(r.get("title", "")))
+        if not other:
+            continue
+        score = 2 * len(src & other) / (len(src) + len(other))
+        if score >= threshold:
+            hits.append({"idx": idx, "title": str(r.get("title", "")), "score": score,
+                         "est": float(r.get("estimated_hours", 0) or 0), "actual": actual,
+                         "end": str(r.get("actual_end", "") or "")})
+    if not hits:
+        return None
+    # 似ている順、同点は新しい完了を優先
+    hits.sort(key=lambda h: (h["score"], h["end"]), reverse=True)
+    items = hits[:limit]
+    avg_actual = sum(h["actual"] for h in items) / len(items)
+    ests = [h["est"] for h in items if h["est"] > 0]
+    return {
+        "items": items,
+        "avg_actual": round(avg_actual, 2),
+        "avg_est": round(sum(ests) / len(ests), 2) if ests else None,
+        "suggest": math.ceil(avg_actual * 4 - 1e-9) / 4,
+    }
+
+
+# ============================================================
+# F1: 作業ログ（チケットのメモ欄へ時刻つきで追記）
+# ============================================================
+
+# 追記した 1 行の形式: [MM/DD HH:MM] 本文（成果のまとめ等で抽出に使う）
+WORK_LOG_RE = re.compile(r"^\[(\d{2})/(\d{2}) (\d{2}):(\d{2})\] (.+)$")
+
+
+def append_work_log(memo: str, text: str, now: Optional[datetime.datetime] = None) -> str:
+    """メモの末尾に「[MM/DD HH:MM] 本文」を 1 行追記した文字列を返す（本文の改行は空白に）"""
+    now = now or datetime.datetime.now()
+    body = " ".join(str(text).split())
+    if not body:
+        return memo or ""
+    line = f"[{now:%m/%d %H:%M}] {body}"
+    memo = (memo or "").rstrip("\n")
+    return f"{memo}\n{line}" if memo else line
+
+
+# ============================================================
+# E2: 納期リスク予報
+# ============================================================
+
+def estimate_factor(df_nodes: pd.DataFrame, user: str, min_count: int = 5,
+                    lo: float = 1.0, hi: float = 2.0) -> tuple:
+    """
+    見積係数（自分の完了チケットの 実績÷見積 の平均）と件数を返す。
+    実績 0（未記録）は除外。件数が min_count 未満なら 1.0。係数は lo〜hi に丸める。
+    """
+    ratios = [a["ratio"] for a in calc_estimate_accuracy(df_nodes, user) if a["actual"] > 0]
+    if len(ratios) < min_count:
+        return 1.0, len(ratios)
+    avg = sum(ratios) / len(ratios)
+    return round(min(hi, max(lo, avg)), 2), len(ratios)
+
+
+def _business_days_between(d_from: datetime.date, d_to: datetime.date, holidays) -> int:
+    """d_from の翌日〜d_to（両端含む側は d_to）の営業日数"""
+    hol = {h.strip().upper() for h in holidays}
+    n, d = 0, d_from
+    while d < d_to:
+        d += datetime.timedelta(days=1)
+        if _DAY_ABBR[d.weekday()] not in hol:
+            n += 1
+    return n
+
+
+def deadline_risks(df_nodes: pd.DataFrame, member: str, daily_h: float, holidays,
+                   today: Optional[datetime.date] = None, factor: float = 1.0) -> List[dict]:
+    """
+    今のペース（1 日 daily_h 時間・残り＝見積×factor−実績）で作業すると、
+    納期（今日以降に設定された実際の納期）に間に合わないチケットを返す。
+    過去の納期は既存の「納期超過」アラートで扱うため含めない。
+    定常（regularly）は繰り返しの仕事のため予報しない。
+    戻り値: [{"idx","title","task","deadline","finish","late_days"}]（納期順）
+    """
+    today = today or datetime.date.today()
+    if df_nodes.empty:
+        return []
+    sched = schedule_tickets(df_nodes, member, daily_h, holidays, today, factor)
+    risks = []
+    for idx, (days, _start, _dl) in sched.items():
+        if idx not in df_nodes.index or str(df_nodes.loc[idx, "status"]) == "regularly":
+            continue
+        real = _parse_date(str(df_nodes.loc[idx, "deadline"] or ""))
+        if not real or not days:
+            continue
+        dl = datetime.date.fromisoformat(real)
+        finish = max(days)
+        if dl < today or finish <= dl:
+            continue
+        risks.append({
+            "idx": idx,
+            "title": str(df_nodes.loc[idx, "title"]),
+            "task": _ancestor_title(df_nodes, idx, "task"),
+            "deadline": dl, "finish": finish,
+            "late_days": _business_days_between(dl, finish, holidays),
+        })
+    risks.sort(key=lambda r: (r["deadline"], r["finish"]))
+    return risks
+
+
+# ============================================================
+# I2: 小さなごほうび（続ける動機になる指標）
+# ============================================================
+
+def motivation_stats(df_nodes: pd.DataFrame, df_daily: pd.DataFrame, user: str,
+                     holidays, today: Optional[datetime.date] = None) -> dict:
+    """
+    Today に出す 3 つの指標を返す。
+      streak     : 日次スケジュールを記録した日の連続日数（記録の無い休日は飛ばす。今日が未記録なら昨日から）
+      week_done  : 今週（月曜始まり）に完了したチケット数
+      bullseye   : 今月完了したうち実績が見積の ±20% に収まった件数 / 見積のある完了件数
+    """
+    today = today or datetime.date.today()
+    hol = {h.strip().upper() for h in holidays}
+
+    # 記録のある日（スロットに 1 つでも入っている日）
+    recorded: set = set()
+    if not df_daily.empty and "Owner" in df_daily.columns:
+        mine = df_daily[df_daily["Owner"] == user]
+        cols = [c for c in DAILY_TIME_COLS if c in mine.columns]
+        for idx, row in mine.iterrows():
+            if any(str(v or "") not in ("", "nan", "None") for v in row[cols]):
+                recorded.add(str(idx)[:10])
+    streak, d = 0, today
+    if d.isoformat() not in recorded:
+        d -= datetime.timedelta(days=1)   # 今日はまだ記録前でも途切れない
+    for _ in range(3660):
+        if d.isoformat() not in recorded:
+            if _DAY_ABBR[d.weekday()] in hol:   # 記録の無い休日は飛ばす（休日出勤の記録は数える）
+                d -= datetime.timedelta(days=1)
+                continue
+            break
+        streak += 1
+        d -= datetime.timedelta(days=1)
+
+    week_start = (today - datetime.timedelta(days=today.weekday())).isoformat()
+    month_start = today.replace(day=1).isoformat()
+    week_done, hit, total = 0, 0, 0
+    if not df_nodes.empty:
+        done = df_nodes[(df_nodes["node_type"] == "ticket") & (df_nodes["status"] == "done")
+                        & (df_nodes["assigned_to"] == user)]
+        for _, r in done.iterrows():
+            end = _date_str(r.get("actual_end"))
+            if not end:
+                continue
+            if week_start <= end <= today.isoformat():
+                week_done += 1
+            if month_start <= end <= today.isoformat():
+                est = float(r.get("estimated_hours", 0) or 0)
+                act = float(r.get("actual_hours", 0) or 0)
+                if est > 0 and act > 0:
+                    total += 1
+                    hit += abs(act - est) <= est * 0.2
+    return {"streak": streak, "week_done": week_done, "bullseye": hit, "bullseye_total": total}
+
+
+# ============================================================
+# G4: 完了予測（バーンダウン）
+# ============================================================
+
+def _scope_tickets(df_nodes: pd.DataFrame, scope: Optional[set], users: Optional[set]) -> pd.DataFrame:
+    """scope（ノード IDX の集合。None=全体）配下で users 担当の有効チケット"""
+    t = df_nodes[(df_nodes["node_type"] == "ticket")
+                 & (~df_nodes["status"].isin(["cancel", "deleted"]))]
+    if users is not None:
+        t = t[t["assigned_to"].isin(users)]
+    if scope:
+        def inside(i) -> bool:
+            cur, seen = str(i), set()
+            while cur and cur not in seen:
+                if cur in scope:
+                    return True
+                if cur not in df_nodes.index:
+                    return False
+                seen.add(cur)
+                cur = str(df_nodes.loc[cur, "parent_id"] or "")
+            return False
+        t = t[t.index.map(inside)]
+    return t
+
+
+def _daily_hours_by_date(df_daily: pd.DataFrame, ticket_ids: set,
+                         since: str = "") -> dict:
+    """{日付: {ticket: 時間}}（日次スケジュールの 15 分スロットを集計）"""
+    out: dict = {}
+    if df_daily.empty or not ticket_ids:
+        return out
+    cols = [c for c in DAILY_TIME_COLS if c in df_daily.columns]
+    for idx, row in df_daily.iterrows():
+        d = str(idx)[:10]
+        if since and d < since:
+            continue
+        for v in row[cols]:
+            if v in ticket_ids:
+                day = out.setdefault(d, {})
+                day[v] = day.get(v, 0.0) + 0.25
+    return out
+
+
+def _add_business_days(start: datetime.date, days: int, holidays) -> datetime.date:
+    """start の翌日から数えて days 営業日目の日付（days<=0 なら start）"""
+    hol = {h.strip().upper() for h in holidays}
+    d, n = start, 0
+    while n < days:
+        d += datetime.timedelta(days=1)
+        if _DAY_ABBR[d.weekday()] not in hol:
+            n += 1
+    return d
+
+
+def completion_forecast(df_nodes: pd.DataFrame, df_daily: pd.DataFrame,
+                        scope: Optional[set], users: Optional[set], holidays,
+                        today: Optional[datetime.date] = None,
+                        pace_days: int = 14, history_days: int = 56) -> dict:
+    """
+    残り作業の推移と完了予想日を返す。
+      remaining_now : 未完了チケットの 見積−実績 の合計(h)
+      pace          : 直近 pace_days 日の実績(h) ÷ その期間の営業日数（h/営業日）
+      forecast      : 今日から ceil(残り÷ペース) 営業日後（ペース 0 なら None、残り 0 なら今日）
+      deadline      : scope ノード自身の納期（無ければ配下チケットの最も遅い納期）
+      history       : [(日付, その日の終わり時点の残り h)]（最大 history_days 日前から今日まで。
+                      残り 0 が続く先頭区間は省く）
+    """
+    today = today or datetime.date.today()
+    tickets = _scope_tickets(df_nodes, scope, users)
+    ids = set(tickets.index)
+    est = {i: float(tickets.loc[i, "estimated_hours"] or 0) for i in ids}
+    act_total = {i: float(tickets.loc[i, "actual_hours"] or 0) for i in ids}
+    # 完了日（完了日の記録が無い done は「最初から完了」扱いにして現在の残りと揃える）
+    done_on = {i: (_date_str(tickets.loc[i, "actual_end"]) or "0000-00-00")
+               if str(tickets.loc[i, "status"]) == "done" else "" for i in ids}
+    open_ids = [i for i in ids if str(tickets.loc[i, "status"]) != "done"]
+    remaining_now = round(sum(max(0.0, est[i] - act_total[i]) for i in open_ids), 2)
+
+    start = today - datetime.timedelta(days=history_days)
+    by_date = _daily_hours_by_date(df_daily, ids, start.isoformat())
+    hol = {h.strip().upper() for h in holidays}
+    pace_from = today - datetime.timedelta(days=pace_days - 1)
+    worked = sum(h for d, day in by_date.items() if d >= pace_from.isoformat()
+                 for h in day.values())
+    bdays = sum(1 for k in range(pace_days)
+                if _DAY_ABBR[(pace_from + datetime.timedelta(days=k)).weekday()] not in hol)
+    pace = round(worked / bdays, 2) if bdays else 0.0
+
+    if remaining_now <= 0:
+        forecast = today
+    elif pace > 0:
+        forecast = _add_business_days(today, math.ceil(remaining_now / pace - 1e-9), holidays)
+    else:
+        forecast = None
+
+    # 推移: 今日の実績合計から日ごとに遡って「その日の終わりの残り」を復元する
+    created = {i: _date_str(tickets.loc[i, "created_at"]) for i in ids}
+    act_until = dict(act_total)
+    history = []
+    d = today
+    while d >= start:
+        ds = d.isoformat()
+        rem = sum(max(0.0, est[i] - act_until[i]) for i in ids
+                  if (not created[i] or created[i] <= ds) and not (done_on[i] and done_on[i] <= ds))
+        history.append((d, round(rem, 2)))
+        for i, h in by_date.get(ds, {}).items():
+            act_until[i] -= h          # 前日の終わり時点へ戻す
+        d -= datetime.timedelta(days=1)
+    history.reverse()
+    # 先頭の「まだチケットが無い（残り 0）」区間は省き、直前の 1 点だけ残す
+    first = next((k for k, (_d, v) in enumerate(history) if v > 0), len(history))
+    history = history[max(0, first - 1):] or history[-1:]
+
+    deadline = None
+    if scope and len(scope) == 1:
+        (only,) = tuple(scope)
+        if only in df_nodes.index:
+            deadline = _parse_date(str(df_nodes.loc[only, "deadline"] or ""))
+    if not deadline:
+        dls = [_parse_date(str(v or "")) for v in tickets["deadline"]] if not tickets.empty else []
+        dls = [x for x in dls if x]
+        deadline = max(dls) if dls else None
+    return {
+        "remaining_now": remaining_now, "pace": pace, "forecast": forecast,
+        "deadline": datetime.date.fromisoformat(deadline) if deadline else None,
+        "history": history, "tickets": len(ids),
+    }
+
+
+def completion_text(fc: dict) -> str:
+    """G4: 完了予測の 1 行表示（例: 10/15 完了見込み（納期 10/20）・残り 12h・ペース 3h/日）"""
+    fmt = lambda d: f"{d.month}/{d.day}"
+    if fc["remaining_now"] <= 0:
+        head = "残り作業なし"
+    elif fc["forecast"] is None:
+        head = "完了日は予測できません（直近 2 週間の実績なし）"
+    else:
+        head = f"{fmt(fc['forecast'])} 完了見込み"
+        if fc["deadline"]:
+            late = fc["forecast"] > fc["deadline"]
+            head += f"（納期 {fmt(fc['deadline'])}{' に遅れ ⚠' if late else ''}）"
+    return f"{head}・残り {fc['remaining_now']:g}h・ペース {fc['pace']:g}h/日"
+
+
+# ============================================================
+# G2: 成果のまとめ（評価面談用）
+# ============================================================
+
+def review_period(name: str, today: Optional[datetime.date] = None) -> tuple:
+    """
+    成果のまとめの期間プリセット（年度は 4 月始まり）を (開始, 終了) の ISO 文字列で返す。
+      上期: 今日を含む／直近の 4/1〜9/30、下期: 今日を含む／直近の 10/1〜3/31、年度: 今年度
+    """
+    today = today or datetime.date.today()
+    fy = today.year if today.month >= 4 else today.year - 1
+    if name == "上期":
+        return datetime.date(fy, 4, 1).isoformat(), datetime.date(fy, 9, 30).isoformat()
+    if name == "下期":
+        y = fy if today.month >= 10 or today.month <= 3 else fy - 1
+        return datetime.date(y, 10, 1).isoformat(), datetime.date(y + 1, 3, 31).isoformat()
+    if name == "年度":
+        return datetime.date(fy, 4, 1).isoformat(), datetime.date(fy + 1, 3, 31).isoformat()
+    return "", ""
+
+
+def _work_logs_in_period(memo: str, d_from: str, d_to: str) -> List[str]:
+    """メモ中の作業ログ（[MM/DD HH:MM] 本文）のうち期間内のものを返す（年は期間から推定）"""
+    out = []
+    years = range(int(d_from[:4]), int(d_to[:4]) + 1)
+    for line in str(memo or "").splitlines():
+        m = WORK_LOG_RE.match(line.strip())
+        if not m:
+            continue
+        for y in years:
+            try:
+                d = datetime.date(y, int(m.group(1)), int(m.group(2))).isoformat()
+            except ValueError:
+                continue
+            if d_from <= d <= d_to:
+                out.append(line.strip())
+                break
+    return out
+
+
+def achievement_summary(df_nodes: pd.DataFrame, df_daily: pd.DataFrame, user: str,
+                        d_from: str, d_to: str) -> dict:
+    """
+    user の期間 d_from〜d_to の成果を集計する。
+    投入時間は日次スケジュール、完了は実績完了日（actual_end）で判定する。
+    """
+    hours_by_ticket: dict = {}
+    days_worked: set = set()
+    month_hours: dict = {}
+    if not df_daily.empty and "Owner" in df_daily.columns:
+        mine = df_daily[df_daily["Owner"] == user]
+        cols = [c for c in DAILY_TIME_COLS if c in mine.columns]
+        for idx, row in mine.iterrows():
+            d = str(idx)[:10]
+            if not (d_from <= d <= d_to):
+                continue
+            for v in row[cols]:
+                if v and v in df_nodes.index:
+                    hours_by_ticket[v] = hours_by_ticket.get(v, 0.0) + 0.25
+                    days_worked.add(d)
+                    month_hours[d[:7]] = month_hours.get(d[:7], 0.0) + 0.25
+    total = sum(hours_by_ticket.values())
+
+    def p1_title(i: str) -> str:
+        if str(df_nodes.loc[i, "parent_id"]) == INBOX_PARENT:
+            return "Inbox（Task 未設定）"
+        p1 = ancestor_of_type(df_nodes, i, "project1")
+        return str(df_nodes.loc[p1, "title"]) if p1 else "（プロジェクト外）"
+
+    by_p1: dict = {}
+    for i, h in hours_by_ticket.items():
+        by_p1[p1_title(i)] = by_p1.get(p1_title(i), 0.0) + h
+
+    top = sorted(hours_by_ticket.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top_items = [{
+        "idx": i, "path": " ＞ ".join(node_path_titles(df_nodes, i)), "hours": h,
+        "status": str(df_nodes.loc[i, "status"]),
+        "logs": _work_logs_in_period(str(df_nodes.loc[i, "memo"] or ""), d_from, d_to),
+    } for i, h in top]
+
+    done = df_nodes[(df_nodes["node_type"] == "ticket") & (df_nodes["status"] == "done")
+                    & (df_nodes["assigned_to"] == user)] if not df_nodes.empty else df_nodes
+    completed = []
+    for i, r in done.iterrows():
+        end = _date_str(r.get("actual_end"))
+        if end and d_from <= end <= d_to:
+            completed.append({"idx": i, "title": str(r.get("title", "")), "p1": p1_title(i),
+                              "end": end, "est": float(r.get("estimated_hours", 0) or 0),
+                              "actual": float(r.get("actual_hours", 0) or 0)})
+    completed.sort(key=lambda c: (c["p1"], c["end"]))
+
+    acc_by_month: dict = {}
+    for c in completed:
+        if c["est"] > 0 and c["actual"] > 0:
+            acc_by_month.setdefault(c["end"][:7], []).append(c["actual"] / c["est"])
+    ratios = [x for v in acc_by_month.values() for x in v]
+    return {
+        "user": user, "from": d_from, "to": d_to,
+        "total_hours": round(total, 2), "days_worked": len(days_worked),
+        "by_p1": sorted(((k, round(v, 2)) for k, v in by_p1.items()), key=lambda kv: kv[1], reverse=True),
+        "top": top_items, "completed": completed,
+        "accuracy": round(sum(ratios) / len(ratios), 2) if ratios else None,
+        "accuracy_by_month": {m: (len(v), round(sum(v) / len(v), 2))
+                              for m, v in sorted(acc_by_month.items())},
+        "month_hours": {m: round(h, 2) for m, h in sorted(month_hours.items())},
+    }
+
+
+def build_achievement_markdown(data: dict, display_name: str = "") -> str:
+    """成果のまとめを Markdown にする（評価面談の準備・AI への入力用）"""
+    name = display_name or data["user"]
+    lines = [f"# 成果のまとめ（{name}）", "",
+             f"- 期間: {data['from']} 〜 {data['to']}",
+             f"- 投入時間: {data['total_hours']:g}h（記録のある日 {data['days_worked']} 日）",
+             f"- 完了したチケット: {len(data['completed'])} 件"]
+    if data["accuracy"] is not None:
+        lines.append(f"- 見積精度（実績÷見積の平均）: {data['accuracy']:g}"
+                     "（1 に近いほど見積どおり、1 超は見積より時間がかかった）")
+    lines += ["", "## プロジェクト別の投入時間", ""]
+    if data["by_p1"]:
+        lines += ["| プロジェクト | 時間 | 割合 |", "|---|---:|---:|"]
+        for p, h in data["by_p1"]:
+            pct = round(h / data["total_hours"] * 100) if data["total_hours"] else 0
+            lines.append(f"| {_md_escape(p)} | {h:g}h | {pct}% |")
+    else:
+        lines.append("（期間内の記録なし）")
+    if data["month_hours"]:
+        lines += ["", "## 月別の投入時間", "", "| 月 | 時間 |", "|---|---:|"]
+        lines += [f"| {m} | {h:g}h |" for m, h in data["month_hours"].items()]
+    lines += ["", "## 時間をかけた仕事 上位 5 件", ""]
+    for n, t in enumerate(data["top"], 1):
+        lines.append(f"{n}. {_md_escape(t['path'])} — {t['hours']:g}h（{t['status']}）")
+        for log in t["logs"][-5:]:
+            lines.append(f"   - {_md_escape(log)}")
+    if not data["top"]:
+        lines.append("（期間内の記録なし）")
+    lines += ["", "## 完了したチケット", ""]
+    cur = None
+    for c in data["completed"]:
+        if c["p1"] != cur:
+            cur = c["p1"]
+            lines += ["", f"### {_md_escape(cur)}"]
+        est = f"見積 {c['est']:g}h → " if c["est"] else ""
+        lines.append(f"- {c['end']} {_md_escape(c['title'])}（{est}実績 {c['actual']:g}h）")
+    if not data["completed"]:
+        lines.append("（期間内に完了したチケットなし）")
+    if data["accuracy_by_month"]:
+        lines += ["", "## 見積精度の推移（月別）", "", "| 月 | 完了件数 | 実績÷見積 |", "|---|---:|---:|"]
+        for m, (n, r) in data["accuracy_by_month"].items():
+            lines.append(f"| {m} | {n} | {r:g} |")
+    return "\n".join(lines) + "\n"
+
+
+# ============================================================
+# F3: 「いま」の小窓
+# ============================================================
+
+def now_and_next(df_daily: pd.DataFrame, df_nodes: pd.DataFrame, user: str,
+                 now: Optional[datetime.datetime] = None) -> dict:
+    """
+    今日の日次スケジュールから「いま」の予定と「次」の予定を返す。
+    戻り値: {"now": 区間 or None, "left_min": 残り分, "next": 区間 or None}
+    区間は collect_daily_segments の要素（from / to / title / task）。
+    """
+    now = now or datetime.datetime.now()
+    hhmm = f"{now:%H:%M}"
+    cur, nxt = None, None
+    for seg in collect_daily_segments(df_daily, df_nodes, now.date().isoformat(), user):
+        if seg["from"] <= hhmm < seg["to"]:
+            cur = seg
+        elif seg["from"] > hhmm and nxt is None:
+            nxt = seg
+    left = None
+    if cur:
+        h, m = (24, 0) if cur["to"] == "24:00" else map(int, cur["to"].split(":"))
+        left = h * 60 + m - (now.hour * 60 + now.minute)
+    return {"now": cur, "left_min": left, "next": nxt}

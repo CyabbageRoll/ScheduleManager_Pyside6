@@ -32,7 +32,7 @@ from ui_widgets import (
     AutoCombo, ScrollableTable, Separator, PomodoroWidget,
     COLOR_OPTIONS, STYLE_BUTTON,
 )
-from theme import C, qss, LEVEL_BG, LEVEL_FG, STYLE_CHIP
+from theme import C, qss, LEVEL_BG, LEVEL_FG, STYLE_CHIP, STYLE_LABEL_INFO
 
 # 画面インデックス（QStackedWidget）
 IDX_MAIN    = 0
@@ -159,6 +159,111 @@ class _HourLineDelegate(QStyledItemDelegate):
             painter.restore()
 
 
+# ---------- F3: 「いま」の小窓 ----------
+
+class NowWindow(QWidget):
+    """
+    常に手前に出す小さな窓（F3）。今日の「いま」と「次」の予定を表示するだけで、
+    音やポップアップの通知はしない。ドラッグで移動、クリックでメイン画面を前面へ。
+    """
+    closed = Signal()   # × で閉じた（ツールバーのボタンを OFF にする）
+
+    def __init__(self, state, main_window):
+        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint
+                         | Qt.WindowType.FramelessWindowHint)
+        self.state = state
+        self._main = main_window
+        self._drag_from = None
+        self._dragged = False
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowTitle("いま")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("nowCard")
+        card.setStyleSheet(qss(
+            "QFrame#nowCard { background:@surface; border:1px solid @accent_border;"
+            " border-radius:10px; }"
+            "QLabel { border:none; background:transparent; }"))
+        outer.addWidget(card)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(10, 6, 6, 8)
+        v.setSpacing(2)
+        top = QHBoxLayout()
+        self.now_lbl = QLabel()
+        self.now_lbl.setStyleSheet(qss("QLabel { color:@text; font-weight:bold; }"))
+        top.addWidget(self.now_lbl, stretch=1)
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(20, 20)
+        close_btn.setToolTip("小窓を閉じる（ツールバーの 📌 いま で再表示）")
+        close_btn.setStyleSheet(qss(
+            "QPushButton { border:none; color:@text_muted; background:transparent; }"
+            "QPushButton:hover { color:@accent_dark; }"))
+        close_btn.clicked.connect(self._on_close)
+        top.addWidget(close_btn)
+        v.addLayout(top)
+        self.left_lbl = QLabel()
+        self.left_lbl.setStyleSheet(qss("QLabel { color:@accent_dark; font-size:9pt; }"))
+        v.addWidget(self.left_lbl)
+        self.next_lbl = QLabel()
+        self.next_lbl.setStyleSheet(qss("QLabel { color:@text_sub; font-size:9pt; }"))
+        v.addWidget(self.next_lbl)
+        self.setMinimumWidth(240)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(30_000)   # 表示の更新だけ（通知はしない）
+        self._timer.timeout.connect(self.update_view)
+
+    def showEvent(self, event) -> None:
+        self.update_view()
+        self._timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def update_view(self, now: Optional[datetime.datetime] = None) -> None:
+        """今日の予定から「いま」と「次」を表示する（未保存の変更も反映）"""
+        info = LG.now_and_next(self.state.df_daily, self.state.df_nodes, self.state.user, now)
+        cur, nxt = info["now"], info["next"]
+        if cur:
+            self.now_lbl.setText(f"いま: {cur['title']}")
+            self.now_lbl.setToolTip(f"{cur['task']} ＞ {cur['title']}" if cur["task"] else cur["title"])
+            self.left_lbl.setText(f"{cur['from']}〜{cur['to']}（残り {info['left_min']} 分）")
+        else:
+            self.now_lbl.setText("いま: 予定なし")
+            self.now_lbl.setToolTip("")
+            self.left_lbl.setText("日次スケジュールに予定を入れると表示されます")
+        self.next_lbl.setText(f"次: {nxt['from']} {nxt['title']}" if nxt else "次: 今日の予定はここまで")
+
+    def _on_close(self) -> None:
+        self.hide()
+        self.closed.emit()
+
+    # ── ドラッグで移動・クリックでメイン画面を前面へ ──
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_from = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._dragged = False
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_from is not None:
+            self.move(event.globalPosition().toPoint() - self._drag_from)
+            self._dragged = True
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._drag_from is not None and not self._dragged:
+            main = self._main
+            if main.isMinimized():
+                main.showNormal()
+            main.raise_()
+            main.activateWindow()
+        self._drag_from = None
+
+
 # ---------- 日次スケジュールウィジェット ----------
 
 class DailyScheduleWidget(QWidget):
@@ -169,6 +274,7 @@ class DailyScheduleWidget(QWidget):
     """
     # 選択スロットで「新しいチケットを作って割り当て」（行番号リスト）
     quick_add_requested = Signal(list)
+    worklog_requested = Signal(str)   # 右クリックした枠のチケットに作業ログを追加
 
     def __init__(self, state):
         super().__init__()
@@ -379,6 +485,14 @@ class DailyScheduleWidget(QWidget):
 
         df = self.state.df_nodes
         menu = QMenu(self)
+        # 右クリックした枠のチケットに作業ログを残す（F1）
+        clicked = self.schedule_table.item(self.schedule_table.rowAt(pos.y()), 1)
+        log_idx = clicked.data(Qt.ItemDataRole.UserRole) if clicked else None
+        if log_idx and log_idx in df.index and log_idx != "hour":
+            log_act = menu.addAction(f"📝 作業ログを追加: {df.loc[log_idx, 'title']}")
+            log_act.triggered.connect(
+                lambda checked=False, ti=log_idx: self.worklog_requested.emit(ti))
+            menu.addSeparator()
         # チケットが無いことに気づいたらその場で作って割り当てる（Ctrl+N と同じ）
         new_act = menu.addAction("＋ 新しいチケットを作成して割り当て…  (Ctrl+N)")
         new_act.triggered.connect(
@@ -874,6 +988,15 @@ class MainWindow(QMainWindow):
         self.inbox_btn.setToolTip("Task 未設定チケットを振り分けます（Ctrl+N で追加）")
         self.inbox_btn.clicked.connect(self._open_inbox_triage)
         tb.addWidget(self.inbox_btn)
+        # F3: 「いま」の小窓（表示のみ・通知なし）
+        self.now_window = NowWindow(self.state, self)
+        self.now_btn = QPushButton("📌 いま")
+        self.now_btn.setCheckable(True)
+        self.now_btn.setStyleSheet(STYLE_BUTTON)
+        self.now_btn.setToolTip("いまの予定と次の予定を、常に手前の小窓に表示します（通知はしません）")
+        self.now_btn.toggled.connect(self._on_toggle_now)
+        self.now_window.closed.connect(lambda: self.now_btn.setChecked(False))
+        tb.addWidget(self.now_btn)
 
         tb.addSeparator()
 
@@ -1048,6 +1171,10 @@ class MainWindow(QMainWindow):
         self.main_pane.table_pane.schedule_refresh.connect(self.schedule_panel.refresh)
         self.gantt_view.ticket_clicked.connect(self.schedule_panel.assign_ticket)
         self.schedule_panel.quick_add_requested.connect(self._on_quick_add)
+        # F1: 作業ログ（日次・ガントの右クリック → 詳細ペインの入力欄へ）
+        self.schedule_panel.worklog_requested.connect(self._on_worklog_requested)
+        self.gantt_view.worklog_requested.connect(self._on_worklog_requested)
+        self.detail_pane.nodes_changed.connect(self._on_detail_nodes_changed)
         self.gantt_view.edit_requested.connect(self._on_gantt_edit_requested)
         self.road_view.edit_requested.connect(self._on_gantt_edit_requested)
         self.road_view.edit_popup_requested.connect(self._on_roadmap_edit_popup)
@@ -1434,6 +1561,7 @@ class MainWindow(QMainWindow):
             self.detail_pane._on_save_report()
         if self._confirm_unsaved("終了する"):
             self.save_ui_state()
+            self.now_window.hide()   # 小窓は別ウィンドウなので一緒に閉じる
             event.accept()
         else:
             event.ignore()
@@ -1463,6 +1591,8 @@ class MainWindow(QMainWindow):
             s.setValue(f"splitter/{key}", sp.saveState())
         s.setValue("view/last_tab", self.stack.currentIndex())
         s.setValue("view/detail_open", self.detail_toggle_btn.isChecked())
+        s.setValue("now/visible", self.now_btn.isChecked())
+        s.setValue("now/pos", self.now_window.pos())
         tp = self.main_pane.tree_pane
         s.setValue("edit/filter_own", tp._filter_own)
         # 存在しなくなったノードは記録しない
@@ -1486,6 +1616,11 @@ class MainWindow(QMainWindow):
         geo = s.value("window/geometry")
         if geo:
             self.restoreGeometry(geo)
+        # F3: 小窓の位置と表示状態（画面外に出ないよう、見えている画面内のときだけ位置を戻す）
+        pos = s.value("now/pos")
+        if pos is not None and QApplication.screenAt(pos) is not None:
+            self.now_window.move(pos)
+        self.now_btn.setChecked(s.value("now/visible", False, type=bool))
         for key, sp in self._state_splitters().items():
             st = s.value(f"splitter/{key}")
             if st:
@@ -1616,6 +1751,30 @@ class MainWindow(QMainWindow):
         self._switch_view(IDX_MAIN)
         self.main_pane.tree_pane.start_import_queue(idxs)
 
+    def _on_toggle_now(self, checked: bool) -> None:
+        """F3: 「いま」の小窓の表示／非表示"""
+        self.now_window.setVisible(checked)
+
+    def _on_worklog_requested(self, idx: str) -> None:
+        """F1: 詳細ペインを開いてそのチケットの作業ログ入力欄にカーソルを置く"""
+        if self.stack.currentIndex() not in (IDX_MAIN, IDX_GANTT, IDX_ROADMAP):
+            self._switch_view(IDX_GANTT)
+        self.detail_toggle_btn.setChecked(True)
+        self.detail_pane.focus_work_log(idx)
+
+    def _on_detail_nodes_changed(self) -> None:
+        """詳細ペインでの変更（作業ログ）を Edit の表・ツリー・表示中ビューへ反映する。
+        再構築に伴う「選択」シグナルで詳細ペインが別ノードへ切り替わらないよう止めて更新する"""
+        for pane in (self.main_pane.tree_pane, self.main_pane.table_pane):
+            pane.blockSignals(True)
+            try:
+                pane.refresh()
+            finally:
+                pane.blockSignals(False)
+        cur = self.stack.currentWidget()
+        if hasattr(cur, "refresh") and cur is not self.main_pane:
+            cur.refresh()
+
     def _on_nodes_changed(self) -> None:
         """Edit のインメモリ変更をツリーと現在表示中ビューへ伝播する。
         singleShot(0) で遅延することで、テーブルの itemChanged 処理中に
@@ -1644,6 +1803,8 @@ class MainWindow(QMainWindow):
         self._update_inbox_btn()
         # Plan タブ等の変更後も保存ボタン色を最新状態に同期
         self._update_save_btn_style()
+        if self.now_window.isVisible():
+            self.now_window.update_view()
 
     def _update_request_tab_badge(self) -> None:
         """自分宛の未処理 Request 件数をタブボタンに表示する"""
@@ -3124,6 +3285,8 @@ class DetailPane(QWidget):
     """ノード詳細 + レポート編集（上: 詳細/本日レポート編集、下: 過去レポート閲覧）。
     Plan/Gantt/Edit のノード選択に連動し、選択ノードの日付付きレポートを管理する。"""
 
+    nodes_changed = Signal()   # 作業ログの追記などでノードを変更した
+
     # LLM 文章化プロンプトのテンプレート（ユーザーがカスタマイズ可能）
     _LLM_TEMPLATE_PATH = Path(__file__).parent / "documents" / "llm_report.md"
     _LLM_FALLBACK = (
@@ -3489,17 +3652,64 @@ class DetailPane(QWidget):
         if basic:
             self.form_box.addWidget(basic)
 
-        # 5) メモカード
+        # 4.5) 完了予測カード（G4: P1〜Task。配下チケットの残りと直近のペースから）
+        if ntype in ("project1", "project2", "project3", "project4", "task"):
+            fc = LG.completion_forecast(self.state.df_nodes, self.state.df_daily,
+                                        {idx}, None, self.state.config.holidays)
+            if fc["tickets"]:
+                fc_card, fv = self._make_card("完了予測")
+                fl = QLabel(LG.completion_text(fc))
+                fl.setWordWrap(True)
+                late = fc["forecast"] and fc["deadline"] and fc["forecast"] > fc["deadline"]
+                fl.setStyleSheet(qss("QLabel { color:@danger; font-size:9pt; }" if late
+                                     else "QLabel { color:@text; font-size:9pt; }"))
+                fv.addWidget(fl)
+                self.form_box.addWidget(fc_card)
+
+        # 5) メモカード（自分のチケットは作業ログの入力欄つき）
         memo = _s("memo")
-        if memo:
-            memo_card, mv = self._make_card("メモ")
-            mlbl = QLabel(memo)
-            mlbl.setWordWrap(True)
-            mlbl.setStyleSheet(qss("QLabel { color:@text; font-size:9pt; }"))
-            mv.addWidget(mlbl)
+        can_log = ntype == "ticket" and _s("assigned_to") == self.state.user
+        self.log_edit = None
+        if memo or can_log:
+            memo_card, mv = self._make_card("メモ・作業ログ" if can_log else "メモ")
+            if memo:
+                mlbl = QLabel(memo)
+                mlbl.setWordWrap(True)
+                mlbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                mlbl.setStyleSheet(qss("QLabel { color:@text; font-size:9pt; }"))
+                mv.addWidget(mlbl)
+            if can_log:
+                self.log_edit = QLineEdit()
+                self.log_edit.setPlaceholderText("📝 作業ログを追加（Enter で時刻つきで記録）")
+                self.log_edit.returnPressed.connect(self._on_add_work_log)
+                mv.addWidget(self.log_edit)
             self.form_box.addWidget(memo_card)
 
         self.form_box.addStretch()
+
+    def _on_add_work_log(self) -> None:
+        """F1: 入力した一言を「[MM/DD HH:MM] 本文」としてメモ欄の末尾へ追記する"""
+        idx = self._node_idx
+        df = self.state.df_nodes
+        if self.log_edit is None or not idx or idx not in df.index:
+            return
+        text = self.log_edit.text().strip()
+        if not text:
+            return
+        df.loc[idx, "memo"] = LG.append_work_log(str(df.loc[idx, "memo"] or ""), text)
+        df.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
+        self._rebuild_form(idx)
+        self.nodes_changed.emit()
+        if self.log_edit is not None:
+            self.log_edit.setFocus()   # 続けて書けるように
+
+    def focus_work_log(self, idx: str) -> None:
+        """指定チケットを表示して作業ログの入力欄にカーソルを置く"""
+        self.update_for_node(idx)
+        if self.log_edit is not None:
+            self.log_edit.setFocus()
 
     def _open_link(self, link: str) -> None:
         """リンク先を OS の既定アプリで開く。URL とローカルパスの両方に対応。"""
@@ -3788,10 +3998,29 @@ class _NodeEditDialog(QDialog):
         self.f_memo = QTextEdit()
         self.f_memo.setMaximumHeight(80)
 
+        # E1: 似た仕事（自分の完了チケット）の実績。チケットのみ表示
+        ntype = (str(state.df_nodes.loc[edit_idx, "node_type"]) if is_edit
+                 else (node_type or "ticket"))
+        self._assist: Optional[dict] = None
+        self.assist_lbl = QLabel()
+        self.assist_lbl.setWordWrap(True)
+        self.assist_lbl.setStyleSheet(STYLE_LABEL_INFO)
+        self.assist_use = QPushButton("使う")
+        self.assist_use.setStyleSheet(STYLE_BUTTON)
+        self.assist_use.clicked.connect(
+            lambda: self._assist and self.f_est.setValue(self._assist["suggest"]))
+        assist_row = QWidget()
+        assist_lay = QHBoxLayout(assist_row)
+        assist_lay.setContentsMargins(0, 0, 0, 0)
+        assist_lay.addWidget(self.assist_lbl, stretch=1)
+        assist_lay.addWidget(self.assist_use)
+        self._assist_row = assist_row
+
         form.addRow("タイトル *:",   self.f_title)
         form.addRow("順序:",         self.f_priority)
         form.addRow("ステータス:",   self.f_status)
         form.addRow("見積工数(h):",  self.f_est)
+        form.addRow("",              assist_row)
         form.addRow("開始可能日:",   start_row)
         form.addRow("納期:",         deadline_row)
         form.addRow("表示色:",       self.f_color)
@@ -3821,6 +4050,23 @@ class _NodeEditDialog(QDialog):
             self.f_memo.setPlainText(str(row.get("memo", "")))
         else:
             self.f_color.set_color(default_color)
+
+        self._assist_enabled = ntype == "ticket"
+        self.f_title.textChanged.connect(self._update_assist)
+        self._update_assist()
+
+    def _update_assist(self) -> None:
+        """E1: タイトルが似た自分の完了チケットの実績を表示する"""
+        title = self.f_title.text().strip()
+        self._assist = (LG.similar_ticket_hours(self.state.df_nodes, title, self.state.user,
+                                                exclude_idx=self._edit_idx or "")
+                        if self._assist_enabled and len(title) >= 2 else None)
+        a = self._assist
+        self._assist_row.setVisible(a is not None)
+        if a is not None:
+            self.assist_lbl.setText(assist_summary(a))
+            self.assist_lbl.setToolTip(assist_detail(a))
+            self.assist_use.setText(f"{a['suggest']:g}h を使う")
 
     def _on_accept(self) -> None:
         if not self.f_title.text().strip():
@@ -3875,6 +4121,20 @@ class _NodeEditDialog(QDialog):
 
 # ---------- クイック追加ダイアログ（Ctrl+N） ----------
 
+def assist_summary(a: dict) -> str:
+    """E1: 見積アシストの 1 行表示"""
+    txt = f"💡 似た仕事の実績（自分・{len(a['items'])}件）: 平均 {a['avg_actual']:g}h"
+    if a["avg_est"] is not None:
+        txt += f"（見積 平均 {a['avg_est']:g}h）"
+    return txt
+
+
+def assist_detail(a: dict) -> str:
+    """E1: 見積アシストの内訳（ツールチップ用）"""
+    return "\n".join(f"・{h['title']}  見積 {h['est']:g}h → 実績 {h['actual']:g}h"
+                     + (f"（{h['end']} 完了）" if h["end"] else "") for h in a["items"])
+
+
 class QuickAddDialog(QDialog):
     """
     1 行入力でチケットを作るダイアログ（B2）。
@@ -3884,7 +4144,7 @@ class QuickAddDialog(QDialog):
     """
 
     _HELP = ("工数: 2h 30m 1.5 1時間半 ／ 納期: 明日 金 来週水 9/30 月末 5日 ／ "
-             "範囲: 9/28〜10/2 ／ @Task（なしは Inbox） ／ #以降はメモ ／ 「」で囲むとタイトル")
+             "範囲: 9/28〜10/2 ／ @Task（なしは Inbox。同名は @案件/Task） ／ #以降はメモ ／ 「」で囲むとタイトル")
 
     def __init__(self, state, default_hours: Optional[float] = None,
                  recent_tasks=(), parent=None):
@@ -3919,6 +4179,14 @@ class QuickAddDialog(QDialog):
             "QLabel { background:@surface_alt; border:1px solid @border_light;"
             " border-radius:6px; padding:6px; }"))
         lay.addWidget(self.preview)
+
+        # E1: 似た仕事（自分の完了チケット）の実績から見積を提案
+        self.assist_btn = QPushButton()
+        self.assist_btn.setStyleSheet(STYLE_BUTTON)
+        self.assist_btn.setVisible(False)
+        self.assist_btn.clicked.connect(self._apply_assist)
+        lay.addWidget(self.assist_btn)
+        self._assist: Optional[dict] = None
 
         help_lbl = QLabel(self._HELP)
         help_lbl.setWordWrap(True)
@@ -3964,7 +4232,8 @@ class QuickAddDialog(QDialog):
                 show_cands = True
                 if self._task_idx is None:
                     errors.append("該当する Task がありません" if n == 0
-                                  else f"Task 候補 {n} 件 — ↑↓ で選んで Enter")
+                                  else f"Task 候補 {n} 件 — ↑↓ で選んで Enter"
+                                       "（同名は @親の名前/Task でも指定できます）")
         self._fill_candidates(q if show_cands else None)
 
         if not p["title"]:
@@ -4003,6 +4272,30 @@ class QuickAddDialog(QDialog):
             html += f"<br>{chip('✖ ' + self._esc(e), C.DANGER)}"
         self.preview.setText(html)
         self.btns.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not errors)
+        self._update_assist(p)
+
+    def _update_assist(self, p: dict) -> None:
+        """E1: タイトルが似た自分の完了チケットの実績を示し、見積に使えるようにする"""
+        self._assist = (LG.similar_ticket_hours(self.state.df_nodes, p["title"], self.state.user)
+                        if len(p["title"]) >= 2 else None)
+        a = self._assist
+        self.assist_btn.setVisible(a is not None)
+        if a is None:
+            return
+        self.assist_btn.setText(assist_summary(a) + (f" → 見積 {a['suggest']:g}h を使う"
+                                                     if p["hours"] is None else ""))
+        self.assist_btn.setToolTip(assist_detail(a))
+        self.assist_btn.setEnabled(p["hours"] is None)   # 工数を書いた後は上書きしない
+
+    def _apply_assist(self) -> None:
+        """提案の見積をメモ（#以降）の手前に工数として書き足す"""
+        if not self._assist:
+            return
+        text = self.edit.text()
+        memo_m = re.search(r"(?:^|\s)[#＃]", text)
+        pos = memo_m.start() if memo_m else len(text)
+        token = f" {self._assist['suggest']:g}h"
+        self.edit.setText(text[:pos].rstrip() + token + (" " + text[pos:].lstrip() if memo_m else ""))
 
     @staticmethod
     def _esc(s: str) -> str:
@@ -4034,7 +4327,8 @@ class QuickAddDialog(QDialog):
         if item is None:
             return
         idx = item.data(Qt.ItemDataRole.UserRole)
-        title = re.sub(r"\s+", "", str(self.state.df_nodes.loc[idx, "title"]))
+        # 同名の Task があれば「@案件B/設計」のように親の名前付きにして、入力欄でも区別できるようにする
+        title = LG.task_query_label(self.state.df_nodes, idx, self.state.user)
         text = self.edit.text()
         memo_m = re.search(r"(?:^|\s)[#＃]", text)
         body_end = memo_m.start() if memo_m else len(text)
@@ -4047,6 +4341,8 @@ class QuickAddDialog(QDialog):
         self._chosen[LG.norm_key(title)] = idx
         self.edit.setText(new_text)
         self.edit.setCursorPosition(m.start() + 1 + len(title))
+        # 入力が変わらない場合（同名 Task を名前どおり入力済み等）も選択を反映する
+        self._update()
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self.edit and event.type() == QEvent.Type.KeyPress:
