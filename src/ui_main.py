@@ -159,11 +159,11 @@ class _HourLineDelegate(QStyledItemDelegate):
             painter.restore()
 
 
-# ---------- F3: 「いま」の小窓 ----------
+# ---------- F3: Now（いまの予定）の小窓 ----------
 
 class NowWindow(QWidget):
     """
-    常に手前に出す小さな窓（F3）。今日の「いま」と「次」の予定を表示するだけで、
+    常に手前に出す小さな窓（F3）。今日の「Now（いま）」と「Next（次）」の予定を表示するだけで、
     音やポップアップの通知はしない。ドラッグで移動、クリックでメイン画面を前面へ。
     """
     closed = Signal()   # × で閉じた（ツールバーのボタンを OFF にする）
@@ -177,7 +177,7 @@ class NowWindow(QWidget):
         self._dragged = False
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setWindowTitle("いま")
+        self.setWindowTitle("Now")
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -197,7 +197,7 @@ class NowWindow(QWidget):
         top.addWidget(self.now_lbl, stretch=1)
         close_btn = QPushButton("×")
         close_btn.setFixedSize(20, 20)
-        close_btn.setToolTip("小窓を閉じる（ツールバーの 📌 いま で再表示）")
+        close_btn.setToolTip("小窓を閉じる（ツールバーの 📌 Now で再表示）")
         close_btn.setStyleSheet(qss(
             "QPushButton { border:none; color:@text_muted; background:transparent; }"
             "QPushButton:hover { color:@accent_dark; }"))
@@ -226,18 +226,18 @@ class NowWindow(QWidget):
         super().hideEvent(event)
 
     def update_view(self, now: Optional[datetime.datetime] = None) -> None:
-        """今日の予定から「いま」と「次」を表示する（未保存の変更も反映）"""
+        """今日の予定から Now（いま）と Next（次）を表示する（未保存の変更も反映）"""
         info = LG.now_and_next(self.state.df_daily, self.state.df_nodes, self.state.user, now)
         cur, nxt = info["now"], info["next"]
         if cur:
-            self.now_lbl.setText(f"いま: {cur['title']}")
+            self.now_lbl.setText(f"Now: {cur['title']}")
             self.now_lbl.setToolTip(f"{cur['task']} ＞ {cur['title']}" if cur["task"] else cur["title"])
             self.left_lbl.setText(f"{cur['from']}〜{cur['to']}（残り {info['left_min']} 分）")
         else:
-            self.now_lbl.setText("いま: 予定なし")
+            self.now_lbl.setText("Now: 予定なし")
             self.now_lbl.setToolTip("")
             self.left_lbl.setText("日次スケジュールに予定を入れると表示されます")
-        self.next_lbl.setText(f"次: {nxt['from']} {nxt['title']}" if nxt else "次: 今日の予定はここまで")
+        self.next_lbl.setText(f"Next: {nxt['from']} {nxt['title']}" if nxt else "Next: 今日の予定はここまで")
 
     def _on_close(self) -> None:
         self.hide()
@@ -988,9 +988,9 @@ class MainWindow(QMainWindow):
         self.inbox_btn.setToolTip("Task 未設定チケットを振り分けます（Ctrl+N で追加）")
         self.inbox_btn.clicked.connect(self._open_inbox_triage)
         tb.addWidget(self.inbox_btn)
-        # F3: 「いま」の小窓（表示のみ・通知なし）
+        # F3: Now の小窓（表示のみ・通知なし）
         self.now_window = NowWindow(self.state, self)
-        self.now_btn = QPushButton("📌 いま")
+        self.now_btn = QPushButton("📌 Now")
         self.now_btn.setCheckable(True)
         self.now_btn.setStyleSheet(STYLE_BUTTON)
         self.now_btn.setToolTip("いまの予定と次の予定を、常に手前の小窓に表示します（通知はしません）")
@@ -1752,7 +1752,7 @@ class MainWindow(QMainWindow):
         self.main_pane.tree_pane.start_import_queue(idxs)
 
     def _on_toggle_now(self, checked: bool) -> None:
-        """F3: 「いま」の小窓の表示／非表示"""
+        """F3: Now の小窓の表示／非表示"""
         self.now_window.setVisible(checked)
 
     def _on_worklog_requested(self, idx: str) -> None:

@@ -2241,7 +2241,7 @@ def build_achievement_markdown(data: dict, display_name: str = "") -> str:
 
 
 # ============================================================
-# F3: 「いま」の小窓
+# F3: Now の小窓
 # ============================================================
 
 def now_and_next(df_daily: pd.DataFrame, df_nodes: pd.DataFrame, user: str,

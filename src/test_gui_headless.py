@@ -2421,8 +2421,8 @@ def test_g2_achievement(win):
 
 
 def test_f3_now_window(win, state, version, tmpdir, ticket_idx):
-    """F3: 「いま」の小窓（いま・次・残り分、ON/OFF、状態の記憶）"""
-    print("\n[F3] いまの小窓テスト")
+    """F3: Now の小窓（いま・次・残り分、ON/OFF、状態の記憶）"""
+    print("\n[F3] Now の小窓テスト")
     import pandas as pd
     import logic as LG
     from PySide6.QtCore import QSettings, QPoint
@@ -2455,10 +2455,10 @@ def test_f3_now_window(win, state, version, tmpdir, ticket_idx):
         win.now_btn.setChecked(True)
         assert nw.isVisible()
         nw.update_view()
-        assert nw.now_lbl.text().startswith("いま: ") and nw.next_lbl.text().startswith("次: ")
+        assert nw.now_lbl.text().startswith("Now: ") and nw.next_lbl.text().startswith("Next: ")
         nw._on_close()
         assert not nw.isVisible() and not win.now_btn.isChecked(), "× で閉じてもボタンが ON のまま"
-        ok("ツールバーの 📌 いま で表示・× で閉じるとボタンも OFF")
+        ok("ツールバーの 📌 Now で表示・× で閉じるとボタンも OFF")
     except Exception as e:
         ng("小窓の表示切替", e)
     try:
