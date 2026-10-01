@@ -237,7 +237,7 @@ def collect_daily_segments(df_daily: pd.DataFrame, df_nodes: pd.DataFrame,
     for s, e, t_idx in raw:
         end_s = ("24:00" if e >= len(DAILY_TIME_COLS)
                  else col_to_hhmm(DAILY_TIME_COLS[e]))
-        title, task_title = t_idx, ""
+        title, task_title = "（削除済み）", ""   # ノードが無い（削除済み）枠
         if df_nodes is not None and not df_nodes.empty \
                 and t_idx in df_nodes.index:
             title = str(df_nodes.loc[t_idx, "title"])
@@ -738,6 +738,26 @@ def delete_block_reason(df_nodes: pd.DataFrame, idx: str, user: str) -> Optional
     if not children.empty:
         return "子ノードが存在するため削除できません"
     return None
+
+
+def subtree_ids(df_nodes: pd.DataFrame, root_idx: str) -> List[str]:
+    """
+    メンテナンスの完全削除用: root_idx 自身とその子孫の IDX を返す（ステータスは問わない）。
+    df_nodes は論理削除済みも含めて渡すこと（含めないと deleted の子孫が孤立して残る）。
+    """
+    if root_idx not in df_nodes.index:
+        return []
+    result: List[str] = []
+    seen: set = set()
+    stack = [root_idx]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:   # 親子が循環した壊れたデータでも止まるようにする
+            continue
+        seen.add(cur)
+        result.append(cur)
+        stack.extend(df_nodes.index[df_nodes["parent_id"] == cur])
+    return result
 
 
 def apply_status(df_nodes: pd.DataFrame, idx: str, new_status: str) -> List[str]:
@@ -2241,7 +2261,7 @@ def build_achievement_markdown(data: dict, display_name: str = "") -> str:
 
 
 # ============================================================
-# F3: 「いま」の小窓
+# F3: Now の小窓
 # ============================================================
 
 def now_and_next(df_daily: pd.DataFrame, df_nodes: pd.DataFrame, user: str,
