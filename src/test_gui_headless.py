@@ -2638,6 +2638,25 @@ def test_purge_maintenance(win):
     except Exception as e:
         ng("subtree_ids", e)
 
+    # Config のボタンからダイアログが開く（MainWindow 経由の配線）
+    orig_pd, opened = ui_sub.PurgeDialog, []
+    class _FakeDialog:
+        def __init__(self, *a):
+            opened.append(a)
+        def exec(self):
+            return 0
+    ui_sub.PurgeDialog = _FakeDialog
+    try:
+        from PySide6.QtWidgets import QPushButton
+        btn = [b for b in win.config_view.findChildren(QPushButton) if "完全削除" in b.text()][0]
+        btn.click()
+        assert opened, "ボタンを押してもダイアログが開かない"
+        ok("Config の「アイテムの完全削除…」ボタンでダイアログが開く")
+    except Exception as e:
+        ng("完全削除ボタン", e)
+    finally:
+        ui_sub.PurgeDialog = orig_pd
+
     orig_w, orig_q = QMessageBox.warning, QMessageBox.question
     answers = []
     QMessageBox.warning = staticmethod(lambda *a, **k: answers.pop(0))

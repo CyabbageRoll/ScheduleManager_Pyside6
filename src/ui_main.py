@@ -1713,6 +1713,7 @@ class MainWindow(QMainWindow):
 
     def _open_purge_dialog(self) -> None:
         """メンテナンス: アイテムの完全削除。DB を直接書き換えるため、未保存分を先に片付けて読み直す"""
+        import ui_sub  # _build_central と同じくローカル import（モジュール先頭では読み込んでいない）
         if not self._confirm_unsaved("完全削除を始める"):
             return
         dlg = ui_sub.PurgeDialog(self.state, self)
