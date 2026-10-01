@@ -2786,6 +2786,183 @@ def test_stale_refs(win, state, version, tmpdir):
         state.schedule_modified = False
 
 
+def test_import(win, state, tmpdir):
+    """他の DB からのインポート（年度替わりの引き継ぎ）"""
+    print("\n[Import] 他の DB からのインポートテスト")
+    import hashlib
+    import sqlite3
+    import ui_sub
+    import logic as LG
+    import db as DBM
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QMessageBox, QApplication
+    from db import Database, create_initial_node
+    me, other, gone_user = state.user, "tanaka@email.com", "olduser@email.com"
+    today = datetime.date.today()
+    past = (today - datetime.timedelta(days=30)).isoformat()
+    future = (today + datetime.timedelta(days=30)).isoformat()
+
+    # 今の DB: 取込済みの「共通」・同名の「同名PJ」（別 IDX）・論理削除した「消したPJ」
+    common = create_initial_node(me, "project1", "共通", "0", 1)
+    dead = create_initial_node(me, "project1", "消したPJ", "0", 2)
+    same_cur = create_initial_node(me, "project1", "同名PJ", "0", 3)
+    for n in (common, dead, same_cur):
+        state.db.upsert_node(n)
+    conn = state.db._connect()
+    conn.execute("UPDATE nodes SET status='deleted' WHERE IDX=?", [dead.name])
+    conn.commit(); conn.close()
+    state.load()
+    cur_p1_max = int(state.df_nodes[state.df_nodes["parent_id"] == "0"]["priority"].max())
+
+    # 取り込み元（前年度）の DB
+    src_dir = os.path.join(tmpdir, "lastyear")
+    src_db = Database(src_dir)
+    pj = create_initial_node(me, "project1", "引継PJ", "0", 1)
+    task = create_initial_node(me, "task", "引継Task", pj.name, 1)
+    t1 = create_initial_node(me, "ticket", "引継チケット", task.name, 1)
+    t1["actual_hours"] = 3.0
+    t1["deadline"], t1["start_available"] = past, future
+    t2 = create_initial_node(other, "ticket", "他人の完了", task.name, 2)
+    t2["status"], t2["actual_hours"], t2["actual_end"] = "done", 5.0, past
+    t3 = create_initial_node(me, "ticket", "削除済みチケット", task.name, 3)
+    t3["status"] = "deleted"
+    old_pj = create_initial_node(gone_user, "project1", "退職者PJ", "0", 2)
+    old_t = create_initial_node(gone_user, "task", "退職者Task", old_pj.name, 1)
+    orphan = create_initial_node(me, "ticket", "孤立チケット", "no_such_parent", 1)
+    inbox = create_initial_node(me, "ticket", "Inboxメモ", DBM.INBOX_PARENT, 1)
+    new_in_common = create_initial_node(me, "ticket", "共通の新チケット", common.name, 5)
+    dead_child = create_initial_node(me, "ticket", "削除PJの子", dead.name, 1)
+    same_src = create_initial_node(me, "project1", "同名PJ", "0", 3)
+    for n in (pj, task, t1, t2, t3, old_pj, old_t, orphan, inbox, common,
+              new_in_common, dead, dead_child, same_src):
+        src_db.upsert_node(n)
+    conn = src_db._connect()
+    conn.execute("UPDATE nodes SET status='todo' WHERE IDX=?", [dead.name])
+    conn.commit(); conn.close()
+    src_path = str(src_db.db_path)
+    digest = lambda: hashlib.sha256(open(src_path, "rb").read()).hexdigest()
+    before = digest()
+
+    # 候補・取り込み計画（ロジック）
+    try:
+        src = DBM.read_nodes_file(src_path)
+        cands = LG.import_candidates(src)
+        assert t3.name not in cands and orphan.name not in cands, "削除済み・孤立が候補に入った"
+        assert {pj.name, inbox.name, dead_child.name} <= cands
+        cur = state.db.read_nodes(include_deleted=True)
+        plan = LG.plan_import(src, cur, [t1.name, new_in_common.name, dead_child.name, same_src.name],
+                              {}, True, today.isoformat())
+        ids = [r.name for r in plan["rows"]]
+        assert set(ids) == {pj.name, task.name, t1.name, new_in_common.name, same_src.name}, ids
+        assert ids.index(pj.name) < ids.index(task.name) < ids.index(t1.name), "親が先に並ばない"
+        assert set(plan["existing"]) == {common.name, dead.name}
+        assert plan["blocked"] == [dead_child.name], plan["blocked"]
+        assert plan["same_name"] == [same_src.name], plan["same_name"]
+        ok("候補から削除済み・孤立を除き、祖先を自動で含め、取込済み・親が削除済み・同名を判定")
+    except Exception as e:
+        ng("取り込み計画", e)
+
+    # 読めないファイル・同じファイル・古い形式の DB
+    shown = []
+    orig_w, orig_q = QMessageBox.warning, QMessageBox.question
+    QMessageBox.warning = staticmethod(lambda *a, **k: shown.append(a[2] if len(a) > 2 else ""))
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    try:
+        dlg = ui_sub.ImportDialog(state, win)
+        txt = os.path.join(tmpdir, "not_db.sqlite")
+        open(txt, "w").write("hello")
+        assert not dlg.load_source(txt) and "DB ファイル" in shown[-1], shown
+        assert not dlg.load_source(str(state.db.db_path)) and "同じファイル" in shown[-1], shown
+        legacy = os.path.join(tmpdir, "legacy.sqlite")
+        c = sqlite3.connect(legacy)
+        c.execute("CREATE TABLE nodes (IDX TEXT PRIMARY KEY, node_type TEXT, parent_id TEXT,"
+                  " title TEXT, status TEXT, priority INTEGER, assigned_to TEXT)")
+        c.execute("INSERT INTO nodes VALUES ('legacy_1','project1','0','古い形式PJ','todo',1,?)", [me])
+        c.commit(); c.close()
+        legacy_before = hashlib.sha256(open(legacy, "rb").read()).hexdigest()
+        old_df = DBM.read_nodes_file(legacy)
+        assert old_df.loc["legacy_1", "link"] == "" and float(old_df.loc["legacy_1", "actual_hours"]) == 0.0
+        assert hashlib.sha256(open(legacy, "rb").read()).hexdigest() == legacy_before, \
+            "古い形式の DB に列追加などの変更が入った"
+        ok("読めないファイル・今の DB と同じファイルは拒否、古い形式の DB は足りない列を補って読む")
+    except Exception as e:
+        ng("取り込み元の検査", e)
+
+    # 画面フロー: Config のボタン → ダイアログで選択 → 取り込み → 読み直し
+    orig_dlg = ui_sub.ImportDialog
+    class _Auto(orig_dlg):
+        def exec(self):
+            assert self.load_source(src_path)
+            def check(title):
+                its = self.tree.findItems(title, Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchRecursive)
+                assert its, f"ツリーに無い: {title}"
+                its[0].setCheckState(0, Qt.CheckState.Checked)
+                return its[0]
+            assert not self.tree.findItems("削除済みチケット", Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchRecursive)
+            assert not self.tree.findItems("孤立チケット", Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchRecursive)
+            assert check("共通").text(4) == "取込済み"
+            assert check("同名PJ").text(4) == "同名あり"
+            assert check("削除PJの子").text(4) == "今の DB で親が削除済み"
+            check("引継PJ"); check("退職者Task"); check("Inboxメモ")
+            QApplication.processEvents()
+            assert set(self._owner_combos) == {me, other, gone_user}, set(self._owner_combos)
+            assert self._owner_combos[gone_user].currentData() == me, "メンバー外の担当者の既定が自分でない"
+            assert self._owner_combos[other].currentData() == other
+            self._on_import()
+            return self.result()
+    ui_sub.ImportDialog = _Auto
+    try:
+        state.nodes_modified = state.schedule_modified = False
+        win.config_view.import_requested.emit()
+        got = state.db.read_nodes(include_deleted=True)
+        want = {pj.name, task.name, t1.name, t2.name, old_pj.name, old_t.name, inbox.name,
+                new_in_common.name, same_src.name}
+        assert want <= set(got.index), want - set(got.index)
+        assert t3.name not in got.index and orphan.name not in got.index and dead_child.name not in got.index
+        assert (got.index == common.name).sum() == 1 and str(got.loc[dead.name, "status"]) == "deleted"
+        r1, r2 = got.loc[t1.name], got.loc[t2.name]
+        assert float(r1["actual_hours"]) == 0 and float(r2["actual_hours"]) == 0, "実績工数が 0 でない"
+        assert not LG._date_str(r1["deadline"]) and LG._date_str(r1["start_available"]) == future
+        assert str(r2["status"]) == "done" and str(r2["assigned_to"]) == other
+        assert str(got.loc[old_pj.name, "assigned_to"]) == me and str(got.loc[old_t.name, "assigned_to"]) == me
+        assert str(got.loc[inbox.name, "parent_id"]) == DBM.INBOX_PARENT
+        assert int(got.loc[pj.name, "priority"]) > cur_p1_max, "最上位の並び順が既存とぶつかる"
+        assert str(got.loc[new_in_common.name, "parent_id"]) == common.name
+        assert t1.name in state.df_nodes.index and not state.nodes_modified, "取り込み後に読み直していない"
+        assert digest() == before, "取り込み元の DB ファイルが変更された"
+        ok("ボタンから取り込み: 祖先・担当者の割り当て・実績 0・過去の納期を消す・並び順・読み直し、元 DB は不変")
+    except Exception as e:
+        ng("インポートの画面フロー", e)
+    finally:
+        ui_sub.ImportDialog = orig_dlg
+
+    try:
+        dlg = ui_sub.ImportDialog(state, win)
+        dlg.load_source(src_path)
+        for t in ("引継PJ", "退職者PJ"):
+            dlg.tree.findItems(t, Qt.MatchFlag.MatchExactly)[0].setCheckState(0, Qt.CheckState.Checked)
+        QApplication.processEvents()
+        assert not dlg.plan()["rows"] and not dlg.import_btn.isEnabled(), "同じものを 2 回取り込める"
+        assert dlg.tree.findItems("引継PJ", Qt.MatchFlag.MatchExactly)[0].text(4) == "取込済み"
+        fresh = create_initial_node(me, "ticket", "新規", task.name, 9)
+        dup = state.db.read_nodes().loc[t1.name].copy()
+        try:
+            state.db.insert_nodes([fresh, dup])
+            raise AssertionError("重複 IDX の追加で例外にならない")
+        except RuntimeError:
+            pass
+        assert fresh.name not in state.db.read_nodes(include_deleted=True).index, "途中まで書き込まれた"
+        for vi in win._view_order:
+            win._switch_view(vi)
+            win.refresh()
+        ok("2 回目は取込済みで取り込めず、同時取り込みの重複は全件取り消し、取り込み後も全タブ表示 OK")
+    except Exception as e:
+        ng("二重取り込み", e)
+    finally:
+        QMessageBox.warning, QMessageBox.question = orig_w, orig_q
+        state.nodes_modified = state.schedule_modified = False
+
+
 def main():
     print("=" * 55)
     print("  ヘッドレス GUI テスト (QT_QPA_PLATFORM=offscreen)")
@@ -2842,6 +3019,7 @@ def main():
             test_f3_now_window(win, state, version, tmpdir, ticket_idx)
             test_i3_dark_mode(win)
             test_stale_refs(win, state, version, tmpdir)
+            test_import(win, state, tmpdir)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

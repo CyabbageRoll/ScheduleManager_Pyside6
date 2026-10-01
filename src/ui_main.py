@@ -1157,6 +1157,8 @@ class MainWindow(QMainWindow):
 
         # ダッシュボードの「開く」 → 対応タブへ遷移
         self.dashboard_view.navigate_requested.connect(self._on_dashboard_navigate)
+        # Config: 他の DB からのインポート
+        self.config_view.import_requested.connect(self._open_import_dialog)
         # チケット選択をポモドーロタイマーの対象に反映
         self.gantt_view.ticket_clicked.connect(self._on_pomodoro_ticket)
         self.main_pane.tree_pane.node_selected.connect(self._on_pomodoro_ticket)
@@ -1708,6 +1710,17 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("読み込みました", 3000)
         except Exception as e:
             QMessageBox.critical(self, "読込エラー", str(e))
+
+    def _open_import_dialog(self) -> None:
+        """他の DB からのインポート。DB へ直接書き込むため、未保存分を先に片付けて取り込み後に読み直す"""
+        import ui_sub  # _build_central と同じくローカル import（モジュール先頭では読み込んでいない）
+        if not self._confirm_unsaved("インポートを始める"):
+            return
+        dlg = ui_sub.ImportDialog(self.state, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._on_load()
+        self.statusBar().showMessage(f"{dlg.imported_count} 件をインポートしました", 8000)
 
     def _on_gantt_edit_requested(self, idx: str) -> None:
         """ガントの右クリック Edit → Edit タブに切替してノードを選択"""

@@ -217,6 +217,47 @@ def _daily_schedule_create_sql() -> str:
     return f"CREATE TABLE IF NOT EXISTS daily_schedule ({', '.join(cols)});"
 
 
+def _normalize_nodes_df(df: pd.DataFrame) -> pd.DataFrame:
+    """nodes の数値列の型を正規化する（SQLite から bytes/object で返る場合に対応）"""
+    for col in ("priority",):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(99).astype(int)
+    for col in ("estimated_hours", "actual_hours"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    return df
+
+
+def read_nodes_file(path) -> pd.DataFrame:
+    """
+    別の DB ファイル（前年度など）の nodes を読み取り専用で全件読む（論理削除済みを含む）。
+    Database() で開くとテーブル作成・マイグレーションで元ファイルを書き換えるため使わない。
+    古い DB で足りない列は既定値で補う。読めない場合は日本語メッセージの RuntimeError。
+    """
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=10)
+    except sqlite3.Error as e:
+        raise RuntimeError(f"DB ファイルを開けませんでした: {e}") from e
+    try:
+        df = pd.read_sql_query("SELECT * FROM nodes", conn)
+    except Exception as e:
+        raise RuntimeError(f"スケジュール管理の DB ファイルではないか、読み込めませんでした: {e}") from e
+    finally:
+        conn.close()
+    if "IDX" not in df.columns:
+        raise RuntimeError("スケジュール管理の DB ファイルではありません（nodes に IDX 列がありません）")
+    defaults = {c: v for c, v in create_initial_node("", "ticket", "").items()}
+    defaults["color"] = "Cyan"
+    for c in NODE_COLUMNS[1:]:
+        if c not in df.columns:
+            df[c] = defaults.get(c)
+    df["IDX"] = df["IDX"].astype(str)
+    df = df.set_index("IDX")[NODE_COLUMNS[1:]]
+    df["parent_id"] = df["parent_id"].astype(str)
+    return _normalize_nodes_df(df)
+
+
 def _to_sql_value(v):
     """pandas / numpy の値をSQLiteに安全なPython標準型へ変換する"""
     # pandasの欠損
@@ -404,14 +445,7 @@ class Database:
         df = self._read_df(sql, index_col="IDX")
         if df.empty:
             return self._empty_nodes_df()
-        # 数値列の型を正規化（SQLite から bytes/object で返る場合に対応）
-        for col in ("priority",):
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(99).astype(int)
-        for col in ("estimated_hours", "actual_hours"):
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        return df
+        return _normalize_nodes_df(df)
 
     def upsert_node(self, ds: pd.Series) -> None:
         """1 件のノードを upsert する（DELETE + INSERT で最新データに上書き）"""
@@ -461,6 +495,34 @@ class Database:
         except Exception as e:
             self._loge(f"[DB] upsert_nodes_bulk エラー: {e}")
             raise  # 呼び出し元で保存失敗を検知できるよう再送出
+        finally:
+            conn.close()
+
+    def insert_nodes(self, series_list: list) -> None:
+        """ノードを 1 トランザクションで新規追加する（インポート用）。
+        既存行は上書きしない: 同じ IDX が既にあれば全件取り消して例外を送出する"""
+        if not series_list:
+            return
+        conn = self._connect()
+        try:
+            for ds in series_list:
+                row = {"IDX": _to_sql_value(ds.name),
+                       **{c: _to_sql_value(ds.get(c, None)) for c in NODE_COLUMNS[1:]}}
+                conn.execute(
+                    f"INSERT INTO nodes ({','.join(row)}) VALUES ({','.join(['?'] * len(row))})",
+                    list(row.values()),
+                )
+            conn.commit()
+            self._logi(f"[DB] insert_nodes: {len(series_list)} 件追加")
+        except sqlite3.IntegrityError as e:
+            conn.rollback()
+            self._loge(f"[DB] insert_nodes 重複: {e}")
+            raise RuntimeError("同じ IDX のアイテムが既にあるため取り込めませんでした"
+                               "（他の人が先に取り込んだ可能性があります）。読み込み直してやり直してください") from e
+        except Exception as e:
+            conn.rollback()
+            self._loge(f"[DB] insert_nodes エラー: {e}")
+            raise  # 呼び出し元で失敗を検知できるよう再送出
         finally:
             conn.close()
 

@@ -740,6 +740,115 @@ def delete_block_reason(df_nodes: pd.DataFrame, idx: str, user: str) -> Optional
     return None
 
 
+# ---------- 他の DB からのインポート（年度替わりの引き継ぎ）----------
+
+def import_candidates(src: pd.DataFrame) -> set:
+    """
+    取り込み元の nodes（論理削除済みを含む）のうち、取り込める IDX の集合を返す。
+    論理削除済みと、祖先をたどっても最上位（"0"）/ Inbox に届かない孤立ノードは除く
+    （元の DB でも画面に出ないノードのため）。
+    """
+    alive = src[src["status"] != "deleted"]
+    good: set = set()
+    bad: set = set()
+    for idx in alive.index:
+        chain: list = []
+        cur, ok = idx, False
+        while True:
+            if cur in good:
+                ok = True
+                break
+            if cur in bad or cur in chain or cur not in alive.index:
+                break   # 孤立・削除済みの親・循環
+            chain.append(cur)
+            pid = str(alive.loc[cur, "parent_id"])
+            if pid in ("0", INBOX_PARENT):
+                ok = True
+                break
+            cur = pid
+        (good if ok else bad).update(chain)
+    return good
+
+
+def plan_import(src: pd.DataFrame, cur: pd.DataFrame, selected, owner_map: dict,
+                clear_past_dates: bool, today: Optional[str] = None) -> dict:
+    """
+    選択したノードの取り込み内容を決める（DB には書かない）。
+      src: 取り込み元の nodes（論理削除済みを含む） / cur: 今の DB の nodes（論理削除済みを含む）
+      selected: 選択した IDX。祖先は自動で含める（今の DB に既にあればそれを親として使う）
+      owner_map: {元の担当者: 新しい担当者}（無い担当者はそのまま）
+    戻り値:
+      rows      : 追加する行（pd.Series、親が先）。実績工数は 0、updated_at は今日、
+                  clear_past_dates なら今日より前の納期・開始可能日を消す。
+                  親ごとの並び順は今ある兄弟の後ろへ付け直す
+      existing  : 今の DB に同じ IDX があるため取り込まない IDX（取込済み）
+      blocked   : 今の DB で親（祖先）が論理削除されているため取り込まない IDX
+      same_name : 取り込み先の同じ親の下に、同じ種別・同じ名前のアイテムが既にある IDX
+    """
+    today = today or datetime.date.today().isoformat()
+    cands = import_candidates(src)
+    need: set = set()
+    for idx in selected:
+        cur_idx = idx
+        while cur_idx in cands and cur_idx not in need:
+            need.add(cur_idx)
+            cur_idx = str(src.loc[cur_idx, "parent_id"])
+    existing = sorted(i for i in need if i in cur.index)
+
+    def _blocked(i: str) -> bool:
+        p = str(src.loc[i, "parent_id"])
+        while p in src.index and p not in cur.index:
+            p = str(src.loc[p, "parent_id"])
+        return p in cur.index and str(cur.loc[p, "status"]) == "deleted"
+
+    todo = [i for i in need if i not in cur.index]
+    blocked = sorted(i for i in todo if _blocked(i))
+    todo = [i for i in todo if i not in set(blocked)]
+    todo_set = set(todo)
+
+    def _depth(i: str) -> int:
+        d, p = 0, str(src.loc[i, "parent_id"])
+        while p in todo_set:
+            d, p = d + 1, str(src.loc[p, "parent_id"])
+        return d
+
+    # 取り込み先で既にある親（"0"・Inbox・既存ノード）の直下に入るものは、今ある兄弟の後ろへ並べる
+    alive_cur = cur[cur["status"] != "deleted"]
+    new_priority: dict = {}
+    same_name: list = []
+    tops: dict = {}
+    for i in todo:
+        p = str(src.loc[i, "parent_id"])
+        if p not in todo_set:
+            tops.setdefault(p, []).append(i)
+    for p, ids in tops.items():
+        sib = alive_cur[alive_cur["parent_id"] == p]
+        base = int(sib["priority"].max()) if not sib.empty else 0
+        for n, i in enumerate(sorted(ids, key=lambda x: int(src.loc[x, "priority"])), start=1):
+            new_priority[i] = base + n
+            dup = sib[(sib["title"] == src.loc[i, "title"])
+                      & (sib["node_type"] == src.loc[i, "node_type"])]
+            if not dup.empty:
+                same_name.append(i)
+
+    rows: list = []
+    for i in sorted(todo, key=_depth):
+        r = src.loc[i].copy()
+        owner = str(r["assigned_to"])
+        r["assigned_to"] = owner_map.get(owner, owner)
+        r["actual_hours"] = 0.0          # 実績は日次スケジュールと揃えるため 0 から
+        r["updated_at"] = today
+        if i in new_priority:
+            r["priority"] = new_priority[i]
+        if clear_past_dates:
+            for c in ("deadline", "start_available"):
+                d = _date_str(r.get(c))
+                if d and d < today:
+                    r[c] = None
+        rows.append(r)
+    return {"rows": rows, "existing": existing, "blocked": blocked, "same_name": same_name}
+
+
 def apply_status(df_nodes: pd.DataFrame, idx: str, new_status: str) -> List[str]:
     """
     ステータスを変更し、付随処理をまとめて行う（df_nodes をその場で更新）。
