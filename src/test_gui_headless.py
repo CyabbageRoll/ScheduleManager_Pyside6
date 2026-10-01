@@ -2600,6 +2600,100 @@ def test_theme():
         ng("apply_app_theme", e)
 
 
+def test_purge_maintenance(win):
+    """メンテナンス: 子孫ごとの完全削除（タイトル入力確認・他ユーザー確認・日次の存在しない参照）"""
+    print("\n[Purge] アイテムの完全削除テスト")
+    import logic as LG
+    import ui_sub
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QMessageBox
+    from db import DAILY_TIME_COLS, create_initial_node, daily_sch_idx
+    state, db = win.state, win.state.db
+    me, other = state.user, "tanaka@email.com"
+    today = datetime.date.today().isoformat()
+    pj = create_initial_node(me, "project1", "整理PJ", "0", 90)
+    task = create_initial_node(me, "task", "整理Task", pj.name, 1)
+    mine = create_initial_node(me, "ticket", "整理チケット", task.name, 1)
+    theirs = create_initial_node(other, "ticket", "他人のチケット", task.name, 2)
+    gone = create_initial_node(me, "ticket", "論理削除済み", task.name, 3)
+    gone["status"] = "deleted"
+    for n in (pj, task, mine, theirs, gone):
+        db.upsert_node(n)
+    state.load()
+    # 自分の日次に工数を記録（DB に保存）→ 通常の削除はできない状態にする
+    sch = daily_sch_idx(today, me)
+    if sch not in state.df_daily.index:
+        state.df_daily.loc[sch] = {c: "" for c in state.df_daily.columns}
+        state.df_daily.loc[sch, "Owner"] = me
+    for c in DAILY_TIME_COLS[96 - 4:]:   # 23:00〜24:00
+        state.df_daily.loc[sch, c] = mine.name
+    db.save_daily_schedule(state.df_daily, me)
+    state.load()
+    ids = [pj.name, task.name, mine.name, theirs.name, gone.name]
+    try:
+        all_nodes = db.read_nodes(include_deleted=True)
+        assert sorted(LG.subtree_ids(all_nodes, pj.name)) == sorted(ids)
+        assert LG.delete_block_reason(state.df_nodes, mine.name, me), "通常の削除制約が外れている"
+        ok("subtree_ids は論理削除済みを含む子孫すべて・通常削除の制約はそのまま")
+    except Exception as e:
+        ng("subtree_ids", e)
+
+    orig_w, orig_q = QMessageBox.warning, QMessageBox.question
+    answers = []
+    QMessageBox.warning = staticmethod(lambda *a, **k: answers.pop(0))
+    QMessageBox.question = staticmethod(lambda *a, **k: answers.pop(0))
+    Yes, No = QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No
+    try:
+        dlg = ui_sub.PurgeDialog(state, win)
+        found = dlg.tree.findItems("整理PJ", Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchRecursive)
+        dlg.tree.setCurrentItem(found[0])
+        assert len(dlg._targets) == 5 and "他ユーザー" in dlg.summary.text()
+        assert "1.00 h" in dlg.summary.text(), dlg.summary.text()
+        assert not dlg.purge_btn.isEnabled(), "未入力で押せる"
+        dlg.confirm_edit.setText("整理P")
+        assert not dlg.purge_btn.isEnabled(), "タイトル不一致で押せる"
+        dlg.confirm_edit.setText("整理PJ")
+        assert dlg.purge_btn.isEnabled(), "タイトル一致で押せない"
+        ok("タイトルを正確に入力したときだけ削除ボタンが押せる")
+        answers[:] = [No]                 # 他ユーザー分の確認で「いいえ」
+        dlg._on_purge()
+        answers[:] = [Yes, No]            # 最終確認で「いいえ」
+        dlg._on_purge()
+        assert len(db.read_nodes(include_deleted=True).index.intersection(ids)) == 5
+        ok("他ユーザー確認・最終確認で「いいえ」なら何も削除しない")
+        answers[:] = [Yes, Yes]
+        dlg._on_purge()
+        assert dlg.purged_count == 5 and not answers
+        assert db.read_nodes(include_deleted=True).index.intersection(ids).empty
+        assert db.read_daily_schedule().loc[sch, DAILY_TIME_COLS[-1]] == mine.name, "日次スロットが変更された"
+        ok("同意すると他ユーザー分・論理削除済みを含め DB から物理削除し、日次スロットは残す")
+    except Exception as e:
+        ng("PurgeDialog", e)
+    finally:
+        QMessageBox.warning, QMessageBox.question = orig_w, orig_q
+
+    # 存在しないチケットを参照する日次スロットがあっても各画面・集計がエラーにならない
+    try:
+        state.load()
+        state.current_date = today
+        win.refresh()
+        for vi in win._view_order:
+            win._switch_view(vi)
+        segs = LG.collect_daily_segments(state.df_daily, state.df_nodes, today, me)
+        assert any(s["ticket_idx"] == mine.name and s["title"] == "（削除済み）" for s in segs)
+        LG.achievement_summary(state.df_nodes, state.df_daily, me, "2000-01-01", today)
+        LG.now_and_next(state.df_daily, state.df_nodes, me, datetime.datetime.now())
+        win.now_window.update_view()
+        win.schedule_panel.refresh()
+        assert win.schedule_panel.schedule_table.item(92, 1).text() == "（削除済み）"
+        ok("削除済みチケットを参照する日次があっても全タブ・集計・Now が動き、枠は「（削除済み）」と表示")
+    except Exception as e:
+        ng("存在しないチケットの参照", e)
+    finally:
+        state.nodes_modified = False
+        state.schedule_modified = False
+
+
 def main():
     print("=" * 55)
     print("  ヘッドレス GUI テスト (QT_QPA_PLATFORM=offscreen)")
@@ -2655,6 +2749,7 @@ def main():
             test_g2_achievement(win)
             test_f3_now_window(win, state, version, tmpdir, ticket_idx)
             test_i3_dark_mode(win)
+            test_purge_maintenance(win)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

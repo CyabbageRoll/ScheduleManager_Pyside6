@@ -792,7 +792,8 @@ class DailyScheduleWidget(QWidget):
             if t_idx != current_ticket:
                 current_ticket = t_idx
                 group_row = 0
-            title = df_nodes.loc[t_idx, "title"] if t_idx in df_nodes.index else t_idx
+            # 完全削除などでノードが無い枠は IDX ではなく「削除済み」と表示する
+            title = df_nodes.loc[t_idx, "title"] if t_idx in df_nodes.index else "（削除済み）"
             pos = position_marks[i]
             if pos == "single":
                 display[i] = title
@@ -1156,6 +1157,8 @@ class MainWindow(QMainWindow):
 
         # ダッシュボードの「開く」 → 対応タブへ遷移
         self.dashboard_view.navigate_requested.connect(self._on_dashboard_navigate)
+        # Config のメンテナンス: アイテムの完全削除
+        self.config_view.purge_requested.connect(self._open_purge_dialog)
         # チケット選択をポモドーロタイマーの対象に反映
         self.gantt_view.ticket_clicked.connect(self._on_pomodoro_ticket)
         self.main_pane.tree_pane.node_selected.connect(self._on_pomodoro_ticket)
@@ -1707,6 +1710,16 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("読み込みました", 3000)
         except Exception as e:
             QMessageBox.critical(self, "読込エラー", str(e))
+
+    def _open_purge_dialog(self) -> None:
+        """メンテナンス: アイテムの完全削除。DB を直接書き換えるため、未保存分を先に片付けて読み直す"""
+        if not self._confirm_unsaved("完全削除を始める"):
+            return
+        dlg = ui_sub.PurgeDialog(self.state, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._on_load()
+        self.statusBar().showMessage(f"{dlg.purged_count} 件を完全に削除しました", 8000)
 
     def _on_gantt_edit_requested(self, idx: str) -> None:
         """ガントの右クリック Edit → Edit タブに切替してノードを選択"""

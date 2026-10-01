@@ -3474,8 +3474,180 @@ class _NoWheelComboBox(QComboBox):
 
 # ---------- Config 設定画面 ----------
 
+class PurgeDialog(QDialog):
+    """
+    メンテナンス: 担当を離れたアイテムを子孫ごと DB から完全に削除するダイアログ。
+    通常の削除制約（実績工数・子ノード・他ユーザー）を外す代わりに、
+    対象タイトルの入力・他ユーザー分の確認・最終確認の 3 段階で誤操作を防ぐ。
+    """
+
+    _TYPE_LABEL = {"project1": "P1", "project2": "P2", "project3": "P3",
+                   "project4": "P4", "task": "Task", "ticket": "Ticket"}
+
+    def __init__(self, state, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self.setWindowTitle("アイテムの完全削除（メンテナンス）")
+        self.resize(760, 640)
+        # 論理削除済みも含めて DB から最新を読む（deleted の子孫も一緒に消すため）
+        self._df = state.db.read_nodes(include_deleted=True)
+        self._targets: list = []
+        self.purged_count = 0
+
+        lay = QVBoxLayout(self)
+        warn = QLabel(
+            "⚠ この操作は元に戻せません。選んだアイテムを子孫ごと DB から完全に削除します。\n"
+            f"実行前に DB ファイル（{state.db.db_path}）をコピーしてバックアップを取ってください。\n"
+            "日次スケジュールの記録は残りますが、削除したチケットの工数は集計に含まれなくなります。")
+        warn.setWordWrap(True)
+        warn.setStyleSheet(qss("QLabel { color: @danger; background: @danger_bg;"
+                               " padding: 8px; border-radius: 4px; font-weight: bold; }"))
+        lay.addWidget(warn)
+
+        lay.addWidget(QLabel("削除するアイテム（その子孫もすべて削除されます）:"))
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["タイトル", "種別", "担当", "状態"])
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._build_tree()
+        self.tree.currentItemChanged.connect(lambda *_: self._on_select())
+        lay.addWidget(self.tree, stretch=1)
+
+        self.summary = QLabel("アイテムを選択してください")
+        self.summary.setWordWrap(True)
+        lay.addWidget(self.summary)
+
+        self.confirm_lbl = QLabel("")
+        self.confirm_lbl.setWordWrap(True)
+        lay.addWidget(self.confirm_lbl)
+        self.confirm_edit = QLineEdit()
+        self.confirm_edit.setEnabled(False)
+        self.confirm_edit.textChanged.connect(lambda *_: self._update_button())
+        lay.addWidget(self.confirm_edit)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        self.purge_btn = QPushButton("🗑 完全に削除")
+        self.purge_btn.setEnabled(False)
+        self.purge_btn.clicked.connect(self._on_purge)
+        cancel_btn = QPushButton("キャンセル")
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(self.purge_btn)
+        btns.addWidget(cancel_btn)
+        lay.addLayout(btns)
+
+    def _build_tree(self) -> None:
+        """全ノード（全ユーザー・論理削除済みを含む）をツリー表示する"""
+        df = self._df
+        items: dict = {}
+        order = df.sort_values("priority").index if not df.empty else []
+        for idx in order:
+            r = df.loc[idx]
+            it = QTreeWidgetItem([
+                str(r["title"]), self._TYPE_LABEL.get(str(r["node_type"]), str(r["node_type"])),
+                self.state.display_name(str(r["assigned_to"])), str(r["status"])])
+            it.setData(0, Qt.ItemDataRole.UserRole, idx)
+            if str(r["status"]) == "deleted":
+                for c in range(4):
+                    it.setForeground(c, QColor(C.TEXT_DIM))
+            items[idx] = it
+        for idx in order:
+            pid = str(df.loc[idx, "parent_id"])
+            if pid in items and pid != idx:
+                items[pid].addChild(items[idx])
+            else:
+                # 親が無い（最上位・Inbox・親が消えた孤立ノード）は最上位に表示
+                self.tree.addTopLevelItem(items[idx])
+
+    def _root_title(self) -> str:
+        return str(self._df.loc[self._targets[0], "title"]) if self._targets else ""
+
+    def _others(self) -> dict:
+        """対象のうち他ユーザー担当の件数 {表示名: 件数}"""
+        out: dict = {}
+        for i in self._targets:
+            owner = str(self._df.loc[i, "assigned_to"])
+            if owner != self.state.user:
+                name = self.state.display_name(owner)
+                out[name] = out.get(name, 0) + 1
+        return out
+
+    def _on_select(self) -> None:
+        it = self.tree.currentItem()
+        idx = it.data(0, Qt.ItemDataRole.UserRole) if it else None
+        self._targets = LG.subtree_ids(self._df, idx) if idx else []
+        self.confirm_edit.clear()
+        if not self._targets:
+            self.summary.setText("アイテムを選択してください")
+            self.confirm_lbl.setText("")
+            self.confirm_edit.setEnabled(False)
+            self._update_button()
+            return
+        sub = self._df.loc[self._targets]
+        counts = sub["node_type"].value_counts()
+        kinds = " / ".join(f"{lbl} {counts[k]}"
+                           for k, lbl in self._TYPE_LABEL.items() if k in counts)
+        tickets = list(sub.index[sub["node_type"] == "ticket"])
+        hours = sum(LG.calc_period_hours(self.state.df_daily, tickets, "", "").values())
+        lines = [f"削除対象: {len(self._targets)} 件（{kinds}）",
+                 f"日次スケジュールに記録された工数: {hours:.2f} h"]
+        others = self._others()
+        if others:
+            detail = "、".join(f"{n}: {c} 件" for n, c in others.items())
+            lines.append(f"⚠ 他ユーザー担当のアイテムを含みます（{detail}）")
+        self.summary.setText("\n".join(lines))
+        self.confirm_lbl.setText(
+            f"削除を確定するには、対象のタイトル「{self._root_title()}」を正確に入力してください")
+        self.confirm_edit.setEnabled(True)
+        self._update_button()
+
+    def _update_button(self) -> None:
+        """タイトルが完全一致したときだけ削除ボタンを押せるようにする"""
+        self.purge_btn.setEnabled(
+            bool(self._targets) and self.confirm_edit.text() == self._root_title())
+
+    def _on_purge(self) -> None:
+        if not self.purge_btn.isEnabled():
+            return
+        No, Yes = QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes
+        others = self._others()
+        if others:
+            detail = "\n".join(f"・{n}: {c} 件" for n, c in others.items())
+            ans = QMessageBox.warning(
+                self, "他ユーザーのアイテムを含みます",
+                f"他ユーザー担当のアイテムが含まれています。\n{detail}\n\n"
+                "他ユーザーのアイテムも完全に削除しますか？\n"
+                "（該当ユーザーには、削除後にアプリで 🔄 読込 をしてもらってください。"
+                "読込前に保存すると、そのユーザーのアイテムが復活することがあります）",
+                Yes | No, No)
+            if ans != Yes:
+                return
+        ans = QMessageBox.question(
+            self, "最終確認",
+            f"「{self._root_title()}」以下 {len(self._targets)} 件を完全に削除します。\n"
+            "元に戻せません。よろしいですか？", Yes | No, No)
+        if ans != Yes:
+            return
+        db = self.state.db
+        if not db.acquire_lock():
+            QMessageBox.warning(self, "削除できません",
+                                "dbが利用中です。しばらく時間をおいて実行してください")
+            return
+        try:
+            db.purge_nodes(self._targets)
+        except Exception as e:
+            QMessageBox.critical(self, "削除エラー", f"削除に失敗しました: {e}")
+            return
+        finally:
+            db.release_lock()
+        self.purged_count = len(self._targets)
+        self.accept()
+
+
 class ConfigView(QWidget):
     """config.ini の閲覧・編集ビュー"""
+
+    # メンテナンスの完全削除ボタン（未保存確認・再読込が必要なため MainWindow が処理する）
+    purge_requested = Signal()
 
     # 起動時に開くタブの選択肢（設定値, 表示名）
     _START_TAB_OPTIONS = [
@@ -3520,6 +3692,7 @@ class ConfigView(QWidget):
         self._build_section_pomodoro()
         self._build_section_inbox()
         self._build_section_commands()
+        self._build_section_maintenance()
 
         self._form_layout.addStretch()
 
@@ -3684,6 +3857,18 @@ class ConfigView(QWidget):
         for i, cmd in enumerate(cfg.commands, 1):
             self._text(f"cmd_{i}_label",  cmd.get("label", ""),  fl, f"command_{i:02d}_label:")
             self._text(f"cmd_{i}_script", cmd.get("script", ""), fl, f"command_{i:02d}_script:")
+
+    def _build_section_maintenance(self) -> None:
+        fl = self._group("メンテナンス")
+        note = QLabel("担当を離れたアイテムを、実績工数や子があっても子孫ごと DB から完全に削除します。"
+                      "元に戻せないため、実行前に DB ファイルのバックアップを取ってください。")
+        note.setWordWrap(True)
+        note.setStyleSheet(qss("QLabel { color: @text_dim; }"))
+        fl.addRow(note)
+        btn = QPushButton("🗑 アイテムの完全削除…")
+        btn.setStyleSheet(STYLE_BUTTON)
+        btn.clicked.connect(self.purge_requested.emit)
+        fl.addRow(btn)
 
     # ── リフレッシュ（フォームを現在のconfig値で再構築）──
 
