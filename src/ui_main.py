@@ -792,7 +792,7 @@ class DailyScheduleWidget(QWidget):
             if t_idx != current_ticket:
                 current_ticket = t_idx
                 group_row = 0
-            # 完全削除などでノードが無い枠は IDX ではなく「削除済み」と表示する
+            # ノードが無い（削除済み）枠は IDX ではなく「削除済み」と表示する
             title = df_nodes.loc[t_idx, "title"] if t_idx in df_nodes.index else "（削除済み）"
             pos = position_marks[i]
             if pos == "single":
@@ -1157,8 +1157,8 @@ class MainWindow(QMainWindow):
 
         # ダッシュボードの「開く」 → 対応タブへ遷移
         self.dashboard_view.navigate_requested.connect(self._on_dashboard_navigate)
-        # Config のメンテナンス: アイテムの完全削除
-        self.config_view.purge_requested.connect(self._open_purge_dialog)
+        # Config: 他の DB からのインポート
+        self.config_view.import_requested.connect(self._open_import_dialog)
         # チケット選択をポモドーロタイマーの対象に反映
         self.gantt_view.ticket_clicked.connect(self._on_pomodoro_ticket)
         self.main_pane.tree_pane.node_selected.connect(self._on_pomodoro_ticket)
@@ -1711,15 +1711,16 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "読込エラー", str(e))
 
-    def _open_purge_dialog(self) -> None:
-        """メンテナンス: アイテムの完全削除。DB を直接書き換えるため、未保存分を先に片付けて読み直す"""
-        if not self._confirm_unsaved("完全削除を始める"):
+    def _open_import_dialog(self) -> None:
+        """他の DB からのインポート。DB へ直接書き込むため、未保存分を先に片付けて取り込み後に読み直す"""
+        import ui_sub  # _build_central と同じくローカル import（モジュール先頭では読み込んでいない）
+        if not self._confirm_unsaved("インポートを始める"):
             return
-        dlg = ui_sub.PurgeDialog(self.state, self)
+        dlg = ui_sub.ImportDialog(self.state, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._on_load()
-        self.statusBar().showMessage(f"{dlg.purged_count} 件を完全に削除しました", 8000)
+        self.statusBar().showMessage(f"{dlg.imported_count} 件をインポートしました", 8000)
 
     def _on_gantt_edit_requested(self, idx: str) -> None:
         """ガントの右クリック Edit → Edit タブに切替してノードを選択"""
@@ -3598,6 +3599,8 @@ class DetailPane(QWidget):
             item = self.form_box.takeAt(0)
             if item.widget():
                 item.widget().setParent(None)
+        # 作業ログ欄は上で破棄したため参照も外す（ノードが無いと下で作り直されず、破棄済みを指したままになる）
+        self.log_edit = None
         if not idx or idx not in self.state.df_nodes.index:
             self.form_box.addStretch()
             return
@@ -3682,7 +3685,6 @@ class DetailPane(QWidget):
         # 5) メモカード（自分のチケットは作業ログの入力欄つき）
         memo = _s("memo")
         can_log = ntype == "ticket" and _s("assigned_to") == self.state.user
-        self.log_edit = None
         if memo or can_log:
             memo_card, mv = self._make_card("メモ・作業ログ" if can_log else "メモ")
             if memo:

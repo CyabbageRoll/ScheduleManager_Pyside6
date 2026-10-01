@@ -2948,7 +2948,8 @@ class AssignmentView(QWidget):
         対象ノードより下位の列は空欄でグレーアウト。"""
         df = self.state.df_nodes
         if t_idx not in df.index:
-            return [""] * 6, [True] * 6
+            # 依頼元のアイテムが削除済み
+            return [""] * 5 + ["（削除済み）"], [True] * 6
         target_type = str(df.loc[t_idx, "node_type"])
         target_pos = self._HIERARCHY.index(target_type) if target_type in self._HIERARCHY else 5
         # 祖先をたどってタイプ→タイトルの辞書を作成
@@ -3285,6 +3286,18 @@ class AssignmentView(QWidget):
         if not asgn_ids:
             self.info.set_info("⚠ 承諾できる依頼が選択されていません（自分宛のみ承諾可）")
             return
+        # 依頼元のアイテムが削除済みの依頼は承諾しても何も受け取れないため除外する
+        df_asgn = self.state.df_assignments
+        gone = [a for a in asgn_ids
+                if df_asgn.loc[a, "ticket_id"] not in self.state.df_nodes.index]
+        if gone:
+            QMessageBox.information(
+                self, "承諾できない依頼",
+                f"{len(gone)} 件は依頼元のアイテムが削除されているため承諾できません。\n"
+                "不要であれば「拒否」で片付けてください。")
+            asgn_ids = [a for a in asgn_ids if a not in gone]
+            if not asgn_ids:
+                return
         today = datetime.date.today().isoformat()
         nodes_to_upsert: list = []
         nodes_to_reassign: list = []
@@ -3474,11 +3487,11 @@ class _NoWheelComboBox(QComboBox):
 
 # ---------- Config 設定画面 ----------
 
-class PurgeDialog(QDialog):
+class ImportDialog(QDialog):
     """
-    メンテナンス: 担当を離れたアイテムを子孫ごと DB から完全に削除するダイアログ。
-    通常の削除制約（実績工数・子ノード・他ユーザー）を外す代わりに、
-    対象タイトルの入力・他ユーザー分の確認・最終確認の 3 段階で誤操作を防ぐ。
+    他の DB（前年度など）からアイテムを選んで今の DB へ取り込むダイアログ（年度替わりの引き継ぎ）。
+    元の IDX を引き継ぎ、今の DB に同じ IDX があるもの（取込済み）は取り込まない。
+    実績工数は日次スケジュールと揃えるため 0 にする。日次・依頼・メモは取り込まない。
     """
 
     _TYPE_LABEL = {"project1": "P1", "project2": "P2", "project3": "P3",
@@ -3487,167 +3500,250 @@ class PurgeDialog(QDialog):
     def __init__(self, state, parent=None):
         super().__init__(parent)
         self.state = state
-        self.setWindowTitle("アイテムの完全削除（メンテナンス）")
-        self.resize(760, 640)
-        # 論理削除済みも含めて DB から最新を読む（deleted の子孫も一緒に消すため）
-        self._df = state.db.read_nodes(include_deleted=True)
-        self._targets: list = []
-        self.purged_count = 0
+        self.setWindowTitle("他の DB からインポート")
+        self.resize(820, 720)
+        self._src = None            # 取り込み元の nodes（論理削除済みを含む）
+        self._cur = None            # 今の DB の nodes（論理削除済みを含む）
+        self._owner_combos: dict = {}
+        self._refresh_pending = False
+        self.imported_count = 0
 
         lay = QVBoxLayout(self)
-        warn = QLabel(
-            "⚠ この操作は元に戻せません。選んだアイテムを子孫ごと DB から完全に削除します。\n"
-            f"実行前に DB ファイル（{state.db.db_path}）をコピーしてバックアップを取ってください。\n"
-            "日次スケジュールの記録は残りますが、削除したチケットの工数は集計に含まれなくなります。")
-        warn.setWordWrap(True)
-        warn.setStyleSheet(qss("QLabel { color: @danger; background: @danger_bg;"
-                               " padding: 8px; border-radius: 4px; font-weight: bold; }"))
-        lay.addWidget(warn)
+        note = QLabel("前年度などの DB からアイテムを選んで今の DB に取り込みます。"
+                      "元の DB は読み取るだけで変更しません。\n"
+                      "実績工数は 0 から始まります（日次スケジュール・依頼・メモは取り込みません）。")
+        note.setWordWrap(True)
+        lay.addWidget(note)
 
-        lay.addWidget(QLabel("削除するアイテム（その子孫もすべて削除されます）:"))
+        row = QHBoxLayout()
+        pick = QPushButton("📂 DB ファイルを選択…")
+        pick.setStyleSheet(STYLE_BUTTON)
+        pick.clicked.connect(self._on_pick)
+        self.path_lbl = QLabel("（未選択）")
+        self.path_lbl.setWordWrap(True)
+        row.addWidget(pick)
+        row.addWidget(self.path_lbl, stretch=1)
+        lay.addLayout(row)
+
+        lay.addWidget(QLabel("取り込むアイテム（親を選ぶと子孫も選ばれます。子だけ選ぶと親も一緒に取り込みます）:"))
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["タイトル", "種別", "担当", "状態"])
+        self.tree.setHeaderLabels(["タイトル", "種別", "担当", "状態", "備考"])
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self._build_tree()
-        self.tree.currentItemChanged.connect(lambda *_: self._on_select())
+        self.tree.itemChanged.connect(lambda *_: self._schedule_refresh())
         lay.addWidget(self.tree, stretch=1)
+        self.hidden_lbl = QLabel("")
+        self.hidden_lbl.setStyleSheet(qss("QLabel { color: @text_dim; }"))
+        lay.addWidget(self.hidden_lbl)
 
-        self.summary = QLabel("アイテムを選択してください")
+        self.clear_dates_cb = QCheckBox("今日より前の納期・開始可能日を消す（未来の日付は残す）")
+        self.clear_dates_cb.setChecked(True)
+        self.clear_dates_cb.toggled.connect(lambda *_: self._schedule_refresh())
+        lay.addWidget(self.clear_dates_cb)
+
+        self.owner_box = QGroupBox("担当者の割り当て（元の担当者 → 取り込み後の担当者）")
+        self.owner_form = QFormLayout(self.owner_box)
+        lay.addWidget(self.owner_box)
+
+        self.summary = QLabel("DB ファイルを選択してください")
         self.summary.setWordWrap(True)
         lay.addWidget(self.summary)
 
-        self.confirm_lbl = QLabel("")
-        self.confirm_lbl.setWordWrap(True)
-        lay.addWidget(self.confirm_lbl)
-        self.confirm_edit = QLineEdit()
-        self.confirm_edit.setEnabled(False)
-        self.confirm_edit.textChanged.connect(lambda *_: self._update_button())
-        lay.addWidget(self.confirm_edit)
-
         btns = QHBoxLayout()
         btns.addStretch()
-        self.purge_btn = QPushButton("🗑 完全に削除")
-        self.purge_btn.setEnabled(False)
-        self.purge_btn.clicked.connect(self._on_purge)
+        self.import_btn = QPushButton("📥 取り込む")
+        self.import_btn.setEnabled(False)
+        self.import_btn.clicked.connect(self._on_import)
         cancel_btn = QPushButton("キャンセル")
         cancel_btn.clicked.connect(self.reject)
-        btns.addWidget(self.purge_btn)
+        btns.addWidget(self.import_btn)
         btns.addWidget(cancel_btn)
         lay.addLayout(btns)
 
+    # ── 取り込み元の読み込み ──
+
+    def _on_pick(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "取り込み元の DB ファイル", str(self.state.db.db_dir),
+            "SQLite DB (*.sqlite *.db);;すべてのファイル (*)")
+        if path:
+            self.load_source(path)
+
+    def load_source(self, path: str) -> bool:
+        """取り込み元を読み込んでツリーを作る。読めなければ理由を表示して False"""
+        if Path(path).resolve() == Path(self.state.db.db_path).resolve():
+            QMessageBox.warning(self, "インポート", "今使っている DB と同じファイルです。別の DB を選んでください")
+            return False
+        try:
+            src = DB.read_nodes_file(path)
+        except RuntimeError as e:
+            QMessageBox.warning(self, "インポート", str(e))
+            return False
+        self._src = src
+        self._cur = self.state.db.read_nodes(include_deleted=True)
+        self.path_lbl.setText(str(path))
+        self._build_tree()
+        self._refresh()
+        return True
+
     def _build_tree(self) -> None:
-        """全ノード（全ユーザー・論理削除済みを含む）をツリー表示する"""
-        df = self._df
+        """取り込める候補をツリー表示する（取込済み・同名ありは備考に表示）"""
+        src, cur = self._src, self._cur
+        cands = LG.import_candidates(src)
+        marks = LG.plan_import(src, cur, cands, {}, False)
+        existing, blocked = set(marks["existing"]), set(marks["blocked"])
+        same = set(marks["same_name"])
+        self.tree.blockSignals(True)
+        self.tree.clear()
         items: dict = {}
-        order = df.sort_values("priority").index if not df.empty else []
+        inbox = None
+        flags = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+                 | Qt.ItemFlag.ItemIsAutoTristate)
+        order = sorted(cands, key=lambda i: (int(src.loc[i, "priority"]), str(src.loc[i, "title"])))
         for idx in order:
-            r = df.loc[idx]
+            r = src.loc[idx]
+            remark = ("取込済み" if idx in existing else
+                      "今の DB で親が削除済み" if idx in blocked else
+                      "同名あり" if idx in same else "")
             it = QTreeWidgetItem([
                 str(r["title"]), self._TYPE_LABEL.get(str(r["node_type"]), str(r["node_type"])),
-                self.state.display_name(str(r["assigned_to"])), str(r["status"])])
+                self.state.display_name(str(r["assigned_to"])), str(r["status"]), remark])
             it.setData(0, Qt.ItemDataRole.UserRole, idx)
-            if str(r["status"]) == "deleted":
-                for c in range(4):
+            it.setFlags(flags)
+            it.setCheckState(0, Qt.CheckState.Unchecked)
+            if remark in ("取込済み", "今の DB で親が削除済み"):
+                for c in range(5):
                     it.setForeground(c, QColor(C.TEXT_DIM))
+            elif remark:
+                it.setForeground(4, QColor(C.DANGER))
             items[idx] = it
         for idx in order:
-            pid = str(df.loc[idx, "parent_id"])
-            if pid in items and pid != idx:
+            pid = str(src.loc[idx, "parent_id"])
+            if pid in items:
                 items[pid].addChild(items[idx])
+            elif pid == DB.INBOX_PARENT:
+                if inbox is None:
+                    inbox = QTreeWidgetItem(["📥 Inbox（Task 未設定）", "", "", "", ""])
+                    inbox.setFlags(flags)
+                    inbox.setCheckState(0, Qt.CheckState.Unchecked)
+                    self.tree.addTopLevelItem(inbox)
+                inbox.addChild(items[idx])
             else:
-                # 親が無い（最上位・Inbox・親が消えた孤立ノード）は最上位に表示
                 self.tree.addTopLevelItem(items[idx])
+        self.tree.blockSignals(False)
+        alive = int((src["status"] != "deleted").sum())
+        hidden = alive - len(cands)
+        self.hidden_lbl.setText(
+            f"※ 論理削除済みのアイテムと、親が見つからないアイテム {hidden} 件は表示していません"
+            if hidden else "※ 論理削除済みのアイテムは表示していません")
 
-    def _root_title(self) -> str:
-        return str(self._df.loc[self._targets[0], "title"]) if self._targets else ""
+    # ── 選択の集計 ──
 
-    def _others(self) -> dict:
-        """対象のうち他ユーザー担当の件数 {表示名: 件数}"""
-        out: dict = {}
-        for i in self._targets:
-            owner = str(self._df.loc[i, "assigned_to"])
-            if owner != self.state.user:
-                name = self.state.display_name(owner)
-                out[name] = out.get(name, 0) + 1
+    def _selected(self) -> list:
+        """チェック済み（全選択）のアイテムの IDX"""
+        out: list = []
+        stack = [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
+        while stack:
+            it = stack.pop()
+            idx = it.data(0, Qt.ItemDataRole.UserRole)
+            if idx and it.checkState(0) == Qt.CheckState.Checked:
+                out.append(idx)
+            stack.extend(it.child(i) for i in range(it.childCount()))
         return out
 
-    def _on_select(self) -> None:
-        it = self.tree.currentItem()
-        idx = it.data(0, Qt.ItemDataRole.UserRole) if it else None
-        self._targets = LG.subtree_ids(self._df, idx) if idx else []
-        self.confirm_edit.clear()
-        if not self._targets:
-            self.summary.setText("アイテムを選択してください")
-            self.confirm_lbl.setText("")
-            self.confirm_edit.setEnabled(False)
-            self._update_button()
+    def _owner_map(self) -> dict:
+        return {o: cb.currentData() for o, cb in self._owner_combos.items()}
+
+    def plan(self) -> dict:
+        return LG.plan_import(self._src, self._cur, self._selected(), self._owner_map(),
+                              self.clear_dates_cb.isChecked())
+
+    def _schedule_refresh(self) -> None:
+        """チェックの連動で itemChanged が連発するため、まとめて 1 回だけ集計する"""
+        if not self._refresh_pending:
+            self._refresh_pending = True
+            QTimer.singleShot(0, self._refresh)
+
+    def _refresh(self) -> None:
+        self._refresh_pending = False
+        if self._src is None:
             return
-        sub = self._df.loc[self._targets]
-        counts = sub["node_type"].value_counts()
-        kinds = " / ".join(f"{lbl} {counts[k]}"
-                           for k, lbl in self._TYPE_LABEL.items() if k in counts)
-        tickets = list(sub.index[sub["node_type"] == "ticket"])
-        hours = sum(LG.calc_period_hours(self.state.df_daily, tickets, "", "").values())
-        lines = [f"削除対象: {len(self._targets)} 件（{kinds}）",
-                 f"日次スケジュールに記録された工数: {hours:.2f} h"]
-        others = self._others()
-        if others:
-            detail = "、".join(f"{n}: {c} 件" for n, c in others.items())
-            lines.append(f"⚠ 他ユーザー担当のアイテムを含みます（{detail}）")
+        plan = LG.plan_import(self._src, self._cur, self._selected(), {}, False)
+        self._rebuild_owner_form(sorted({str(r["assigned_to"]) for r in plan["rows"]}))
+        rows = plan["rows"]
+        counts: dict = {}
+        for r in rows:
+            counts[str(r["node_type"])] = counts.get(str(r["node_type"]), 0) + 1
+        kinds = " / ".join(f"{lbl} {counts[k]}" for k, lbl in self._TYPE_LABEL.items() if k in counts)
+        lines = [f"取り込む: {len(rows)} 件" + (f"（{kinds}）" if kinds else "")]
+        if plan["existing"]:
+            lines.append(f"取込済みのため取り込まない: {len(plan['existing'])} 件"
+                         "（親として必要な場合は今の DB のものを使います）")
+        if plan["blocked"]:
+            lines.append(f"⚠ 今の DB で親が削除済みのため取り込まない: {len(plan['blocked'])} 件")
+        if plan["same_name"]:
+            names = "、".join(str(self._src.loc[i, "title"]) for i in plan["same_name"][:5])
+            lines.append(f"⚠ 同じ場所に同名のアイテムが既にあります: {len(plan['same_name'])} 件（{names}）")
         self.summary.setText("\n".join(lines))
-        self.confirm_lbl.setText(
-            f"削除を確定するには、対象のタイトル「{self._root_title()}」を正確に入力してください")
-        self.confirm_edit.setEnabled(True)
-        self._update_button()
+        self.import_btn.setEnabled(bool(rows))
 
-    def _update_button(self) -> None:
-        """タイトルが完全一致したときだけ削除ボタンを押せるようにする"""
-        self.purge_btn.setEnabled(
-            bool(self._targets) and self.confirm_edit.text() == self._root_title())
-
-    def _on_purge(self) -> None:
-        if not self.purge_btn.isEnabled():
+    def _rebuild_owner_form(self, owners: list) -> None:
+        """取り込む行の元の担当者ごとに、取り込み後の担当者を選ぶ欄を作る（選択済みの値は残す）"""
+        if owners == sorted(self._owner_combos):
             return
-        No, Yes = QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes
-        others = self._others()
-        if others:
-            detail = "\n".join(f"・{n}: {c} 件" for n, c in others.items())
-            ans = QMessageBox.warning(
-                self, "他ユーザーのアイテムを含みます",
-                f"他ユーザー担当のアイテムが含まれています。\n{detail}\n\n"
-                "他ユーザーのアイテムも完全に削除しますか？\n"
-                "（該当ユーザーには、削除後にアプリで 🔄 読込 をしてもらってください。"
-                "読込前に保存すると、そのユーザーのアイテムが復活することがあります）",
-                Yes | No, No)
-            if ans != Yes:
-                return
-        ans = QMessageBox.question(
-            self, "最終確認",
-            f"「{self._root_title()}」以下 {len(self._targets)} 件を完全に削除します。\n"
-            "元に戻せません。よろしいですか？", Yes | No, No)
-        if ans != Yes:
+        keep = self._owner_map()
+        while self.owner_form.rowCount():
+            self.owner_form.removeRow(0)
+        self._owner_combos = {}
+        for o in owners:
+            cb = QComboBox()
+            for m in self.state.members:
+                cb.addItem(self.state.display_name(m), m)
+            default = keep.get(o) or (o if o in self.state.members else self.state.user)
+            cb.setCurrentIndex(max(cb.findData(default), 0))
+            label = self.state.display_name(o) if o in self.state.members else f"{o}（今のメンバーにいません）"
+            self.owner_form.addRow(label + " →", cb)
+            self._owner_combos[o] = cb
+        if not owners:
+            self.owner_form.addRow(QLabel("（取り込むアイテムを選ぶと表示されます）"))
+
+    # ── 取り込み ──
+
+    def _on_import(self) -> None:
+        # 開いている間に他の人が取り込んだ場合に備えて、今の DB を読み直してから決める
+        self._cur = self.state.db.read_nodes(include_deleted=True)
+        plan = self.plan()
+        rows = plan["rows"]
+        if not rows:
+            QMessageBox.information(self, "インポート", "取り込むアイテムがありません（すべて取込済みです）")
+            return
+        msg = f"{len(rows)} 件を今の DB に取り込みます。よろしいですか？"
+        if plan["same_name"]:
+            msg += f"\n\n⚠ 同じ場所に同名のアイテムが既にあるものが {len(plan['same_name'])} 件あります（2 つ並びます）。"
+        Yes, No = QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No
+        if QMessageBox.question(self, "インポートの確認", msg, Yes | No, No) != Yes:
             return
         db = self.state.db
         if not db.acquire_lock():
-            QMessageBox.warning(self, "削除できません",
-                                "dbが利用中です。しばらく時間をおいて実行してください")
+            QMessageBox.warning(self, "インポート", "dbが利用中です。しばらく時間をおいて実行してください")
             return
         try:
-            db.purge_nodes(self._targets)
+            db.insert_nodes(rows)
         except Exception as e:
-            QMessageBox.critical(self, "削除エラー", f"削除に失敗しました: {e}")
+            QMessageBox.critical(self, "インポートエラー", str(e))
             return
         finally:
             db.release_lock()
-        self.purged_count = len(self._targets)
+        if self.state.logger:
+            self.state.logger.info(f"[インポート] {len(rows)} 件 from={self.path_lbl.text()}")
+        self.imported_count = len(rows)
         self.accept()
 
 
 class ConfigView(QWidget):
     """config.ini の閲覧・編集ビュー"""
 
-    # メンテナンスの完全削除ボタン（未保存確認・再読込が必要なため MainWindow が処理する）
-    purge_requested = Signal()
+    # 他の DB からのインポート（未保存確認・再読込が必要なため MainWindow が処理する）
+    import_requested = Signal()
 
     # 起動時に開くタブの選択肢（設定値, 表示名）
     _START_TAB_OPTIONS = [
@@ -3692,7 +3788,7 @@ class ConfigView(QWidget):
         self._build_section_pomodoro()
         self._build_section_inbox()
         self._build_section_commands()
-        self._build_section_maintenance()
+        self._build_section_import()
 
         self._form_layout.addStretch()
 
@@ -3858,16 +3954,15 @@ class ConfigView(QWidget):
             self._text(f"cmd_{i}_label",  cmd.get("label", ""),  fl, f"command_{i:02d}_label:")
             self._text(f"cmd_{i}_script", cmd.get("script", ""), fl, f"command_{i:02d}_script:")
 
-    def _build_section_maintenance(self) -> None:
-        fl = self._group("メンテナンス")
-        note = QLabel("担当を離れたアイテムを、実績工数や子があっても子孫ごと DB から完全に削除します。"
-                      "元に戻せないため、実行前に DB ファイルのバックアップを取ってください。")
+    def _build_section_import(self) -> None:
+        fl = self._group("データの引き継ぎ")
+        note = QLabel("前年度などの DB からアイテムを選んで今の DB に取り込みます（実績工数は 0 から）。")
         note.setWordWrap(True)
         note.setStyleSheet(qss("QLabel { color: @text_dim; }"))
         fl.addRow(note)
-        btn = QPushButton("🗑 アイテムの完全削除…")
+        btn = QPushButton("📥 他の DB からインポート…")
         btn.setStyleSheet(STYLE_BUTTON)
-        btn.clicked.connect(self.purge_requested.emit)
+        btn.clicked.connect(self.import_requested.emit)
         fl.addRow(btn)
 
     # ── リフレッシュ（フォームを現在のconfig値で再構築）──

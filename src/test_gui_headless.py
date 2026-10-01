@@ -2600,98 +2600,367 @@ def test_theme():
         ng("apply_app_theme", e)
 
 
-def test_purge_maintenance(win):
-    """メンテナンス: 子孫ごとの完全削除（タイトル入力確認・他ユーザー確認・日次の存在しない参照）"""
-    print("\n[Purge] アイテムの完全削除テスト")
-    import logic as LG
+def test_stale_refs(win, state, version, tmpdir):
+    """ノードが読み込まれなくなった（削除済み）後に、画面が保持する古い IDX・日次/依頼の参照切れで壊れないか
+    （キャンセル済みは実績 0 扱いのため、日次の記録が残ったまま論理削除できる）"""
+    print("\n[Stale] 存在しないノードへの参照テスト")
     import ui_sub
-    from PySide6.QtCore import Qt
-    from PySide6.QtWidgets import QMessageBox
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QMessageBox, QMenu, QApplication
     from db import DAILY_TIME_COLS, create_initial_node, daily_sch_idx
-    state, db = win.state, win.state.db
-    me, other = state.user, "tanaka@email.com"
-    today = datetime.date.today().isoformat()
-    pj = create_initial_node(me, "project1", "整理PJ", "0", 90)
-    task = create_initial_node(me, "task", "整理Task", pj.name, 1)
-    mine = create_initial_node(me, "ticket", "整理チケット", task.name, 1)
-    theirs = create_initial_node(other, "ticket", "他人のチケット", task.name, 2)
-    gone = create_initial_node(me, "ticket", "論理削除済み", task.name, 3)
-    gone["status"] = "deleted"
-    for n in (pj, task, mine, theirs, gone):
+    db, me, other = state.db, state.user, "tanaka@email.com"
+    state.config.report_output_dir = tmpdir   # 出力系がファイル保存ダイアログで止まらないように
+    today = datetime.date.today()
+    days = [(today - datetime.timedelta(days=k)).isoformat() for k in (0, 1, 40)]
+    pj = create_initial_node(me, "project1", "監査PJ", "0", 91)
+    task = create_initial_node(me, "task", "監査Task", pj.name, 1)
+    t_me = create_initial_node(me, "ticket", "監査チケット", task.name, 1)
+    t_ot = create_initial_node(other, "ticket", "監査他人", task.name, 2)
+    keep = create_initial_node(me, "project1", "残すPJ", "0", 92)
+    keep_t = create_initial_node(me, "task", "残すTask", keep.name, 1)
+    keep_k = create_initial_node(me, "ticket", "残すチケット", keep_t.name, 1)
+    for n in (pj, task, t_me, t_ot, keep, keep_t, keep_k):
         db.upsert_node(n)
     state.load()
-    # 自分の日次に工数を記録（DB に保存）→ 通常の削除はできない状態にする
-    sch = daily_sch_idx(today, me)
-    if sch not in state.df_daily.index:
-        state.df_daily.loc[sch] = {c: "" for c in state.df_daily.columns}
-        state.df_daily.loc[sch, "Owner"] = me
-    for c in DAILY_TIME_COLS[96 - 4:]:   # 23:00〜24:00
-        state.df_daily.loc[sch, c] = mine.name
+    # 自分と他ユーザーの日次（今日・昨日・40 日前）に削除対象を記録
+    for d in days:
+        for owner, tick in ((me, t_me.name), (other, t_ot.name)):
+            sch = daily_sch_idx(d, owner)
+            if sch not in state.df_daily.index:
+                state.df_daily.loc[sch] = {c: "" for c in state.df_daily.columns}
+                state.df_daily.loc[sch, "Owner"] = owner
+            for c in DAILY_TIME_COLS[36:40]:      # 09:00〜10:00
+                state.df_daily.loc[sch, c] = tick
+            state.df_daily.loc[sch, DAILY_TIME_COLS[40]] = keep_k.name
+            state.df_daily.loc[sch, "Last_Update"] = today.isoformat()   # 直近更新の行だけ保存されるため
     db.save_daily_schedule(state.df_daily, me)
+    db.save_daily_schedule(state.df_daily, other)
+    # 削除対象を指す依頼（自分宛・他人宛・Task）
+    db.create_assignment(t_ot.name, other, me, "見て")
+    db.create_assignment(t_me.name, me, other, "頼む")
+    db.create_assignment(task.name, other, me, "Task ごと")
     state.load()
-    ids = [pj.name, task.name, mine.name, theirs.name, gone.name]
-    try:
-        all_nodes = db.read_nodes(include_deleted=True)
-        assert sorted(LG.subtree_ids(all_nodes, pj.name)) == sorted(ids)
-        assert LG.delete_block_reason(state.df_nodes, mine.name, me), "通常の削除制約が外れている"
-        ok("subtree_ids は論理削除済みを含む子孫すべて・通常削除の制約はそのまま")
-    except Exception as e:
-        ng("subtree_ids", e)
 
-    orig_w, orig_q = QMessageBox.warning, QMessageBox.question
-    answers = []
-    QMessageBox.warning = staticmethod(lambda *a, **k: answers.pop(0))
-    QMessageBox.question = staticmethod(lambda *a, **k: answers.pop(0))
-    Yes, No = QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No
-    try:
-        dlg = ui_sub.PurgeDialog(state, win)
-        found = dlg.tree.findItems("整理PJ", Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchRecursive)
-        dlg.tree.setCurrentItem(found[0])
-        assert len(dlg._targets) == 5 and "他ユーザー" in dlg.summary.text()
-        assert "1.00 h" in dlg.summary.text(), dlg.summary.text()
-        assert not dlg.purge_btn.isEnabled(), "未入力で押せる"
-        dlg.confirm_edit.setText("整理P")
-        assert not dlg.purge_btn.isEnabled(), "タイトル不一致で押せる"
-        dlg.confirm_edit.setText("整理PJ")
-        assert dlg.purge_btn.isEnabled(), "タイトル一致で押せない"
-        ok("タイトルを正確に入力したときだけ削除ボタンが押せる")
-        answers[:] = [No]                 # 他ユーザー分の確認で「いいえ」
-        dlg._on_purge()
-        answers[:] = [Yes, No]            # 最終確認で「いいえ」
-        dlg._on_purge()
-        assert len(db.read_nodes(include_deleted=True).index.intersection(ids)) == 5
-        ok("他ユーザー確認・最終確認で「いいえ」なら何も削除しない")
-        answers[:] = [Yes, Yes]
-        dlg._on_purge()
-        assert dlg.purged_count == 5 and not answers
-        assert db.read_nodes(include_deleted=True).index.intersection(ids).empty
-        assert db.read_daily_schedule().loc[sch, DAILY_TIME_COLS[-1]] == mine.name, "日次スロットが変更された"
-        ok("同意すると他ユーザー分・論理削除済みを含め DB から物理削除し、日次スロットは残す")
-    except Exception as e:
-        ng("PurgeDialog", e)
-    finally:
-        QMessageBox.warning, QMessageBox.question = orig_w, orig_q
+    # 画面に削除対象を選ばせておく（古い IDX を保持させる）
+    state.current_date = today.isoformat()
+    win.refresh()
+    win._switch_view(1)   # Main(ガント)
+    gv = win.gantt_view
+    i = gv.pj_combo.findData(pj.name)
+    if i >= 0:
+        gv.pj_combo.setCurrentIndex(i)
+    tp, tbl = win.main_pane.tree_pane, win.main_pane.table_pane
+    tp._restore_selection(t_me.name)
+    tp._selected_idx = t_me.name
+    tbl.update_for_parent(task.name)
+    if tbl.table.rowCount():
+        tbl.table.selectRow(0)
+    win.detail_pane.update_for_node(t_me.name)
+    state.push_recent_ticket(t_me.name)
+    win.pomodoro.set_ticket(t_me.name, "監査チケット")
+    win.schedule_panel._selected_ticket = t_me.name
+    win.now_btn.setChecked(True)
+    win.search_view.f_kw.setText("監査")
 
-    # 存在しないチケットを参照する日次スロットがあっても各画面・集計がエラーにならない
+    # 実際の画面フロー（Config のボタン → ダイアログ → 削除 → 読込）で削除する
+    patched = {k: getattr(QMessageBox, k) for k in ("warning", "question", "information", "critical")}
+    shown = []
+    for k in patched:
+        setattr(QMessageBox, k, staticmethod(
+            lambda *a, _k=k, **kw: (shown.append((_k, a[1] if len(a) > 1 else "")),
+                                    QMessageBox.StandardButton.Yes)[1]))
+    import ui_main
+    orig_menu = ui_main.QMenu
+    class _NoExecMenu(QMenu):
+        def exec(self, *a, **k):   # 右クリックメニューを表示せずに戻る
+            return None
+    ui_main.QMenu = _NoExecMenu
+    gone = [pj.name, task.name, t_me.name, t_ot.name]
+    errors = []
+    old_hook = sys.excepthook
+    sys.excepthook = lambda *exc: errors.append("".join(traceback.format_exception(*exc)))
+
+    def step(label, fn):
+        try:
+            fn()
+            QApplication.processEvents()
+        except Exception as e:   # noqa: BLE001  各操作の例外を集める
+            errors.append(f"{label}: {e!r}\n{traceback.format_exc()}")
+
     try:
-        state.load()
-        state.current_date = today
-        win.refresh()
+        def _delete_in_db():   # DB 上で論理削除して読み直す（画面は古い IDX を持ったまま）
+            conn = db._connect()
+            conn.executemany("UPDATE nodes SET status='deleted' WHERE IDX=?", [[i] for i in gone])
+            conn.commit(); conn.close()
+            win._on_load()
+        step("削除して読込", _delete_in_db)
+        assert set(gone).isdisjoint(state.df_nodes.index)
+
+        # 古い IDX を保持したままの各画面・操作
         for vi in win._view_order:
-            win._switch_view(vi)
-        segs = LG.collect_daily_segments(state.df_daily, state.df_nodes, today, me)
-        assert any(s["ticket_idx"] == mine.name and s["title"] == "（削除済み）" for s in segs)
-        LG.achievement_summary(state.df_nodes, state.df_daily, me, "2000-01-01", today)
-        LG.now_and_next(state.df_daily, state.df_nodes, me, datetime.datetime.now())
-        win.now_window.update_view()
-        win.schedule_panel.refresh()
-        assert win.schedule_panel.schedule_table.item(92, 1).text() == "（削除済み）"
-        ok("削除済みチケットを参照する日次があっても全タブ・集計・Now が動き、枠は「（削除済み）」と表示")
+            step(f"タブ {vi}", lambda vi=vi: (win._switch_view(vi), win.refresh()))
+        for m in state.members:
+            step(f"メンバー {m}", lambda m=m: (win._on_member_changed(m), win.refresh()))
+        win._on_member_changed(me)
+        for d in days:
+            step(f"日付 {d}", lambda d=d: (win._on_date_changed(d), win.refresh()))
+        win._on_date_changed(today.isoformat())
+        dp = win.detail_pane
+        step("詳細ペイン refresh", dp.refresh)
+        step("詳細ペイン 作業ログ", dp._on_add_work_log)
+        step("詳細ペイン 実績挿入", dp._on_insert_actuals)
+        step("詳細ペイン レポート保存", dp._on_save_report)
+        step("詳細 focus_work_log", lambda: win._on_worklog_requested(t_me.name))
+        step("ガント Edit 要求", lambda: win._on_gantt_edit_requested(t_me.name))
+        step("ツリー削除", tp._on_delete)
+        step("ツリー refresh", tp.refresh)
+        tbl._parent_idx = task.name
+        step("表 update_for_parent", lambda: tbl.update_for_parent(task.name))
+        for name in ("_on_delete", "_on_move_up", "_on_move_down", "_on_propagate_color"):
+            step(f"表 {name}", getattr(tbl, name))
+        sp = win.schedule_panel
+        step("スロット割当（削除済み）", lambda: sp.assign_ticket(t_me.name))
+        step("スロット行へ割当", lambda: sp._assign_to_rows([30], t_me.name))
+        from PySide6.QtCore import QPoint
+        sp.schedule_table.selectRow(36)
+        step("スロット右クリック", lambda: sp._on_slot_context_menu(
+            QPoint(5, sp.schedule_table.rowViewportPosition(36) + 2)))
+        step("スロットのクリア", lambda: sp._update_schedule_slots([36, 37], ""))
+        step("ポモドーロ終了", lambda: win._on_pomodoro_finished(
+            t_me.name, datetime.datetime.now() - datetime.timedelta(minutes=30), datetime.datetime.now()))
+        step("ポモドーロ対象", lambda: win._on_pomodoro_ticket(t_me.name))
+        step("Now 小窓", win.now_window.update_view)
+        av = win.anal_view
+        for name in ("_calc", "_calc_burndown", "_calc_personal"):
+            step(f"分析 {name}", getattr(av, name))
+        step("成果のまとめ", lambda: ui_sub.AchievementDialog(state, win)._rebuild())
+        step("検索", win.search_view._on_search)
+        step("日次ログ出力", win.gantt_view._on_export_daily)
+        step("チーム出力", lambda: (win.team_view.f_from.set_date(days[2]),
+                                   win.team_view.f_to.set_date(days[0]),
+                                   win.team_view._on_export_team()))
+        asg = win.assign_view
+        step("依頼 refresh", asg.refresh)
+        mine = [a for a in state.df_assignments.index
+                if state.df_assignments.loc[a, "to_user"] == me
+                and state.df_assignments.loc[a, "status"] == "pending"]
+        asg._own_selected_ids = lambda: mine
+        step("依頼 refresh（削除済み表示）", asg.refresh)
+        step("依頼 承諾（削除済み）", asg._on_accept)
+        assert ("information", "承諾できない依頼") in shown, "削除済みの依頼を承諾できてしまう"
+        asg_db = state.db.read_assignments()
+        stale = asg_db[asg_db["ticket_id"].isin(gone) & (asg_db["to_user"] == me)]
+        assert len(stale) == 2 and set(stale["status"]) == {"pending"}, "削除済みの依頼が承諾済みになった"
+        assert asg._node_hierarchy_row(t_ot.name)[0][5] == "（削除済み）"
+        step("Undo", win._on_undo)
+        step("Redo", win._on_redo)
+        state.nodes_modified = state.schedule_modified = True
+        step("保存", win._on_save)
+        step("読込", win._on_load)
+        assert db.read_daily_schedule().loc[daily_sch_idx(days[1], other), DAILY_TIME_COLS[36]] == t_ot.name, \
+            "他ユーザーの日次が変わった"
+        # 前回終了時に削除した Project を選んでいた状態からの起動
+        QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, tmpdir)
+        win._ui_settings().setValue("main/project", pj.name)
+        from ui_main import MainWindow
+        def _restart():
+            w2 = MainWindow(state, version)
+            w2.restore_ui_state()
+            w2._switch_view(1)
+            w2.refresh()
+            w2.now_btn.setChecked(False)
+            w2.hide(); w2.deleteLater()
+        step("削除した PJ を記憶した状態で起動", _restart)
+        if errors:
+            raise AssertionError(f"{len(errors)} 件の例外:\n" + "\n".join(errors[:5]))
+        ok("削除後に古い IDX を持つ画面・日次/依頼の参照切れ・保存/読込/Undo・起動時の復元で例外なし")
     except Exception as e:
-        ng("存在しないチケットの参照", e)
+        ng("存在しないノードへの参照", e)
     finally:
+        sys.excepthook = old_hook
+        for k, v in patched.items():
+            setattr(QMessageBox, k, v)
+        ui_main.QMenu = orig_menu
+        win.now_btn.setChecked(False)
         state.nodes_modified = False
         state.schedule_modified = False
+
+
+def test_import(win, state, tmpdir):
+    """他の DB からのインポート（年度替わりの引き継ぎ）"""
+    print("\n[Import] 他の DB からのインポートテスト")
+    import hashlib
+    import sqlite3
+    import ui_sub
+    import logic as LG
+    import db as DBM
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QMessageBox, QApplication
+    from db import Database, create_initial_node
+    me, other, gone_user = state.user, "tanaka@email.com", "olduser@email.com"
+    today = datetime.date.today()
+    past = (today - datetime.timedelta(days=30)).isoformat()
+    future = (today + datetime.timedelta(days=30)).isoformat()
+
+    # 今の DB: 取込済みの「共通」・同名の「同名PJ」（別 IDX）・論理削除した「消したPJ」
+    common = create_initial_node(me, "project1", "共通", "0", 1)
+    dead = create_initial_node(me, "project1", "消したPJ", "0", 2)
+    same_cur = create_initial_node(me, "project1", "同名PJ", "0", 3)
+    for n in (common, dead, same_cur):
+        state.db.upsert_node(n)
+    conn = state.db._connect()
+    conn.execute("UPDATE nodes SET status='deleted' WHERE IDX=?", [dead.name])
+    conn.commit(); conn.close()
+    state.load()
+    cur_p1_max = int(state.df_nodes[state.df_nodes["parent_id"] == "0"]["priority"].max())
+
+    # 取り込み元（前年度）の DB
+    src_dir = os.path.join(tmpdir, "lastyear")
+    src_db = Database(src_dir)
+    pj = create_initial_node(me, "project1", "引継PJ", "0", 1)
+    task = create_initial_node(me, "task", "引継Task", pj.name, 1)
+    t1 = create_initial_node(me, "ticket", "引継チケット", task.name, 1)
+    t1["actual_hours"] = 3.0
+    t1["deadline"], t1["start_available"] = past, future
+    t2 = create_initial_node(other, "ticket", "他人の完了", task.name, 2)
+    t2["status"], t2["actual_hours"], t2["actual_end"] = "done", 5.0, past
+    t3 = create_initial_node(me, "ticket", "削除済みチケット", task.name, 3)
+    t3["status"] = "deleted"
+    old_pj = create_initial_node(gone_user, "project1", "退職者PJ", "0", 2)
+    old_t = create_initial_node(gone_user, "task", "退職者Task", old_pj.name, 1)
+    orphan = create_initial_node(me, "ticket", "孤立チケット", "no_such_parent", 1)
+    inbox = create_initial_node(me, "ticket", "Inboxメモ", DBM.INBOX_PARENT, 1)
+    new_in_common = create_initial_node(me, "ticket", "共通の新チケット", common.name, 5)
+    dead_child = create_initial_node(me, "ticket", "削除PJの子", dead.name, 1)
+    same_src = create_initial_node(me, "project1", "同名PJ", "0", 3)
+    for n in (pj, task, t1, t2, t3, old_pj, old_t, orphan, inbox, common,
+              new_in_common, dead, dead_child, same_src):
+        src_db.upsert_node(n)
+    conn = src_db._connect()
+    conn.execute("UPDATE nodes SET status='todo' WHERE IDX=?", [dead.name])
+    conn.commit(); conn.close()
+    src_path = str(src_db.db_path)
+    digest = lambda: hashlib.sha256(open(src_path, "rb").read()).hexdigest()
+    before = digest()
+
+    # 候補・取り込み計画（ロジック）
+    try:
+        src = DBM.read_nodes_file(src_path)
+        cands = LG.import_candidates(src)
+        assert t3.name not in cands and orphan.name not in cands, "削除済み・孤立が候補に入った"
+        assert {pj.name, inbox.name, dead_child.name} <= cands
+        cur = state.db.read_nodes(include_deleted=True)
+        plan = LG.plan_import(src, cur, [t1.name, new_in_common.name, dead_child.name, same_src.name],
+                              {}, True, today.isoformat())
+        ids = [r.name for r in plan["rows"]]
+        assert set(ids) == {pj.name, task.name, t1.name, new_in_common.name, same_src.name}, ids
+        assert ids.index(pj.name) < ids.index(task.name) < ids.index(t1.name), "親が先に並ばない"
+        assert set(plan["existing"]) == {common.name, dead.name}
+        assert plan["blocked"] == [dead_child.name], plan["blocked"]
+        assert plan["same_name"] == [same_src.name], plan["same_name"]
+        ok("候補から削除済み・孤立を除き、祖先を自動で含め、取込済み・親が削除済み・同名を判定")
+    except Exception as e:
+        ng("取り込み計画", e)
+
+    # 読めないファイル・同じファイル・古い形式の DB
+    shown = []
+    orig_w, orig_q = QMessageBox.warning, QMessageBox.question
+    QMessageBox.warning = staticmethod(lambda *a, **k: shown.append(a[2] if len(a) > 2 else ""))
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+    try:
+        dlg = ui_sub.ImportDialog(state, win)
+        txt = os.path.join(tmpdir, "not_db.sqlite")
+        open(txt, "w").write("hello")
+        assert not dlg.load_source(txt) and "DB ファイル" in shown[-1], shown
+        assert not dlg.load_source(str(state.db.db_path)) and "同じファイル" in shown[-1], shown
+        legacy = os.path.join(tmpdir, "legacy.sqlite")
+        c = sqlite3.connect(legacy)
+        c.execute("CREATE TABLE nodes (IDX TEXT PRIMARY KEY, node_type TEXT, parent_id TEXT,"
+                  " title TEXT, status TEXT, priority INTEGER, assigned_to TEXT)")
+        c.execute("INSERT INTO nodes VALUES ('legacy_1','project1','0','古い形式PJ','todo',1,?)", [me])
+        c.commit(); c.close()
+        legacy_before = hashlib.sha256(open(legacy, "rb").read()).hexdigest()
+        old_df = DBM.read_nodes_file(legacy)
+        assert old_df.loc["legacy_1", "link"] == "" and float(old_df.loc["legacy_1", "actual_hours"]) == 0.0
+        assert hashlib.sha256(open(legacy, "rb").read()).hexdigest() == legacy_before, \
+            "古い形式の DB に列追加などの変更が入った"
+        ok("読めないファイル・今の DB と同じファイルは拒否、古い形式の DB は足りない列を補って読む")
+    except Exception as e:
+        ng("取り込み元の検査", e)
+
+    # 画面フロー: Config のボタン → ダイアログで選択 → 取り込み → 読み直し
+    orig_dlg = ui_sub.ImportDialog
+    class _Auto(orig_dlg):
+        def exec(self):
+            assert self.load_source(src_path)
+            def check(title):
+                its = self.tree.findItems(title, Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchRecursive)
+                assert its, f"ツリーに無い: {title}"
+                its[0].setCheckState(0, Qt.CheckState.Checked)
+                return its[0]
+            assert not self.tree.findItems("削除済みチケット", Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchRecursive)
+            assert not self.tree.findItems("孤立チケット", Qt.MatchFlag.MatchExactly | Qt.MatchFlag.MatchRecursive)
+            assert check("共通").text(4) == "取込済み"
+            assert check("同名PJ").text(4) == "同名あり"
+            assert check("削除PJの子").text(4) == "今の DB で親が削除済み"
+            check("引継PJ"); check("退職者Task"); check("Inboxメモ")
+            QApplication.processEvents()
+            assert set(self._owner_combos) == {me, other, gone_user}, set(self._owner_combos)
+            assert self._owner_combos[gone_user].currentData() == me, "メンバー外の担当者の既定が自分でない"
+            assert self._owner_combos[other].currentData() == other
+            self._on_import()
+            return self.result()
+    ui_sub.ImportDialog = _Auto
+    try:
+        state.nodes_modified = state.schedule_modified = False
+        win.config_view.import_requested.emit()
+        got = state.db.read_nodes(include_deleted=True)
+        want = {pj.name, task.name, t1.name, t2.name, old_pj.name, old_t.name, inbox.name,
+                new_in_common.name, same_src.name}
+        assert want <= set(got.index), want - set(got.index)
+        assert t3.name not in got.index and orphan.name not in got.index and dead_child.name not in got.index
+        assert (got.index == common.name).sum() == 1 and str(got.loc[dead.name, "status"]) == "deleted"
+        r1, r2 = got.loc[t1.name], got.loc[t2.name]
+        assert float(r1["actual_hours"]) == 0 and float(r2["actual_hours"]) == 0, "実績工数が 0 でない"
+        assert not LG._date_str(r1["deadline"]) and LG._date_str(r1["start_available"]) == future
+        assert str(r2["status"]) == "done" and str(r2["assigned_to"]) == other
+        assert str(got.loc[old_pj.name, "assigned_to"]) == me and str(got.loc[old_t.name, "assigned_to"]) == me
+        assert str(got.loc[inbox.name, "parent_id"]) == DBM.INBOX_PARENT
+        assert int(got.loc[pj.name, "priority"]) > cur_p1_max, "最上位の並び順が既存とぶつかる"
+        assert str(got.loc[new_in_common.name, "parent_id"]) == common.name
+        assert t1.name in state.df_nodes.index and not state.nodes_modified, "取り込み後に読み直していない"
+        assert digest() == before, "取り込み元の DB ファイルが変更された"
+        ok("ボタンから取り込み: 祖先・担当者の割り当て・実績 0・過去の納期を消す・並び順・読み直し、元 DB は不変")
+    except Exception as e:
+        ng("インポートの画面フロー", e)
+    finally:
+        ui_sub.ImportDialog = orig_dlg
+
+    try:
+        dlg = ui_sub.ImportDialog(state, win)
+        dlg.load_source(src_path)
+        for t in ("引継PJ", "退職者PJ"):
+            dlg.tree.findItems(t, Qt.MatchFlag.MatchExactly)[0].setCheckState(0, Qt.CheckState.Checked)
+        QApplication.processEvents()
+        assert not dlg.plan()["rows"] and not dlg.import_btn.isEnabled(), "同じものを 2 回取り込める"
+        assert dlg.tree.findItems("引継PJ", Qt.MatchFlag.MatchExactly)[0].text(4) == "取込済み"
+        fresh = create_initial_node(me, "ticket", "新規", task.name, 9)
+        dup = state.db.read_nodes().loc[t1.name].copy()
+        try:
+            state.db.insert_nodes([fresh, dup])
+            raise AssertionError("重複 IDX の追加で例外にならない")
+        except RuntimeError:
+            pass
+        assert fresh.name not in state.db.read_nodes(include_deleted=True).index, "途中まで書き込まれた"
+        for vi in win._view_order:
+            win._switch_view(vi)
+            win.refresh()
+        ok("2 回目は取込済みで取り込めず、同時取り込みの重複は全件取り消し、取り込み後も全タブ表示 OK")
+    except Exception as e:
+        ng("二重取り込み", e)
+    finally:
+        QMessageBox.warning, QMessageBox.question = orig_w, orig_q
+        state.nodes_modified = state.schedule_modified = False
 
 
 def main():
@@ -2749,7 +3018,8 @@ def main():
             test_g2_achievement(win)
             test_f3_now_window(win, state, version, tmpdir, ticket_idx)
             test_i3_dark_mode(win)
-            test_purge_maintenance(win)
+            test_stale_refs(win, state, version, tmpdir)
+            test_import(win, state, tmpdir)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")
