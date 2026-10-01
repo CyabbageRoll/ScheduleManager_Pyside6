@@ -3599,6 +3599,8 @@ class DetailPane(QWidget):
             item = self.form_box.takeAt(0)
             if item.widget():
                 item.widget().setParent(None)
+        # 作業ログ欄は上で破棄したため参照も外す（ノードが無いと下で作り直されず、破棄済みを指したままになる）
+        self.log_edit = None
         if not idx or idx not in self.state.df_nodes.index:
             self.form_box.addStretch()
             return
@@ -3683,7 +3685,6 @@ class DetailPane(QWidget):
         # 5) メモカード（自分のチケットは作業ログの入力欄つき）
         memo = _s("memo")
         can_log = ntype == "ticket" and _s("assigned_to") == self.state.user
-        self.log_edit = None
         if memo or can_log:
             memo_card, mv = self._make_card("メモ・作業ログ" if can_log else "メモ")
             if memo:

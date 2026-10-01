@@ -2948,7 +2948,8 @@ class AssignmentView(QWidget):
         対象ノードより下位の列は空欄でグレーアウト。"""
         df = self.state.df_nodes
         if t_idx not in df.index:
-            return [""] * 6, [True] * 6
+            # 依頼元のアイテムが削除済み（完全削除など）
+            return [""] * 5 + ["（削除済み）"], [True] * 6
         target_type = str(df.loc[t_idx, "node_type"])
         target_pos = self._HIERARCHY.index(target_type) if target_type in self._HIERARCHY else 5
         # 祖先をたどってタイプ→タイトルの辞書を作成
@@ -3285,6 +3286,18 @@ class AssignmentView(QWidget):
         if not asgn_ids:
             self.info.set_info("⚠ 承諾できる依頼が選択されていません（自分宛のみ承諾可）")
             return
+        # 依頼元のアイテムが削除済み（完全削除など）の依頼は承諾しても何も受け取れないため除外する
+        df_asgn = self.state.df_assignments
+        gone = [a for a in asgn_ids
+                if df_asgn.loc[a, "ticket_id"] not in self.state.df_nodes.index]
+        if gone:
+            QMessageBox.information(
+                self, "承諾できない依頼",
+                f"{len(gone)} 件は依頼元のアイテムが削除されているため承諾できません。\n"
+                "不要であれば「拒否」で片付けてください。")
+            asgn_ids = [a for a in asgn_ids if a not in gone]
+            if not asgn_ids:
+                return
         today = datetime.date.today().isoformat()
         nodes_to_upsert: list = []
         nodes_to_reassign: list = []

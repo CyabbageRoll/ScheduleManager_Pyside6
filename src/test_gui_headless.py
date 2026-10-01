@@ -2713,6 +2713,206 @@ def test_purge_maintenance(win):
         state.schedule_modified = False
 
 
+def test_purge_stale_refs(win, state, version, tmpdir):
+    """完全削除の直後に、画面が保持する古い IDX・日次/依頼の参照切れ・他ユーザーの再保存で壊れないか"""
+    print("\n[Purge+] 完全削除後の参照切れテスト")
+    import ui_sub
+    from PySide6.QtCore import Qt, QSettings
+    from PySide6.QtWidgets import QMessageBox, QMenu, QApplication
+    from schedule_app import AppState
+    from db import DAILY_TIME_COLS, create_initial_node, daily_sch_idx
+    db, me, other = state.db, state.user, "tanaka@email.com"
+    state.config.report_output_dir = tmpdir   # 出力系がファイル保存ダイアログで止まらないように
+    today = datetime.date.today()
+    days = [(today - datetime.timedelta(days=k)).isoformat() for k in (0, 1, 40)]
+    pj = create_initial_node(me, "project1", "監査PJ", "0", 91)
+    task = create_initial_node(me, "task", "監査Task", pj.name, 1)
+    t_me = create_initial_node(me, "ticket", "監査チケット", task.name, 1)
+    t_ot = create_initial_node(other, "ticket", "監査他人", task.name, 2)
+    keep = create_initial_node(me, "project1", "残すPJ", "0", 92)
+    keep_t = create_initial_node(me, "task", "残すTask", keep.name, 1)
+    keep_k = create_initial_node(me, "ticket", "残すチケット", keep_t.name, 1)
+    for n in (pj, task, t_me, t_ot, keep, keep_t, keep_k):
+        db.upsert_node(n)
+    state.load()
+    # 自分と他ユーザーの日次（今日・昨日・40 日前）に削除対象を記録
+    for d in days:
+        for owner, tick in ((me, t_me.name), (other, t_ot.name)):
+            sch = daily_sch_idx(d, owner)
+            if sch not in state.df_daily.index:
+                state.df_daily.loc[sch] = {c: "" for c in state.df_daily.columns}
+                state.df_daily.loc[sch, "Owner"] = owner
+            for c in DAILY_TIME_COLS[36:40]:      # 09:00〜10:00
+                state.df_daily.loc[sch, c] = tick
+            state.df_daily.loc[sch, DAILY_TIME_COLS[40]] = keep_k.name
+            state.df_daily.loc[sch, "Last_Update"] = today.isoformat()   # 直近更新の行だけ保存されるため
+    db.save_daily_schedule(state.df_daily, me)
+    db.save_daily_schedule(state.df_daily, other)
+    # 削除対象を指す依頼（自分宛・他人宛・Task）
+    db.create_assignment(t_ot.name, other, me, "見て")
+    db.create_assignment(t_me.name, me, other, "頼む")
+    db.create_assignment(task.name, other, me, "Task ごと")
+    state.load()
+    # 他ユーザーは削除前のデータを開いたまま
+    st_other = AppState(config=state.config, login_user=other)
+    st_other.db = db
+    st_other.load()
+
+    # 画面に削除対象を選ばせておく（古い IDX を保持させる）
+    state.current_date = today.isoformat()
+    win.refresh()
+    win._switch_view(1)   # Main(ガント)
+    gv = win.gantt_view
+    i = gv.pj_combo.findData(pj.name)
+    if i >= 0:
+        gv.pj_combo.setCurrentIndex(i)
+    tp, tbl = win.main_pane.tree_pane, win.main_pane.table_pane
+    tp._restore_selection(t_me.name)
+    tp._selected_idx = t_me.name
+    tbl.update_for_parent(task.name)
+    if tbl.table.rowCount():
+        tbl.table.selectRow(0)
+    win.detail_pane.update_for_node(t_me.name)
+    state.push_recent_ticket(t_me.name)
+    win.pomodoro.set_ticket(t_me.name, "監査チケット")
+    win.schedule_panel._selected_ticket = t_me.name
+    win.now_btn.setChecked(True)
+    win.search_view.f_kw.setText("監査")
+
+    # 実際の画面フロー（Config のボタン → ダイアログ → 削除 → 読込）で削除する
+    patched = {k: getattr(QMessageBox, k) for k in ("warning", "question", "information", "critical")}
+    shown = []
+    for k in patched:
+        setattr(QMessageBox, k, staticmethod(
+            lambda *a, _k=k, **kw: (shown.append((_k, a[1] if len(a) > 1 else "")),
+                                    QMessageBox.StandardButton.Yes)[1]))
+    import ui_main
+    orig_menu, orig_pd = ui_main.QMenu, ui_sub.PurgeDialog
+    class _NoExecMenu(QMenu):
+        def exec(self, *a, **k):   # 右クリックメニューを表示せずに戻る
+            return None
+    ui_main.QMenu = _NoExecMenu
+    class _AutoPurge(orig_pd):
+        def exec(self):
+            it = self.tree.findItems("監査PJ", Qt.MatchFlag.MatchExactly)[0]
+            self.tree.setCurrentItem(it)
+            self.confirm_edit.setText("監査PJ")
+            self._on_purge()
+            return self.result()
+    ui_sub.PurgeDialog = _AutoPurge
+    gone = [pj.name, task.name, t_me.name, t_ot.name]
+    errors = []
+    old_hook = sys.excepthook
+    sys.excepthook = lambda *exc: errors.append("".join(traceback.format_exception(*exc)))
+
+    def step(label, fn):
+        try:
+            fn()
+            QApplication.processEvents()
+        except Exception as e:   # noqa: BLE001  各操作の例外を集める
+            errors.append(f"{label}: {e!r}\n{traceback.format_exc()}")
+
+    try:
+        step("完全削除", lambda: win.config_view.purge_requested.emit())
+        assert db.read_nodes(include_deleted=True).index.intersection(gone).empty, "削除されていない"
+        assert set(gone).isdisjoint(state.df_nodes.index)
+
+        # 古い IDX を保持したままの各画面・操作
+        for vi in win._view_order:
+            step(f"タブ {vi}", lambda vi=vi: (win._switch_view(vi), win.refresh()))
+        for m in state.members:
+            step(f"メンバー {m}", lambda m=m: (win._on_member_changed(m), win.refresh()))
+        win._on_member_changed(me)
+        for d in days:
+            step(f"日付 {d}", lambda d=d: (win._on_date_changed(d), win.refresh()))
+        win._on_date_changed(today.isoformat())
+        dp = win.detail_pane
+        step("詳細ペイン refresh", dp.refresh)
+        step("詳細ペイン 作業ログ", dp._on_add_work_log)
+        step("詳細ペイン 実績挿入", dp._on_insert_actuals)
+        step("詳細ペイン レポート保存", dp._on_save_report)
+        step("詳細 focus_work_log", lambda: win._on_worklog_requested(t_me.name))
+        step("ガント Edit 要求", lambda: win._on_gantt_edit_requested(t_me.name))
+        step("ツリー削除", tp._on_delete)
+        step("ツリー refresh", tp.refresh)
+        tbl._parent_idx = task.name
+        step("表 update_for_parent", lambda: tbl.update_for_parent(task.name))
+        for name in ("_on_delete", "_on_move_up", "_on_move_down", "_on_propagate_color"):
+            step(f"表 {name}", getattr(tbl, name))
+        sp = win.schedule_panel
+        step("スロット割当（削除済み）", lambda: sp.assign_ticket(t_me.name))
+        step("スロット行へ割当", lambda: sp._assign_to_rows([30], t_me.name))
+        from PySide6.QtCore import QPoint
+        sp.schedule_table.selectRow(36)
+        step("スロット右クリック", lambda: sp._on_slot_context_menu(
+            QPoint(5, sp.schedule_table.rowViewportPosition(36) + 2)))
+        step("スロットのクリア", lambda: sp._update_schedule_slots([36, 37], ""))
+        step("ポモドーロ終了", lambda: win._on_pomodoro_finished(
+            t_me.name, datetime.datetime.now() - datetime.timedelta(minutes=30), datetime.datetime.now()))
+        step("ポモドーロ対象", lambda: win._on_pomodoro_ticket(t_me.name))
+        step("Now 小窓", win.now_window.update_view)
+        av = win.anal_view
+        for name in ("_calc", "_calc_burndown", "_calc_personal"):
+            step(f"分析 {name}", getattr(av, name))
+        step("成果のまとめ", lambda: ui_sub.AchievementDialog(state, win)._rebuild())
+        step("検索", win.search_view._on_search)
+        step("日次ログ出力", win.gantt_view._on_export_daily)
+        step("チーム出力", lambda: (win.team_view.f_from.set_date(days[2]),
+                                   win.team_view.f_to.set_date(days[0]),
+                                   win.team_view._on_export_team()))
+        asg = win.assign_view
+        step("依頼 refresh", asg.refresh)
+        mine = [a for a in state.df_assignments.index
+                if state.df_assignments.loc[a, "to_user"] == me
+                and state.df_assignments.loc[a, "status"] == "pending"]
+        asg._own_selected_ids = lambda: mine
+        step("依頼 refresh（削除済み表示）", asg.refresh)
+        step("依頼 承諾（削除済み）", asg._on_accept)
+        assert ("information", "承諾できない依頼") in shown, "削除済みの依頼を承諾できてしまう"
+        asg_db = state.db.read_assignments()
+        stale = asg_db[asg_db["ticket_id"].isin(gone) & (asg_db["to_user"] == me)]
+        assert len(stale) == 2 and set(stale["status"]) == {"pending"}, "削除済みの依頼が承諾済みになった"
+        assert asg._node_hierarchy_row(t_ot.name)[0][5] == "（削除済み）"
+        step("Undo", win._on_undo)
+        step("Redo", win._on_redo)
+        state.nodes_modified = state.schedule_modified = True
+        step("保存", win._on_save)
+        step("読込", win._on_load)
+        assert db.read_daily_schedule().loc[daily_sch_idx(days[1], other), DAILY_TIME_COLS[36]] == t_ot.name, \
+            "他ユーザーの日次が変わった"
+        # 前回終了時に削除した Project を選んでいた状態からの起動
+        QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, tmpdir)
+        win._ui_settings().setValue("main/project", pj.name)
+        from ui_main import MainWindow
+        def _restart():
+            w2 = MainWindow(state, version)
+            w2.restore_ui_state()
+            w2._switch_view(1)
+            w2.refresh()
+            w2.now_btn.setChecked(False)
+            w2.hide(); w2.deleteLater()
+        step("削除した PJ を記憶した状態で起動", _restart)
+        # 他ユーザーが削除前のデータのまま保存した場合
+        st_other.nodes_modified = True
+        step("他ユーザーの古いデータで保存", st_other.save)
+        state.load()
+        for vi in win._view_order:
+            step(f"孤立ノードありでタブ {vi}", lambda vi=vi: (win._switch_view(vi), win.refresh()))
+        if errors:
+            raise AssertionError(f"{len(errors)} 件の例外:\n" + "\n".join(errors[:5]))
+        ok("削除後に古い IDX を持つ画面・日次/依頼の参照切れ・保存/読込/Undo・起動時の復元で例外なし")
+    except Exception as e:
+        ng("完全削除後の参照切れ", e)
+    finally:
+        sys.excepthook = old_hook
+        for k, v in patched.items():
+            setattr(QMessageBox, k, v)
+        ui_main.QMenu, ui_sub.PurgeDialog = orig_menu, orig_pd
+        win.now_btn.setChecked(False)
+        state.nodes_modified = False
+        state.schedule_modified = False
+
+
 def main():
     print("=" * 55)
     print("  ヘッドレス GUI テスト (QT_QPA_PLATFORM=offscreen)")
@@ -2769,6 +2969,7 @@ def main():
             test_f3_now_window(win, state, version, tmpdir, ticket_idx)
             test_i3_dark_mode(win)
             test_purge_maintenance(win)
+            test_purge_stale_refs(win, state, version, tmpdir)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")
