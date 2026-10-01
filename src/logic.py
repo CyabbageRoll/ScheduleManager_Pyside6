@@ -740,26 +740,6 @@ def delete_block_reason(df_nodes: pd.DataFrame, idx: str, user: str) -> Optional
     return None
 
 
-def subtree_ids(df_nodes: pd.DataFrame, root_idx: str) -> List[str]:
-    """
-    メンテナンスの完全削除用: root_idx 自身とその子孫の IDX を返す（ステータスは問わない）。
-    df_nodes は論理削除済みも含めて渡すこと（含めないと deleted の子孫が孤立して残る）。
-    """
-    if root_idx not in df_nodes.index:
-        return []
-    result: List[str] = []
-    seen: set = set()
-    stack = [root_idx]
-    while stack:
-        cur = stack.pop()
-        if cur in seen:   # 親子が循環した壊れたデータでも止まるようにする
-            continue
-        seen.add(cur)
-        result.append(cur)
-        stack.extend(df_nodes.index[df_nodes["parent_id"] == cur])
-    return result
-
-
 def apply_status(df_nodes: pd.DataFrame, idx: str, new_status: str) -> List[str]:
     """
     ステータスを変更し、付随処理をまとめて行う（df_nodes をその場で更新）。

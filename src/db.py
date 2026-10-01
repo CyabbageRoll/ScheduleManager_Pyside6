@@ -464,22 +464,6 @@ class Database:
         finally:
             conn.close()
 
-    def purge_nodes(self, idxs: list) -> None:
-        """ノードを DB から物理削除する（メンテナンス用・元に戻せない）。
-        daily_schedule のスロットと依頼テーブルは変更しない（存在しない IDX の参照として残る）"""
-        if not idxs:
-            return
-        conn = self._connect()
-        try:
-            conn.executemany("DELETE FROM nodes WHERE IDX=?", [[i] for i in idxs])
-            conn.commit()
-            self._logw(f"[DB] purge_nodes: {len(idxs)} 件を物理削除 {list(idxs)}")
-        except Exception as e:
-            self._loge(f"[DB] purge_nodes エラー: {e}")
-            raise  # 呼び出し元で削除失敗を検知できるよう再送出
-        finally:
-            conn.close()
-
     def reassign_nodes_bulk(self, idxs: list, user: str) -> None:
         """担当者のみを変更する（他列は DB の最新値を保持し、古いメモリ内容で上書きしない）"""
         if not idxs:
