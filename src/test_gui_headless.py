@@ -2963,6 +2963,301 @@ def test_import(win, state, tmpdir):
         state.nodes_modified = state.schedule_modified = False
 
 
+def test_presets(win, state, tmpdir):
+    """日次スケジュールのプリセット（保存・呼び出し・削除済みチケットなどの飛ばし・壊れたファイル）"""
+    print("\n[Preset] 日次スケジュールのプリセットテスト")
+    import json
+    import ui_main
+    import logic as LG
+    from PySide6.QtWidgets import QMessageBox, QMenu
+    from db import DAILY_TIME_COLS, create_initial_node, daily_sch_idx
+    me, other = state.user, "tanaka@email.com"
+    sp = win.schedule_panel
+    path = os.path.join(tmpdir, "schedule_presets.json")
+    sp._preset_path = path
+    win._on_member_changed(me)
+    base = datetime.date.today() + datetime.timedelta(days=20)
+    d1, d2, d3, d4 = [(base + datetime.timedelta(days=k)).isoformat() for k in range(4)]
+
+    pj = create_initial_node(me, "project1", "プリセットPJ", "0", 95)
+    task = create_initial_node(me, "task", "プリセットTask", pj.name, 1)
+    names = ["朝会", "定例", "消える", "移管される", "完了する"]
+    tk = [create_initial_node(me, "ticket", n, task.name, i + 1) for i, n in enumerate(names)]
+    tk[1]["status"] = "regularly"
+    for n in [pj, task] + tk:
+        state.df_nodes.loc[n.name] = n
+    a, b, c, d, e = [t.name for t in tk]
+    slots_of = lambda day: LG.day_slots(state.df_daily, daily_sch_idx(day, me))
+
+    shown = []
+    patched = {k: getattr(QMessageBox, k) for k in ("warning", "question", "information")}
+    for k in patched:
+        setattr(QMessageBox, k, staticmethod(
+            lambda *a_, _k=k, **kw: (shown.append((_k, a_[2] if len(a_) > 2 else "")),
+                                     QMessageBox.StandardButton.Yes)[1]))
+    orig_input, orig_menu, orig_ask = ui_main.QInputDialog, ui_main.QMenu, sp._ask_preset_mode
+    typed = {"title": "朝の定例"}
+    class _FakeInput:
+        @staticmethod
+        def getText(*a_, **k):
+            return typed["title"], True
+    opened = []
+    class _NoExecMenu(QMenu):
+        def exec(self, *a_, **k):
+            opened.append([x.text() for x in self.actions()])
+            return None
+    ui_main.QInputDialog, ui_main.QMenu = _FakeInput, _NoExecMenu
+    try:
+        # 1 日分を作って保存: 09:00 朝会 / 09:15-09:45 定例 / 10:00 消える / 10:15 移管 / 10:30 完了
+        state.current_date = d1
+        win.refresh()
+        for rows, t in (([36], a), ([37, 38], b), ([40], c), ([41], d), ([42], e)):
+            sp._update_schedule_slots(rows, t)
+        sp._on_save_preset()
+        data = json.loads(open(path, encoding="utf-8").read())
+        assert [p["title"] for p in data["presets"]] == ["朝の定例"]
+        assert data["presets"][0]["slots"] == {"C0900": a, "C0915": b, "C0930": b,
+                                               "C1000": c, "C1015": d, "C1030": e}
+        sp._on_save_preset()   # 同じ名前は確認のうえ上書き（増えない）
+        assert len(LG.load_presets(path)) == 1 and any("上書き" in m for k, m in shown)
+        ok("表示中の日の予定を名前付きで JSON に保存、同名は上書き")
+    except Exception as ex:
+        ng("プリセットの保存", ex)
+
+    try:
+        # 保存後にチケットの状態が変わる: 削除・他人へ移管・完了
+        state.df_nodes = state.df_nodes.drop(index=c)
+        state.df_nodes.loc[d, "assigned_to"] = other
+        state.df_nodes.loc[e, "status"] = "done"
+        # 残して入れる: 09:15 に別の予定、13:00 にも予定がある日
+        state.current_date = d2
+        win.refresh()
+        sp._update_schedule_slots([37], a)
+        sp._update_schedule_slots([52], a)
+        hours_a = float(state.df_nodes.loc[a, "actual_hours"])
+        sp._ask_preset_mode = lambda title: False
+        asked = []
+        sp._ask_preset_done = lambda titles: (asked.append(titles), None)[1]   # キャンセル
+        sp._on_apply_preset(0)
+        assert asked == [["完了する"]] and slots_of(d2) == {"C0915": a, "C1300": a}, (asked, slots_of(d2))
+        sp._ask_preset_done = lambda titles: True    # 完了済みも入れる
+        state.nodes_modified = state.schedule_modified = False
+        sp._on_apply_preset(0)
+        assert slots_of(d2) == {"C0900": a, "C0915": a, "C0930": b, "C1030": e, "C1300": a}, slots_of(d2)
+        assert "C1030" in LG.load_presets(path)[0]["slots"], "「入れる」でプリセットが変わった"
+        assert float(state.df_nodes.loc[a, "actual_hours"]) == hours_a + 0.25, "実績工数が合わない"
+        assert state.schedule_modified and state.nodes_modified
+        msg = sp.info.text()
+        assert all(w in msg for w in ("削除済み 1 枠", "自分の担当でない 1 枠", "予定あり 1 枠")) and "完了" not in msg, msg
+        ok("今の予定を残して空き枠にだけ入れ、削除済み・担当でない枠は飛ばして知らせる。完了済みは選んで入れられる")
+
+        # 消して入れる: 13:00 の予定は消え、プリセットの入れられる枠だけ入る
+        state.current_date = d3
+        win.refresh()
+        sp._update_schedule_slots([37], a)
+        sp._update_schedule_slots([52], a)
+        sp._ask_preset_mode = lambda title: True
+        sp._ask_preset_done = lambda titles: False   # プリセットから消して入れる
+        sp._on_apply_preset(0)
+        assert slots_of(d3) == {"C0900": a, "C0915": b, "C0930": b}, slots_of(d3)
+        saved = LG.load_presets(path)[0]["slots"]
+        assert "C1030" not in saved and saved["C1000"] == c, "完了済みの枠だけがプリセットから消えていない"
+        sp._ask_preset_done = lambda titles: (_ for _ in ()).throw(AssertionError("消した後も完了の確認が出た"))
+        # キャンセル・予定の無い日（確認なしで入る）
+        sp._ask_preset_mode = lambda title: None
+        sp._on_apply_preset(0)
+        assert slots_of(d3) == {"C0900": a, "C0915": b, "C0930": b}
+        state.current_date = d4
+        win.refresh()
+        sp._ask_preset_mode = lambda title: (_ for _ in ()).throw(AssertionError("空の日に確認が出た"))
+        sp._on_apply_preset(0)
+        assert slots_of(d4) == {"C0900": a, "C0915": b, "C0930": b}
+        ok("消して入れる・キャンセル・予定の無い日は確認なしで入る")
+
+        # 完了済みだけのプリセットで「プリセットから消す」→ プリセットごと削除、キャンセル済みは飛ばす
+        LG.save_presets(path, [{"title": "完了だけ", "slots": {"C1100": e}}])
+        sp._ask_preset_done = lambda titles: False
+        before = slots_of(d4)
+        sp._on_apply_preset(0)
+        assert LG.load_presets(path) == [] and slots_of(d4) == before
+        state.df_nodes.loc[b, "status"] = "cancel"
+        pl = LG.plan_preset({"C0900": b, "C0915": e}, state.df_nodes, me, {}, False)
+        assert pl == {"assign": {}, "skipped": {"キャンセル済み": 1, "完了済み": 1}}, pl
+        state.df_nodes.loc[b, "status"] = "regularly"
+        # 入れられる枠が 1 つも無いプリセットは、今の予定を消さない
+        LG.save_presets(path, [{"title": "全滅", "slots": {"C0900": c, "C0915": "no_such_ticket"}}])
+        sp._ask_preset_mode = lambda title: True
+        before = slots_of(d4)
+        sp._on_apply_preset(0)
+        assert slots_of(d4) == before and any("入れられる予定がありません" in m for k, m in shown)
+        # 他メンバーのスケジュール表示中は何もしない
+        win._on_member_changed(other)
+        sp._on_apply_preset(0); sp._on_save_preset(); sp._on_preset_menu()
+        assert not opened and slots_of(d4) == before
+        win._on_member_changed(me)
+        ok("全枠が削除済みなら今の予定を消さない・他メンバー表示中は使えない")
+    except Exception as ex:
+        ng("プリセットの呼び出し", ex)
+
+    try:
+        # 上限・削除・メニュー
+        full = [{"title": f"P{i}", "slots": {"C0900": a}} for i in range(LG.PRESET_MAX)]
+        LG.save_presets(path, full)
+        state.current_date = d1
+        win.refresh()
+        typed["title"] = "11 件目"
+        sp._on_save_preset()
+        assert len(LG.load_presets(path)) == LG.PRESET_MAX and any("件までです" in m for k, m in shown)
+        sp._on_delete_preset(0)
+        assert [p["title"] for p in LG.load_presets(path)][0] == "P1" and len(LG.load_presets(path)) == 9
+        sp._on_preset_menu()
+        assert opened and opened[-1][0] == "▶ P1"
+        # 壊れたファイル・形式違い・書き込めない保存先
+        open(path, "w", encoding="utf-8").write("{broken")
+        assert LG.load_presets(path) == []
+        sp._on_preset_menu(); sp._on_apply_preset(0); sp._on_delete_preset(3)
+        open(path, "w", encoding="utf-8").write(json.dumps(
+            {"presets": [1, {"title": "x"}, {"title": "", "slots": {"C0900": a}},
+                         {"title": "変な枠", "slots": {"ZZ": a, "C0900": 5}},
+                         {"title": "有効", "slots": {"C0900": a, "C9999": a}}]}))
+        assert LG.load_presets(path) == [{"title": "有効", "slots": {"C0900": a}}]
+        open(path, "w", encoding="utf-8").write("[1, 2]")
+        assert LG.load_presets(path) == [] and LG.load_presets(os.path.join(tmpdir, "none.json")) == []
+        sp._preset_path = tmpdir   # フォルダを指す = 書き込めない
+        typed["title"] = "書けない"
+        sp._on_save_preset()
+        assert any("保存できませんでした" in m for k, m in shown)
+        ok("上限 10 件・削除・メニュー表示、壊れた/形式違いのファイルと書き込めない保存先でも例外なし")
+    except Exception as ex:
+        ng("プリセットの管理と異常系", ex)
+    finally:
+        for k, v in patched.items():
+            setattr(QMessageBox, k, v)
+        ui_main.QInputDialog, ui_main.QMenu, sp._ask_preset_mode = orig_input, orig_menu, orig_ask
+        del sp._ask_preset_done   # インスタンスに差し込んだ差し替えを外す
+        sp._preset_path = path
+        state.current_date = datetime.date.today().isoformat()
+        state.load()
+        state.nodes_modified = state.schedule_modified = False
+        win.refresh()
+
+
+def test_slot_resize(win, state):
+    """日次スケジュール: 予定の下端をドラッグして時間を伸縮する"""
+    print("\n[Resize] 予定の下端ドラッグテスト")
+    import logic as LG
+    from PySide6.QtCore import Qt, QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    from db import create_initial_node, daily_sch_idx
+    me, other = state.user, "tanaka@email.com"
+    sp = win.schedule_panel
+    table, vp = sp.schedule_table, sp.schedule_table.viewport()
+    win._on_member_changed(me)
+    day = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+    pj = create_initial_node(me, "project1", "伸縮PJ", "0", 96)
+    task = create_initial_node(me, "task", "伸縮Task", pj.name, 1)
+    ta = create_initial_node(me, "ticket", "予定A", task.name, 1)
+    tb = create_initial_node(me, "ticket", "予定B", task.name, 2)
+    for n in (pj, task, ta, tb):
+        state.df_nodes.loc[n.name] = n
+    a, b = ta.name, tb.name
+    state.current_date = day
+    win.show()
+    win.refresh()
+    QApplication.processEvents()
+    table.scrollToItem(table.item(40, 1), table.ScrollHint.PositionAtTop)
+    QApplication.processEvents()
+    sp._update_schedule_slots([40, 41, 42], a)   # 10:00〜10:45
+    sp._update_schedule_slots([46], b)           # 11:30〜11:45
+    slots = lambda: LG.day_slots(state.df_daily, daily_sch_idx(day, me))
+    rows_of = lambda t: sorted(DAILY_COLS.index(c) for c, v in slots().items() if v == t)
+    from db import DAILY_TIME_COLS as DAILY_COLS
+    top = lambda r: table.rowViewportPosition(r)
+    bottom = lambda r: top(r) + table.rowHeight(r) - 1   # 行の下端
+    middle = lambda r: top(r) + table.rowHeight(r) // 2
+
+    def send(kind, y, buttons=Qt.MouseButton.LeftButton):
+        btn = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseMove else Qt.MouseButton.LeftButton
+        pos = QPointF(60, y)
+        ev = QMouseEvent(kind, pos, vp.mapToGlobal(pos), btn, buttons, Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(vp, ev)
+
+    def drag(from_y, to_y):
+        send(QEvent.Type.MouseButtonPress, from_y)
+        send(QEvent.Type.MouseMove, to_y)
+        send(QEvent.Type.MouseButtonRelease, to_y)
+        QApplication.processEvents()
+
+    try:
+        assert sp._resize_handle_row(bottom(42)) == 42 and sp._resize_handle_row(top(43) + 1) == 42
+        assert sp._resize_handle_row(middle(41)) == -1 and sp._resize_handle_row(middle(44)) == -1
+        send(QEvent.Type.MouseMove, bottom(42), Qt.MouseButton.NoButton)
+        assert vp.cursor().shape() == Qt.CursorShape.SizeVerCursor, "下端でカーソルが変わらない"
+        send(QEvent.Type.MouseMove, middle(41), Qt.MouseButton.NoButton)
+        assert vp.cursor().shape() != Qt.CursorShape.SizeVerCursor
+        ok("予定の下端付近だけが「つかみ代」になり、カーソルが上下矢印に変わる")
+    except Exception as ex:
+        ng("つかみ代の判定", ex)
+
+    try:
+        h0 = float(state.df_nodes.loc[a, "actual_hours"])
+        state.nodes_modified = state.schedule_modified = False
+        drag(bottom(42), middle(44))                       # 10:45 → 11:15 まで伸ばす
+        assert rows_of(a) == [40, 41, 42, 43, 44], rows_of(a)
+        assert float(state.df_nodes.loc[a, "actual_hours"]) == h0 + 0.5 and state.schedule_modified
+        drag(bottom(44), middle(50))                       # 予定 B（11:30）の手前で止まる
+        assert rows_of(a) == [40, 41, 42, 43, 44, 45] and rows_of(b) == [46], (rows_of(a), rows_of(b))
+        drag(bottom(45), middle(41))                       # 上へドラッグで縮める
+        assert rows_of(a) == [40, 41] and rows_of(b) == [46], rows_of(a)
+        assert float(state.df_nodes.loc[a, "actual_hours"]) == h0 - 0.25
+        drag(bottom(41), middle(36))                       # 開始より上までドラッグしても 1 枠は残る
+        assert rows_of(a) == [40], rows_of(a)
+        assert not table.selectedIndexes() and sp._resize is None
+        ok("下へドラッグで伸ばす（次の予定の手前まで）・上へドラッグで縮める（最低 1 枠）・実績工数も連動")
+    except Exception as ex:
+        ng("ドラッグで伸縮", ex)
+
+    try:
+        # つかみ代でない場所のドラッグは通常の行選択のまま
+        send(QEvent.Type.MouseButtonPress, middle(50))
+        assert sp._resize is None
+        send(QEvent.Type.MouseButtonRelease, middle(50))
+        assert rows_of(a) == [40] and rows_of(b) == [46]
+        # 他人の担当になったチケット・削除済みのチケット・他メンバー表示中は伸縮できない
+        state.df_nodes.loc[b, "assigned_to"] = other
+        assert sp._resize_handle_row(bottom(46)) == -1
+        state.df_nodes.loc[b, "assigned_to"] = me
+        keep = state.df_nodes.loc[a].copy()
+        state.df_nodes = state.df_nodes.drop(index=a)
+        sp._rebuild_schedule()
+        assert sp._resize_handle_row(bottom(40)) == -1
+        drag(bottom(40), middle(43))
+        assert rows_of(a) == [40], "削除済みのチケットの予定が伸びた"
+        state.df_nodes.loc[a] = keep
+        # ドラッグ中にチケットが無くなっても例外にならない
+        sp._rebuild_schedule()
+        send(QEvent.Type.MouseButtonPress, bottom(40))
+        assert sp._resize is not None
+        state.df_nodes = state.df_nodes.drop(index=a)
+        send(QEvent.Type.MouseMove, middle(43))
+        send(QEvent.Type.MouseButtonRelease, middle(43))
+        assert sp._resize is None and rows_of(a) == [40]
+        state.df_nodes.loc[a] = keep
+        win._on_member_changed(other)
+        assert sp._resize_handle_row(bottom(40)) == -1
+        win._on_member_changed(me)
+        ok("つかみ代以外は通常の選択、担当外・削除済み・他メンバー表示中は伸縮不可、ドラッグ中の消失でも例外なし")
+    except Exception as ex:
+        ng("伸縮できない場合", ex)
+    finally:
+        sp._resize = None
+        state.current_date = datetime.date.today().isoformat()
+        state.load()
+        state.nodes_modified = state.schedule_modified = False
+        win.refresh()
+
+
 def main():
     print("=" * 55)
     print("  ヘッドレス GUI テスト (QT_QPA_PLATFORM=offscreen)")
@@ -3020,6 +3315,8 @@ def main():
             test_i3_dark_mode(win)
             test_stale_refs(win, state, version, tmpdir)
             test_import(win, state, tmpdir)
+            test_presets(win, state, tmpdir)
+            test_slot_resize(win, state)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")

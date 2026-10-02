@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (
     QTextEdit, QFormLayout, QScrollArea, QMessageBox, QHeaderView,
     QFrame, QStackedWidget, QSizePolicy, QToolBar, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QSpinBox, QCheckBox,
-    QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu,
+    QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu, QInputDialog,
+    QTableWidgetSelectionRange,
     QApplication, QStyle, QProgressBar, QGridLayout, QListWidget, QListWidgetItem,
 )
 from pathlib import Path
@@ -46,6 +47,9 @@ IDX_AIIMPORT = 7
 IDX_VERSION  = 8
 IDX_CONFIG   = 9
 IDX_TODAY    = 10
+
+# 日次スケジュールのプリセット（個人用・共有しない）。個人設定の user_config.ini と同じ場所に置く
+PRESET_FILE = Path(__file__).parent.parent / "schedule_presets.json"
 
 
 # ---------- 日次スケジュール用カスタムデリゲート ----------
@@ -276,10 +280,13 @@ class DailyScheduleWidget(QWidget):
     quick_add_requested = Signal(list)
     worklog_requested = Signal(str)   # 右クリックした枠のチケットに作業ログを追加
 
+    _RESIZE_GRIP = 4   # 予定の下端からこのピクセル以内を、ドラッグで伸縮する「つかみ代」とする
+
     def __init__(self, state):
         super().__init__()
         self.state = state
         self._selected_ticket: Optional[str] = None
+        self._preset_path = PRESET_FILE
 
         self.setMinimumWidth(200)
 
@@ -346,6 +353,11 @@ class DailyScheduleWidget(QWidget):
         self.free_btn.setStyleSheet(STYLE_BUTTON)
         self.free_btn.clicked.connect(self._on_free)
         btn_row.addWidget(self.free_btn)
+        self.preset_btn = QPushButton("プリセット")
+        self.preset_btn.setStyleSheet(STYLE_BUTTON)
+        self.preset_btn.setToolTip("1 日の予定をプリセットとして保存・呼び出します（自分の PC にだけ保存）")
+        self.preset_btn.clicked.connect(self._on_preset_menu)
+        btn_row.addWidget(self.preset_btn)
         self.wh_label = QLabel("─")
         self.wh_label.setStyleSheet(qss("font-size:7pt; color:@text_sub; padding-left:4px;"))
         btn_row.addWidget(self.wh_label, stretch=1)
@@ -380,6 +392,11 @@ class DailyScheduleWidget(QWidget):
         # 右クリックメニュー（最近使った + 階層カスケードで割り当て）
         self.schedule_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.schedule_table.customContextMenuRequested.connect(self._on_slot_context_menu)
+
+        # 予定の下端をドラッグして時間を伸縮する
+        self._resize: Optional[dict] = None
+        self.schedule_table.viewport().setMouseTracking(True)
+        self.schedule_table.viewport().installEventFilter(self)
 
         # 時刻ラベルを設定（全行フル表示、毎時にスタイルを付与）
         hour_font = QFont()
@@ -623,6 +640,251 @@ class DailyScheduleWidget(QWidget):
         ))
         self._update_schedule_slots(rows, "")
         self.schedule_table.clearSelection()  # 解除後は選択をクリア
+
+    # ── 予定の下端をドラッグして時間を伸縮 ──
+
+    def _slot_ticket(self, row: int) -> str:
+        """指定行に入っているチケット IDX（空き・範囲外は空文字）"""
+        item = self.schedule_table.item(row, 1) if 0 <= row < 96 else None
+        v = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return v if v and v != "hour" else ""
+
+    def _resize_handle_row(self, y: int) -> int:
+        """y（表の表示領域内の座標）が予定の下端付近なら、その予定の最終行を返す（無ければ -1）。
+        対象は自分のスケジュールに入っている自分担当のチケットのみ"""
+        if self.state.current_member != self.state.user:
+            return -1
+        table = self.schedule_table
+        row = table.rowAt(y)
+        if row < 0:
+            return -1
+        top = table.rowViewportPosition(row)
+        near = []
+        if top + table.rowHeight(row) - y <= self._RESIZE_GRIP:
+            near.append(row)        # 行の下端付近
+        if y - top < self._RESIZE_GRIP // 2:
+            near.append(row - 1)    # 行の上端すぐ = 1 つ上の行の下端（空き枠の選択を邪魔しないよう狭め）
+        df = self.state.df_nodes
+        for r in near:
+            t = self._slot_ticket(r)
+            if (t and self._slot_ticket(r + 1) != t and t in df.index
+                    and str(df.loc[t, "node_type"]) == "ticket"
+                    and str(df.loc[t, "assigned_to"]) == self.state.user):
+                return r
+        return -1
+
+    def _resize_start(self, end_row: int) -> None:
+        ticket = self._slot_ticket(end_row)
+        first = end_row
+        while self._slot_ticket(first - 1) == ticket:
+            first -= 1
+        limit = end_row   # 次の予定の手前まで伸ばせる（他の予定は上書きしない）
+        while limit + 1 < 96 and not self._slot_ticket(limit + 1):
+            limit += 1
+        self._resize = {"ticket": ticket, "first": first, "end": end_row,
+                        "limit": limit, "new_end": end_row}
+
+    def _resize_drag_to(self, y: int) -> None:
+        """ドラッグ中: 伸縮後の範囲を選択表示でプレビューする"""
+        rs = self._resize
+        table = self.schedule_table
+        if rs["ticket"] not in self.state.df_nodes.index:
+            self._resize = None   # ドラッグ中に読み直しなどでチケットが無くなった
+            table.clearSelection()
+            return
+        row = table.rowAt(y)
+        if row < 0:
+            row = 95 if y > 0 else 0   # 表の下 / 上にはみ出した
+        rs["new_end"] = max(rs["first"], min(row, rs["limit"]))
+        table.clearSelection()
+        table.setRangeSelected(
+            QTableWidgetSelectionRange(rs["first"], 0, rs["new_end"], 1), True)
+        table.scrollToItem(table.item(rs["new_end"], 1))
+        n = rs["new_end"] + 1
+        title = self.state.df_nodes.loc[rs["ticket"], "title"]
+        self.info.set_info(f"{title}: 〜{n // 4:02d}:{(n % 4) * 15:02d} まで")
+
+    def _resize_finish(self) -> None:
+        rs, self._resize = self._resize, None
+        self.schedule_table.clearSelection()
+        self.schedule_table.viewport().unsetCursor()
+        if rs["new_end"] > rs["end"]:
+            self._assign_to_rows(list(range(rs["end"] + 1, rs["new_end"] + 1)), rs["ticket"])
+        elif rs["new_end"] < rs["end"]:
+            self._update_schedule_slots(list(range(rs["new_end"] + 1, rs["end"] + 1)), "")
+
+    def eventFilter(self, obj, event) -> bool:
+        vp = self.schedule_table.viewport()
+        if obj is vp:
+            et = event.type()
+            if et == QEvent.Type.MouseMove:
+                y = int(event.position().y())
+                if self._resize is not None:
+                    self._resize_drag_to(y)
+                    return True
+                if self._resize_handle_row(y) >= 0:
+                    vp.setCursor(Qt.CursorShape.SizeVerCursor)
+                else:
+                    vp.unsetCursor()
+            elif (et == QEvent.Type.MouseButtonPress
+                  and event.button() == Qt.MouseButton.LeftButton):
+                row = self._resize_handle_row(int(event.position().y()))
+                if row >= 0:
+                    self._resize_start(row)
+                    return True   # 行選択にはしない
+            elif et == QEvent.Type.MouseButtonRelease and self._resize is not None:
+                self._resize_finish()
+                return True
+        return super().eventFilter(obj, event)
+
+    # ── 日次スケジュールのプリセット ──
+
+    def _on_preset_menu(self) -> None:
+        """プリセットの呼び出し・保存・削除メニューを表示する"""
+        if self.state.current_member != self.state.user:
+            self.info.set_info("⚠ プリセットは自分のスケジュールでのみ使えます")
+            return
+        presets = LG.load_presets(self._preset_path)
+        menu = QMenu(self)
+        for i, p in enumerate(presets):
+            act = menu.addAction(f"▶ {p['title']}")
+            act.triggered.connect(lambda checked=False, i=i: self._on_apply_preset(i))
+        if not presets:
+            menu.addAction("（プリセットはまだありません）").setEnabled(False)
+        menu.addSeparator()
+        save_act = menu.addAction("💾 表示中の日の予定をプリセットに保存…")
+        save_act.triggered.connect(lambda checked=False: self._on_save_preset())
+        if presets:
+            sub = menu.addMenu("🗑 プリセットを削除")
+            for i, p in enumerate(presets):
+                act = sub.addAction(p["title"])
+                act.triggered.connect(lambda checked=False, i=i: self._on_delete_preset(i))
+        menu.exec(self.preset_btn.mapToGlobal(self.preset_btn.rect().bottomLeft()))
+
+    def _write_presets(self, presets: list) -> bool:
+        try:
+            LG.save_presets(self._preset_path, presets)
+            return True
+        except OSError as e:
+            QMessageBox.warning(self, "プリセット", f"プリセットを保存できませんでした:\n{e}")
+            return False
+
+    def _on_save_preset(self) -> None:
+        """表示中の日の予定（1 日分）を名前を付けて保存する"""
+        if self.state.current_member != self.state.user:
+            return
+        slots = LG.day_slots(self.state.df_daily,
+                             DB.daily_sch_idx(self.state.current_date, self.state.user))
+        if not slots:
+            QMessageBox.information(self, "プリセット", "表示中の日に予定がありません")
+            return
+        title, ok = QInputDialog.getText(self, "プリセットに保存", "プリセットの名前:")
+        title = (title or "").strip()
+        if not ok or not title:
+            return
+        presets = LG.load_presets(self._preset_path)
+        same = [i for i, p in enumerate(presets) if p["title"] == title]
+        if same:
+            ans = QMessageBox.question(self, "プリセット", f"「{title}」は既にあります。上書きしますか？")
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            presets[same[0]] = {"title": title, "slots": slots}
+        elif len(presets) >= LG.PRESET_MAX:
+            QMessageBox.warning(self, "プリセット",
+                                f"プリセットは {LG.PRESET_MAX} 件までです。不要なものを削除してから保存してください")
+            return
+        else:
+            presets.append({"title": title, "slots": slots})
+        if self._write_presets(presets):
+            self.info.set_info(f"プリセット「{title}」を保存しました")
+
+    def _on_delete_preset(self, i: int) -> None:
+        presets = LG.load_presets(self._preset_path)
+        if not 0 <= i < len(presets):
+            return
+        title = presets[i]["title"]
+        ans = QMessageBox.question(self, "プリセット", f"プリセット「{title}」を削除しますか？")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        del presets[i]
+        if self._write_presets(presets):
+            self.info.set_info(f"プリセット「{title}」を削除しました")
+
+    def _ask_preset_mode(self, title: str) -> Optional[bool]:
+        """今の予定の扱いを聞く: True=消して入れる / False=残して空きに入れる / None=やめる"""
+        box = QMessageBox(self)
+        box.setWindowTitle("プリセットの呼び出し")
+        box.setText(f"「{title}」を入れます。今入っている予定はどうしますか？")
+        clear_btn = box.addButton("消して入れる", QMessageBox.ButtonRole.DestructiveRole)
+        keep_btn = box.addButton("残して空きに入れる", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        return True if clicked is clear_btn else False if clicked is keep_btn else None
+
+    def _ask_preset_done(self, titles: list) -> Optional[bool]:
+        """完了済みチケットの扱いを聞く: True=入れる / False=プリセットから消して入れる / None=やめる"""
+        box = QMessageBox(self)
+        box.setWindowTitle("プリセットの呼び出し")
+        box.setText("完了済みのチケットが含まれています。どうしますか？\n\n"
+                    + "\n".join(f"・{t}" for t in titles[:10])
+                    + ("\n…" if len(titles) > 10 else ""))
+        put_btn = box.addButton("入れる", QMessageBox.ButtonRole.AcceptRole)
+        drop_btn = box.addButton("プリセットから消して入れる", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(put_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        return True if clicked is put_btn else False if clicked is drop_btn else None
+
+    def _on_apply_preset(self, i: int) -> None:
+        """プリセットを表示中の日に入れる。入れられないチケット（削除済みなど）の枠は飛ばす"""
+        if self.state.current_member != self.state.user:
+            return
+        presets = LG.load_presets(self._preset_path)
+        if not 0 <= i < len(presets):
+            return
+        preset = presets[i]
+        # 完了済みのチケットは、入れるか、プリセットから消すかを選ぶ
+        done = LG.preset_done_tickets(preset["slots"], self.state.df_nodes, self.state.user)
+        if done:
+            put = self._ask_preset_done([str(self.state.df_nodes.loc[t, "title"]) for t in done])
+            if put is None:
+                return
+            if not put:
+                preset["slots"] = {c: t for c, t in preset["slots"].items() if t not in done}
+                if not preset["slots"]:
+                    del presets[i]   # 完了済みだけのプリセットは空になるので削除する
+                if not self._write_presets(presets):
+                    return
+                if not preset["slots"]:
+                    self.info.set_info(f"プリセット「{preset['title']}」は完了済みのチケットだけだったため削除しました")
+                    return
+        existing = LG.day_slots(self.state.df_daily,
+                                DB.daily_sch_idx(self.state.current_date, self.state.user))
+        clear = False
+        if existing:
+            clear = self._ask_preset_mode(preset["title"])
+            if clear is None:
+                return
+        plan = LG.plan_preset(preset["slots"], self.state.df_nodes, self.state.user,
+                              existing, keep_existing=not clear, allow_done=True)
+        skipped = "、".join(f"{k} {n} 枠" for k, n in plan["skipped"].items())
+        if not plan["assign"]:
+            # 入れられる枠が無いときは、今の予定も消さない
+            QMessageBox.information(
+                self, "プリセット",
+                f"「{preset['title']}」に入れられる予定がありませんでした（{skipped}）")
+            return
+        if clear:
+            self._update_schedule_slots(
+                [r for r, c in enumerate(DB.DAILY_TIME_COLS) if c in existing], "")
+        for t_idx, rows in plan["assign"].items():
+            self._update_schedule_slots(rows, t_idx)
+        n = sum(len(r) for r in plan["assign"].values())
+        self.info.set_info(f"プリセット「{preset['title']}」を入れました（{n} 枠）"
+                           + (f" ／ 飛ばした枠: {skipped}" if skipped else ""))
 
     def refresh(self) -> None:
         """スケジュール表示を更新する"""
