@@ -22,3 +22,4 @@ claude.md
 hook.md
 src/db/schedule.sqlite
 user_config.ini
+schedule_presets.json

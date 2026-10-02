@@ -4,6 +4,7 @@ logic.py - スケジューリング・テキストパーサー・検索・エク
 import datetime
 import calendar
 import csv
+import json
 import math
 import os
 import re
@@ -2373,3 +2374,88 @@ def now_and_next(df_daily: pd.DataFrame, df_nodes: pd.DataFrame, user: str,
         h, m = (24, 0) if cur["to"] == "24:00" else map(int, cur["to"].split(":"))
         left = h * 60 + m - (now.hour * 60 + now.minute)
     return {"now": cur, "left_min": left, "next": nxt}
+
+
+# ============================================================
+# 日次スケジュールのプリセット（個人用・ローカルの JSON に保存）
+# ============================================================
+
+PRESET_MAX = 10   # 保存できるプリセットの上限
+
+
+def load_presets(path) -> List[dict]:
+    """
+    プリセットを読み込む: [{"title": str, "slots": {列名(C0900 など): チケット IDX}}, ...]
+    ファイルが無い・壊れている・手で書き換えて形式が違う場合も例外にせず、読める分だけ返す。
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    items = data.get("presets") if isinstance(data, dict) else None
+    out: List[dict] = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict) or not isinstance(it.get("slots"), dict):
+            continue
+        title = str(it.get("title") or "").strip()
+        slots = {c: v for c, v in it["slots"].items()
+                 if c in DAILY_TIME_COLS and isinstance(v, str) and v}
+        if title and slots:
+            out.append({"title": title, "slots": slots})
+    return out[:PRESET_MAX]
+
+
+def save_presets(path, presets: List[dict]) -> None:
+    """プリセットを JSON で保存する（書き込めない場合は OSError を送出）"""
+    Path(path).write_text(
+        json.dumps({"presets": presets}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def day_slots(df_daily: pd.DataFrame, sch_idx: str) -> dict:
+    """指定日の予定を {列名: チケット IDX} で返す（空き枠は含めない）"""
+    if df_daily.empty or sch_idx not in df_daily.index:
+        return {}
+    row = df_daily.loc[sch_idx]
+    out: dict = {}
+    for c in DAILY_TIME_COLS:
+        v = row[c] if c in row.index else ""
+        if v is None or v != v:   # None / NaN
+            continue
+        v = str(v)
+        if v and v not in ("nan", "None"):
+            out[c] = v
+    return out
+
+
+def plan_preset(slots: dict, df_nodes: pd.DataFrame, user: str,
+                existing: dict, keep_existing: bool) -> dict:
+    """
+    プリセットを当てはめる内容を決める（データは変更しない）。
+      existing: その日に今入っている予定 {列名: IDX}
+      keep_existing: True なら今の予定を残し、空き枠にだけ入れる
+    割り当てられるのは自分担当の todo / regularly のチケットのみ（右クリックの割り当てと同じ）。
+    戻り値:
+      assign  : {チケット IDX: [行番号, ...]}
+      skipped : {理由: 枠数}（削除済み・担当でない・完了/キャンセル済み・予定あり）
+    """
+    assign: dict = {}
+    skipped: dict = {}
+
+    def _skip(reason: str) -> None:
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    for row, col in enumerate(DAILY_TIME_COLS):
+        t = slots.get(col)
+        if not t:
+            continue
+        if t not in df_nodes.index or str(df_nodes.loc[t, "node_type"]) != "ticket":
+            _skip("削除済み")
+        elif str(df_nodes.loc[t, "assigned_to"]) != user:
+            _skip("自分の担当でない")
+        elif str(df_nodes.loc[t, "status"]) not in _OPEN_STATUSES:
+            _skip("完了・キャンセル済み")
+        elif keep_existing and existing.get(col):
+            _skip("予定あり")
+        else:
+            assign.setdefault(t, []).append(row)
+    return {"assign": assign, "skipped": skipped}

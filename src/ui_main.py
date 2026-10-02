@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QTextEdit, QFormLayout, QScrollArea, QMessageBox, QHeaderView,
     QFrame, QStackedWidget, QSizePolicy, QToolBar, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QSpinBox, QCheckBox,
-    QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu,
+    QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu, QInputDialog,
     QApplication, QStyle, QProgressBar, QGridLayout, QListWidget, QListWidgetItem,
 )
 from pathlib import Path
@@ -46,6 +46,9 @@ IDX_AIIMPORT = 7
 IDX_VERSION  = 8
 IDX_CONFIG   = 9
 IDX_TODAY    = 10
+
+# 日次スケジュールのプリセット（個人用・共有しない）。個人設定の user_config.ini と同じ場所に置く
+PRESET_FILE = Path(__file__).parent.parent / "schedule_presets.json"
 
 
 # ---------- 日次スケジュール用カスタムデリゲート ----------
@@ -280,6 +283,7 @@ class DailyScheduleWidget(QWidget):
         super().__init__()
         self.state = state
         self._selected_ticket: Optional[str] = None
+        self._preset_path = PRESET_FILE
 
         self.setMinimumWidth(200)
 
@@ -346,6 +350,11 @@ class DailyScheduleWidget(QWidget):
         self.free_btn.setStyleSheet(STYLE_BUTTON)
         self.free_btn.clicked.connect(self._on_free)
         btn_row.addWidget(self.free_btn)
+        self.preset_btn = QPushButton("プリセット")
+        self.preset_btn.setStyleSheet(STYLE_BUTTON)
+        self.preset_btn.setToolTip("1 日の予定をプリセットとして保存・呼び出します（自分の PC にだけ保存）")
+        self.preset_btn.clicked.connect(self._on_preset_menu)
+        btn_row.addWidget(self.preset_btn)
         self.wh_label = QLabel("─")
         self.wh_label.setStyleSheet(qss("font-size:7pt; color:@text_sub; padding-left:4px;"))
         btn_row.addWidget(self.wh_label, stretch=1)
@@ -623,6 +632,125 @@ class DailyScheduleWidget(QWidget):
         ))
         self._update_schedule_slots(rows, "")
         self.schedule_table.clearSelection()  # 解除後は選択をクリア
+
+    # ── 日次スケジュールのプリセット ──
+
+    def _on_preset_menu(self) -> None:
+        """プリセットの呼び出し・保存・削除メニューを表示する"""
+        if self.state.current_member != self.state.user:
+            self.info.set_info("⚠ プリセットは自分のスケジュールでのみ使えます")
+            return
+        presets = LG.load_presets(self._preset_path)
+        menu = QMenu(self)
+        for i, p in enumerate(presets):
+            act = menu.addAction(f"▶ {p['title']}")
+            act.triggered.connect(lambda checked=False, i=i: self._on_apply_preset(i))
+        if not presets:
+            menu.addAction("（プリセットはまだありません）").setEnabled(False)
+        menu.addSeparator()
+        save_act = menu.addAction("💾 表示中の日の予定をプリセットに保存…")
+        save_act.triggered.connect(lambda checked=False: self._on_save_preset())
+        if presets:
+            sub = menu.addMenu("🗑 プリセットを削除")
+            for i, p in enumerate(presets):
+                act = sub.addAction(p["title"])
+                act.triggered.connect(lambda checked=False, i=i: self._on_delete_preset(i))
+        menu.exec(self.preset_btn.mapToGlobal(self.preset_btn.rect().bottomLeft()))
+
+    def _write_presets(self, presets: list) -> bool:
+        try:
+            LG.save_presets(self._preset_path, presets)
+            return True
+        except OSError as e:
+            QMessageBox.warning(self, "プリセット", f"プリセットを保存できませんでした:\n{e}")
+            return False
+
+    def _on_save_preset(self) -> None:
+        """表示中の日の予定（1 日分）を名前を付けて保存する"""
+        if self.state.current_member != self.state.user:
+            return
+        slots = LG.day_slots(self.state.df_daily,
+                             DB.daily_sch_idx(self.state.current_date, self.state.user))
+        if not slots:
+            QMessageBox.information(self, "プリセット", "表示中の日に予定がありません")
+            return
+        title, ok = QInputDialog.getText(self, "プリセットに保存", "プリセットの名前:")
+        title = (title or "").strip()
+        if not ok or not title:
+            return
+        presets = LG.load_presets(self._preset_path)
+        same = [i for i, p in enumerate(presets) if p["title"] == title]
+        if same:
+            ans = QMessageBox.question(self, "プリセット", f"「{title}」は既にあります。上書きしますか？")
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            presets[same[0]] = {"title": title, "slots": slots}
+        elif len(presets) >= LG.PRESET_MAX:
+            QMessageBox.warning(self, "プリセット",
+                                f"プリセットは {LG.PRESET_MAX} 件までです。不要なものを削除してから保存してください")
+            return
+        else:
+            presets.append({"title": title, "slots": slots})
+        if self._write_presets(presets):
+            self.info.set_info(f"プリセット「{title}」を保存しました")
+
+    def _on_delete_preset(self, i: int) -> None:
+        presets = LG.load_presets(self._preset_path)
+        if not 0 <= i < len(presets):
+            return
+        title = presets[i]["title"]
+        ans = QMessageBox.question(self, "プリセット", f"プリセット「{title}」を削除しますか？")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        del presets[i]
+        if self._write_presets(presets):
+            self.info.set_info(f"プリセット「{title}」を削除しました")
+
+    def _ask_preset_mode(self, title: str) -> Optional[bool]:
+        """今の予定の扱いを聞く: True=消して入れる / False=残して空きに入れる / None=やめる"""
+        box = QMessageBox(self)
+        box.setWindowTitle("プリセットの呼び出し")
+        box.setText(f"「{title}」を入れます。今入っている予定はどうしますか？")
+        clear_btn = box.addButton("消して入れる", QMessageBox.ButtonRole.DestructiveRole)
+        keep_btn = box.addButton("残して空きに入れる", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(keep_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        return True if clicked is clear_btn else False if clicked is keep_btn else None
+
+    def _on_apply_preset(self, i: int) -> None:
+        """プリセットを表示中の日に入れる。入れられないチケット（削除済みなど）の枠は飛ばす"""
+        if self.state.current_member != self.state.user:
+            return
+        presets = LG.load_presets(self._preset_path)
+        if not 0 <= i < len(presets):
+            return
+        preset = presets[i]
+        existing = LG.day_slots(self.state.df_daily,
+                                DB.daily_sch_idx(self.state.current_date, self.state.user))
+        clear = False
+        if existing:
+            clear = self._ask_preset_mode(preset["title"])
+            if clear is None:
+                return
+        plan = LG.plan_preset(preset["slots"], self.state.df_nodes, self.state.user,
+                              existing, keep_existing=not clear)
+        skipped = "、".join(f"{k} {n} 枠" for k, n in plan["skipped"].items())
+        if not plan["assign"]:
+            # 入れられる枠が無いときは、今の予定も消さない
+            QMessageBox.information(
+                self, "プリセット",
+                f"「{preset['title']}」に入れられる予定がありませんでした（{skipped}）")
+            return
+        if clear:
+            self._update_schedule_slots(
+                [r for r, c in enumerate(DB.DAILY_TIME_COLS) if c in existing], "")
+        for t_idx, rows in plan["assign"].items():
+            self._update_schedule_slots(rows, t_idx)
+        n = sum(len(r) for r in plan["assign"].values())
+        self.info.set_info(f"プリセット「{preset['title']}」を入れました（{n} 枠）"
+                           + (f" ／ 飛ばした枠: {skipped}" if skipped else ""))
 
     def refresh(self) -> None:
         """スケジュール表示を更新する"""
