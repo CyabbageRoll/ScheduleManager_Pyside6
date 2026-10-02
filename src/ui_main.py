@@ -719,6 +719,21 @@ class DailyScheduleWidget(QWidget):
         clicked = box.clickedButton()
         return True if clicked is clear_btn else False if clicked is keep_btn else None
 
+    def _ask_preset_done(self, titles: list) -> Optional[bool]:
+        """完了済みチケットの扱いを聞く: True=入れる / False=プリセットから消して入れる / None=やめる"""
+        box = QMessageBox(self)
+        box.setWindowTitle("プリセットの呼び出し")
+        box.setText("完了済みのチケットが含まれています。どうしますか？\n\n"
+                    + "\n".join(f"・{t}" for t in titles[:10])
+                    + ("\n…" if len(titles) > 10 else ""))
+        put_btn = box.addButton("入れる", QMessageBox.ButtonRole.AcceptRole)
+        drop_btn = box.addButton("プリセットから消して入れる", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(put_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        return True if clicked is put_btn else False if clicked is drop_btn else None
+
     def _on_apply_preset(self, i: int) -> None:
         """プリセットを表示中の日に入れる。入れられないチケット（削除済みなど）の枠は飛ばす"""
         if self.state.current_member != self.state.user:
@@ -727,6 +742,21 @@ class DailyScheduleWidget(QWidget):
         if not 0 <= i < len(presets):
             return
         preset = presets[i]
+        # 完了済みのチケットは、入れるか、プリセットから消すかを選ぶ
+        done = LG.preset_done_tickets(preset["slots"], self.state.df_nodes, self.state.user)
+        if done:
+            put = self._ask_preset_done([str(self.state.df_nodes.loc[t, "title"]) for t in done])
+            if put is None:
+                return
+            if not put:
+                preset["slots"] = {c: t for c, t in preset["slots"].items() if t not in done}
+                if not preset["slots"]:
+                    del presets[i]   # 完了済みだけのプリセットは空になるので削除する
+                if not self._write_presets(presets):
+                    return
+                if not preset["slots"]:
+                    self.info.set_info(f"プリセット「{preset['title']}」は完了済みのチケットだけだったため削除しました")
+                    return
         existing = LG.day_slots(self.state.df_daily,
                                 DB.daily_sch_idx(self.state.current_date, self.state.user))
         clear = False
@@ -735,7 +765,7 @@ class DailyScheduleWidget(QWidget):
             if clear is None:
                 return
         plan = LG.plan_preset(preset["slots"], self.state.df_nodes, self.state.user,
-                              existing, keep_existing=not clear)
+                              existing, keep_existing=not clear, allow_done=True)
         skipped = "、".join(f"{k} {n} 枠" for k, n in plan["skipped"].items())
         if not plan["assign"]:
             # 入れられる枠が無いときは、今の予定も消さない

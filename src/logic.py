@@ -2427,16 +2427,30 @@ def day_slots(df_daily: pd.DataFrame, sch_idx: str) -> dict:
     return out
 
 
+def preset_done_tickets(slots: dict, df_nodes: pd.DataFrame, user: str) -> List[str]:
+    """プリセット内の、自分担当で完了（done）になっているチケットの IDX（枠の順・重複なし）"""
+    out: List[str] = []
+    for col in DAILY_TIME_COLS:
+        t = slots.get(col)
+        if (t and t not in out and t in df_nodes.index
+                and str(df_nodes.loc[t, "node_type"]) == "ticket"
+                and str(df_nodes.loc[t, "assigned_to"]) == user
+                and str(df_nodes.loc[t, "status"]) == "done"):
+            out.append(t)
+    return out
+
+
 def plan_preset(slots: dict, df_nodes: pd.DataFrame, user: str,
-                existing: dict, keep_existing: bool) -> dict:
+                existing: dict, keep_existing: bool, allow_done: bool = False) -> dict:
     """
     プリセットを当てはめる内容を決める（データは変更しない）。
       existing: その日に今入っている予定 {列名: IDX}
       keep_existing: True なら今の予定を残し、空き枠にだけ入れる
-    割り当てられるのは自分担当の todo / regularly のチケットのみ（右クリックの割り当てと同じ）。
+    割り当てられるのは自分担当の todo / regularly のチケット（右クリックの割り当てと同じ）。
+    allow_done が True なら完了（done）のチケットも入れる。
     戻り値:
       assign  : {チケット IDX: [行番号, ...]}
-      skipped : {理由: 枠数}（削除済み・担当でない・完了/キャンセル済み・予定あり）
+      skipped : {理由: 枠数}（削除済み・担当でない・完了済み・キャンセル済み・予定あり）
     """
     assign: dict = {}
     skipped: dict = {}
@@ -2452,8 +2466,10 @@ def plan_preset(slots: dict, df_nodes: pd.DataFrame, user: str,
             _skip("削除済み")
         elif str(df_nodes.loc[t, "assigned_to"]) != user:
             _skip("自分の担当でない")
-        elif str(df_nodes.loc[t, "status"]) not in _OPEN_STATUSES:
-            _skip("完了・キャンセル済み")
+        elif str(df_nodes.loc[t, "status"]) == "done" and not allow_done:
+            _skip("完了済み")
+        elif str(df_nodes.loc[t, "status"]) not in _OPEN_STATUSES + ("done",):
+            _skip("キャンセル済み")
         elif keep_existing and existing.get(col):
             _skip("予定あり")
         else:

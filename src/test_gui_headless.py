@@ -3036,14 +3036,20 @@ def test_presets(win, state, tmpdir):
         sp._update_schedule_slots([52], a)
         hours_a = float(state.df_nodes.loc[a, "actual_hours"])
         sp._ask_preset_mode = lambda title: False
+        asked = []
+        sp._ask_preset_done = lambda titles: (asked.append(titles), None)[1]   # キャンセル
+        sp._on_apply_preset(0)
+        assert asked == [["完了する"]] and slots_of(d2) == {"C0915": a, "C1300": a}, (asked, slots_of(d2))
+        sp._ask_preset_done = lambda titles: True    # 完了済みも入れる
         state.nodes_modified = state.schedule_modified = False
         sp._on_apply_preset(0)
-        assert slots_of(d2) == {"C0900": a, "C0915": a, "C0930": b, "C1300": a}, slots_of(d2)
+        assert slots_of(d2) == {"C0900": a, "C0915": a, "C0930": b, "C1030": e, "C1300": a}, slots_of(d2)
+        assert "C1030" in LG.load_presets(path)[0]["slots"], "「入れる」でプリセットが変わった"
         assert float(state.df_nodes.loc[a, "actual_hours"]) == hours_a + 0.25, "実績工数が合わない"
         assert state.schedule_modified and state.nodes_modified
         msg = sp.info.text()
-        assert all(w in msg for w in ("削除済み 1 枠", "自分の担当でない 1 枠", "完了・キャンセル済み 1 枠", "予定あり 1 枠")), msg
-        ok("今の予定を残して空き枠にだけ入れ、削除済み・担当でない・完了済みの枠は飛ばして知らせる")
+        assert all(w in msg for w in ("削除済み 1 枠", "自分の担当でない 1 枠", "予定あり 1 枠")) and "完了" not in msg, msg
+        ok("今の予定を残して空き枠にだけ入れ、削除済み・担当でない枠は飛ばして知らせる。完了済みは選んで入れられる")
 
         # 消して入れる: 13:00 の予定は消え、プリセットの入れられる枠だけ入る
         state.current_date = d3
@@ -3051,8 +3057,12 @@ def test_presets(win, state, tmpdir):
         sp._update_schedule_slots([37], a)
         sp._update_schedule_slots([52], a)
         sp._ask_preset_mode = lambda title: True
+        sp._ask_preset_done = lambda titles: False   # プリセットから消して入れる
         sp._on_apply_preset(0)
         assert slots_of(d3) == {"C0900": a, "C0915": b, "C0930": b}, slots_of(d3)
+        saved = LG.load_presets(path)[0]["slots"]
+        assert "C1030" not in saved and saved["C1000"] == c, "完了済みの枠だけがプリセットから消えていない"
+        sp._ask_preset_done = lambda titles: (_ for _ in ()).throw(AssertionError("消した後も完了の確認が出た"))
         # キャンセル・予定の無い日（確認なしで入る）
         sp._ask_preset_mode = lambda title: None
         sp._on_apply_preset(0)
@@ -3064,6 +3074,16 @@ def test_presets(win, state, tmpdir):
         assert slots_of(d4) == {"C0900": a, "C0915": b, "C0930": b}
         ok("消して入れる・キャンセル・予定の無い日は確認なしで入る")
 
+        # 完了済みだけのプリセットで「プリセットから消す」→ プリセットごと削除、キャンセル済みは飛ばす
+        LG.save_presets(path, [{"title": "完了だけ", "slots": {"C1100": e}}])
+        sp._ask_preset_done = lambda titles: False
+        before = slots_of(d4)
+        sp._on_apply_preset(0)
+        assert LG.load_presets(path) == [] and slots_of(d4) == before
+        state.df_nodes.loc[b, "status"] = "cancel"
+        pl = LG.plan_preset({"C0900": b, "C0915": e}, state.df_nodes, me, {}, False)
+        assert pl == {"assign": {}, "skipped": {"キャンセル済み": 1, "完了済み": 1}}, pl
+        state.df_nodes.loc[b, "status"] = "regularly"
         # 入れられる枠が 1 つも無いプリセットは、今の予定を消さない
         LG.save_presets(path, [{"title": "全滅", "slots": {"C0900": c, "C0915": "no_such_ticket"}}])
         sp._ask_preset_mode = lambda title: True
@@ -3114,6 +3134,7 @@ def test_presets(win, state, tmpdir):
         for k, v in patched.items():
             setattr(QMessageBox, k, v)
         ui_main.QInputDialog, ui_main.QMenu, sp._ask_preset_mode = orig_input, orig_menu, orig_ask
+        del sp._ask_preset_done   # インスタンスに差し込んだ差し替えを外す
         sp._preset_path = path
         state.current_date = datetime.date.today().isoformat()
         state.load()
