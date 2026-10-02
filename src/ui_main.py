@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QFrame, QStackedWidget, QSizePolicy, QToolBar, QDialog,
     QDialogButtonBox, QDoubleSpinBox, QSpinBox, QCheckBox,
     QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu, QInputDialog,
+    QTableWidgetSelectionRange,
     QApplication, QStyle, QProgressBar, QGridLayout, QListWidget, QListWidgetItem,
 )
 from pathlib import Path
@@ -279,6 +280,8 @@ class DailyScheduleWidget(QWidget):
     quick_add_requested = Signal(list)
     worklog_requested = Signal(str)   # 右クリックした枠のチケットに作業ログを追加
 
+    _RESIZE_GRIP = 4   # 予定の下端からこのピクセル以内を、ドラッグで伸縮する「つかみ代」とする
+
     def __init__(self, state):
         super().__init__()
         self.state = state
@@ -389,6 +392,11 @@ class DailyScheduleWidget(QWidget):
         # 右クリックメニュー（最近使った + 階層カスケードで割り当て）
         self.schedule_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.schedule_table.customContextMenuRequested.connect(self._on_slot_context_menu)
+
+        # 予定の下端をドラッグして時間を伸縮する
+        self._resize: Optional[dict] = None
+        self.schedule_table.viewport().setMouseTracking(True)
+        self.schedule_table.viewport().installEventFilter(self)
 
         # 時刻ラベルを設定（全行フル表示、毎時にスタイルを付与）
         hour_font = QFont()
@@ -632,6 +640,102 @@ class DailyScheduleWidget(QWidget):
         ))
         self._update_schedule_slots(rows, "")
         self.schedule_table.clearSelection()  # 解除後は選択をクリア
+
+    # ── 予定の下端をドラッグして時間を伸縮 ──
+
+    def _slot_ticket(self, row: int) -> str:
+        """指定行に入っているチケット IDX（空き・範囲外は空文字）"""
+        item = self.schedule_table.item(row, 1) if 0 <= row < 96 else None
+        v = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return v if v and v != "hour" else ""
+
+    def _resize_handle_row(self, y: int) -> int:
+        """y（表の表示領域内の座標）が予定の下端付近なら、その予定の最終行を返す（無ければ -1）。
+        対象は自分のスケジュールに入っている自分担当のチケットのみ"""
+        if self.state.current_member != self.state.user:
+            return -1
+        table = self.schedule_table
+        row = table.rowAt(y)
+        if row < 0:
+            return -1
+        top = table.rowViewportPosition(row)
+        near = []
+        if top + table.rowHeight(row) - y <= self._RESIZE_GRIP:
+            near.append(row)        # 行の下端付近
+        if y - top < self._RESIZE_GRIP // 2:
+            near.append(row - 1)    # 行の上端すぐ = 1 つ上の行の下端（空き枠の選択を邪魔しないよう狭め）
+        df = self.state.df_nodes
+        for r in near:
+            t = self._slot_ticket(r)
+            if (t and self._slot_ticket(r + 1) != t and t in df.index
+                    and str(df.loc[t, "node_type"]) == "ticket"
+                    and str(df.loc[t, "assigned_to"]) == self.state.user):
+                return r
+        return -1
+
+    def _resize_start(self, end_row: int) -> None:
+        ticket = self._slot_ticket(end_row)
+        first = end_row
+        while self._slot_ticket(first - 1) == ticket:
+            first -= 1
+        limit = end_row   # 次の予定の手前まで伸ばせる（他の予定は上書きしない）
+        while limit + 1 < 96 and not self._slot_ticket(limit + 1):
+            limit += 1
+        self._resize = {"ticket": ticket, "first": first, "end": end_row,
+                        "limit": limit, "new_end": end_row}
+
+    def _resize_drag_to(self, y: int) -> None:
+        """ドラッグ中: 伸縮後の範囲を選択表示でプレビューする"""
+        rs = self._resize
+        table = self.schedule_table
+        if rs["ticket"] not in self.state.df_nodes.index:
+            self._resize = None   # ドラッグ中に読み直しなどでチケットが無くなった
+            table.clearSelection()
+            return
+        row = table.rowAt(y)
+        if row < 0:
+            row = 95 if y > 0 else 0   # 表の下 / 上にはみ出した
+        rs["new_end"] = max(rs["first"], min(row, rs["limit"]))
+        table.clearSelection()
+        table.setRangeSelected(
+            QTableWidgetSelectionRange(rs["first"], 0, rs["new_end"], 1), True)
+        table.scrollToItem(table.item(rs["new_end"], 1))
+        n = rs["new_end"] + 1
+        title = self.state.df_nodes.loc[rs["ticket"], "title"]
+        self.info.set_info(f"{title}: 〜{n // 4:02d}:{(n % 4) * 15:02d} まで")
+
+    def _resize_finish(self) -> None:
+        rs, self._resize = self._resize, None
+        self.schedule_table.clearSelection()
+        self.schedule_table.viewport().unsetCursor()
+        if rs["new_end"] > rs["end"]:
+            self._assign_to_rows(list(range(rs["end"] + 1, rs["new_end"] + 1)), rs["ticket"])
+        elif rs["new_end"] < rs["end"]:
+            self._update_schedule_slots(list(range(rs["new_end"] + 1, rs["end"] + 1)), "")
+
+    def eventFilter(self, obj, event) -> bool:
+        vp = self.schedule_table.viewport()
+        if obj is vp:
+            et = event.type()
+            if et == QEvent.Type.MouseMove:
+                y = int(event.position().y())
+                if self._resize is not None:
+                    self._resize_drag_to(y)
+                    return True
+                if self._resize_handle_row(y) >= 0:
+                    vp.setCursor(Qt.CursorShape.SizeVerCursor)
+                else:
+                    vp.unsetCursor()
+            elif (et == QEvent.Type.MouseButtonPress
+                  and event.button() == Qt.MouseButton.LeftButton):
+                row = self._resize_handle_row(int(event.position().y()))
+                if row >= 0:
+                    self._resize_start(row)
+                    return True   # 行選択にはしない
+            elif et == QEvent.Type.MouseButtonRelease and self._resize is not None:
+                self._resize_finish()
+                return True
+        return super().eventFilter(obj, event)
 
     # ── 日次スケジュールのプリセット ──
 

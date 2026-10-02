@@ -3142,6 +3142,122 @@ def test_presets(win, state, tmpdir):
         win.refresh()
 
 
+def test_slot_resize(win, state):
+    """日次スケジュール: 予定の下端をドラッグして時間を伸縮する"""
+    print("\n[Resize] 予定の下端ドラッグテスト")
+    import logic as LG
+    from PySide6.QtCore import Qt, QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    from db import create_initial_node, daily_sch_idx
+    me, other = state.user, "tanaka@email.com"
+    sp = win.schedule_panel
+    table, vp = sp.schedule_table, sp.schedule_table.viewport()
+    win._on_member_changed(me)
+    day = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+    pj = create_initial_node(me, "project1", "伸縮PJ", "0", 96)
+    task = create_initial_node(me, "task", "伸縮Task", pj.name, 1)
+    ta = create_initial_node(me, "ticket", "予定A", task.name, 1)
+    tb = create_initial_node(me, "ticket", "予定B", task.name, 2)
+    for n in (pj, task, ta, tb):
+        state.df_nodes.loc[n.name] = n
+    a, b = ta.name, tb.name
+    state.current_date = day
+    win.show()
+    win.refresh()
+    QApplication.processEvents()
+    table.scrollToItem(table.item(40, 1), table.ScrollHint.PositionAtTop)
+    QApplication.processEvents()
+    sp._update_schedule_slots([40, 41, 42], a)   # 10:00〜10:45
+    sp._update_schedule_slots([46], b)           # 11:30〜11:45
+    slots = lambda: LG.day_slots(state.df_daily, daily_sch_idx(day, me))
+    rows_of = lambda t: sorted(DAILY_COLS.index(c) for c, v in slots().items() if v == t)
+    from db import DAILY_TIME_COLS as DAILY_COLS
+    top = lambda r: table.rowViewportPosition(r)
+    bottom = lambda r: top(r) + table.rowHeight(r) - 1   # 行の下端
+    middle = lambda r: top(r) + table.rowHeight(r) // 2
+
+    def send(kind, y, buttons=Qt.MouseButton.LeftButton):
+        btn = Qt.MouseButton.NoButton if kind == QEvent.Type.MouseMove else Qt.MouseButton.LeftButton
+        pos = QPointF(60, y)
+        ev = QMouseEvent(kind, pos, vp.mapToGlobal(pos), btn, buttons, Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(vp, ev)
+
+    def drag(from_y, to_y):
+        send(QEvent.Type.MouseButtonPress, from_y)
+        send(QEvent.Type.MouseMove, to_y)
+        send(QEvent.Type.MouseButtonRelease, to_y)
+        QApplication.processEvents()
+
+    try:
+        assert sp._resize_handle_row(bottom(42)) == 42 and sp._resize_handle_row(top(43) + 1) == 42
+        assert sp._resize_handle_row(middle(41)) == -1 and sp._resize_handle_row(middle(44)) == -1
+        send(QEvent.Type.MouseMove, bottom(42), Qt.MouseButton.NoButton)
+        assert vp.cursor().shape() == Qt.CursorShape.SizeVerCursor, "下端でカーソルが変わらない"
+        send(QEvent.Type.MouseMove, middle(41), Qt.MouseButton.NoButton)
+        assert vp.cursor().shape() != Qt.CursorShape.SizeVerCursor
+        ok("予定の下端付近だけが「つかみ代」になり、カーソルが上下矢印に変わる")
+    except Exception as ex:
+        ng("つかみ代の判定", ex)
+
+    try:
+        h0 = float(state.df_nodes.loc[a, "actual_hours"])
+        state.nodes_modified = state.schedule_modified = False
+        drag(bottom(42), middle(44))                       # 10:45 → 11:15 まで伸ばす
+        assert rows_of(a) == [40, 41, 42, 43, 44], rows_of(a)
+        assert float(state.df_nodes.loc[a, "actual_hours"]) == h0 + 0.5 and state.schedule_modified
+        drag(bottom(44), middle(50))                       # 予定 B（11:30）の手前で止まる
+        assert rows_of(a) == [40, 41, 42, 43, 44, 45] and rows_of(b) == [46], (rows_of(a), rows_of(b))
+        drag(bottom(45), middle(41))                       # 上へドラッグで縮める
+        assert rows_of(a) == [40, 41] and rows_of(b) == [46], rows_of(a)
+        assert float(state.df_nodes.loc[a, "actual_hours"]) == h0 - 0.25
+        drag(bottom(41), middle(36))                       # 開始より上までドラッグしても 1 枠は残る
+        assert rows_of(a) == [40], rows_of(a)
+        assert not table.selectedIndexes() and sp._resize is None
+        ok("下へドラッグで伸ばす（次の予定の手前まで）・上へドラッグで縮める（最低 1 枠）・実績工数も連動")
+    except Exception as ex:
+        ng("ドラッグで伸縮", ex)
+
+    try:
+        # つかみ代でない場所のドラッグは通常の行選択のまま
+        send(QEvent.Type.MouseButtonPress, middle(50))
+        assert sp._resize is None
+        send(QEvent.Type.MouseButtonRelease, middle(50))
+        assert rows_of(a) == [40] and rows_of(b) == [46]
+        # 他人の担当になったチケット・削除済みのチケット・他メンバー表示中は伸縮できない
+        state.df_nodes.loc[b, "assigned_to"] = other
+        assert sp._resize_handle_row(bottom(46)) == -1
+        state.df_nodes.loc[b, "assigned_to"] = me
+        keep = state.df_nodes.loc[a].copy()
+        state.df_nodes = state.df_nodes.drop(index=a)
+        sp._rebuild_schedule()
+        assert sp._resize_handle_row(bottom(40)) == -1
+        drag(bottom(40), middle(43))
+        assert rows_of(a) == [40], "削除済みのチケットの予定が伸びた"
+        state.df_nodes.loc[a] = keep
+        # ドラッグ中にチケットが無くなっても例外にならない
+        sp._rebuild_schedule()
+        send(QEvent.Type.MouseButtonPress, bottom(40))
+        assert sp._resize is not None
+        state.df_nodes = state.df_nodes.drop(index=a)
+        send(QEvent.Type.MouseMove, middle(43))
+        send(QEvent.Type.MouseButtonRelease, middle(43))
+        assert sp._resize is None and rows_of(a) == [40]
+        state.df_nodes.loc[a] = keep
+        win._on_member_changed(other)
+        assert sp._resize_handle_row(bottom(40)) == -1
+        win._on_member_changed(me)
+        ok("つかみ代以外は通常の選択、担当外・削除済み・他メンバー表示中は伸縮不可、ドラッグ中の消失でも例外なし")
+    except Exception as ex:
+        ng("伸縮できない場合", ex)
+    finally:
+        sp._resize = None
+        state.current_date = datetime.date.today().isoformat()
+        state.load()
+        state.nodes_modified = state.schedule_modified = False
+        win.refresh()
+
+
 def main():
     print("=" * 55)
     print("  ヘッドレス GUI テスト (QT_QPA_PLATFORM=offscreen)")
@@ -3200,6 +3316,7 @@ def main():
             test_stale_refs(win, state, version, tmpdir)
             test_import(win, state, tmpdir)
             test_presets(win, state, tmpdir)
+            test_slot_resize(win, state)
 
     print("\n" + "=" * 55)
     print(f"  結果: OK={PASS}  NG={FAIL}  合計={PASS+FAIL}")
