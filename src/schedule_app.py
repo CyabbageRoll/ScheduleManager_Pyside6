@@ -107,6 +107,15 @@ class AppConfig:
         }
 
 
+def _unquote_path(value: str) -> str:
+    """前後の空白と、パス全体を囲む引用符（"..." / '...'）を取り除く。
+    エクスプローラーの「パスのコピー」は引用符付きで貼り付けられるため"""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
 def load_config(path: Path = CONFIG_FILE) -> AppConfig:
     """
     config.ini と user_config.ini を読み込んで AppConfig を返す。
@@ -125,7 +134,8 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
 
     # [Database]
     if parser.has_section("Database"):
-        cfg.server_dir = parser.get("Database", "server_dir", fallback=cfg.server_dir)
+        cfg.server_dir = _unquote_path(
+            parser.get("Database", "server_dir", fallback=cfg.server_dir))
         cfg.db_timeout = parser.getint("Database", "db_timeout", fallback=cfg.db_timeout)
 
     # [User]
@@ -170,8 +180,8 @@ def load_config(path: Path = CONFIG_FILE) -> AppConfig:
 
     # [Report]
     if parser.has_section("Report"):
-        cfg.report_output_dir = parser.get("Report", "output_dir",
-                                           fallback=cfg.report_output_dir)
+        cfg.report_output_dir = _unquote_path(
+            parser.get("Report", "output_dir", fallback=cfg.report_output_dir))
 
     # [Pomodoro]
     if parser.has_section("Pomodoro"):

@@ -1965,10 +1965,14 @@ class MainWindow(QMainWindow):
 
     def _export_ai_context(self) -> str:
         """保存後に AI 用の作業ツリー・Inbox 一覧を <output_dir>/ai_context へ書き出す。
-        output_dir 未設定なら何もしない。失敗しても保存は成功扱いとし、警告文を返す"""
+        output_dir 未設定なら何もしない。output_dir のフォルダが無いときは作らない
+        （保存のたびに意図しない場所へフォルダを作らないため）。
+        失敗しても保存は成功扱いとし、警告文を返す"""
         out_dir = (self.state.config.report_output_dir or "").strip()
         if not out_dir:
             return ""
+        if not Path(out_dir).is_dir():
+            return f"（⚠ output_dir のフォルダが見つからないため AI 用ファイルは書き出していません: {out_dir}）"
         try:
             LG.export_ai_context(out_dir, self.state.df_nodes, self.state.user)
         except Exception as e:

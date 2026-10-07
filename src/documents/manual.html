@@ -968,7 +968,7 @@ parent: 移動先 Task の IDX / 仮ID</pre>
 </div>
 
 <h3>保存時の自動書き出し（AI 用の作業ツリー）</h3>
-<p><kbd>Ctrl+S</kbd> で保存すると、<code>[Report] output_dir</code> の下に次のファイルを毎回上書きで書き出します（<code>output_dir</code> 未設定なら何もしません）。
+<p><kbd>Ctrl+S</kbd> で保存すると、<code>[Report] output_dir</code> の下に次のファイルを毎回上書きで書き出します（<code>output_dir</code> 未設定なら何もしません。フォルダが存在しない場合は作らずにステータスバーへ警告を出します。パスは <code>"</code> で囲んでいても構いません）。
 自分で用意したプロンプトと一緒に AI へ渡すと、ボタン操作なしで最新の IDX を参照させられます。</p>
 <table>
   <tr><th>ファイル</th><th>内容</th></tr>
