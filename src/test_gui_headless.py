@@ -1916,15 +1916,39 @@ def test_ai_context(win, task_idx, ticket2_idx):
 
         state.config.report_output_dir = ""
         assert win._export_ai_context() == ""
-        blocker = Path(d) / "file"
-        blocker.write_text("x")
-        state.config.report_output_dir = str(blocker)
+        missing = Path(d) / "missing"
+        state.config.report_output_dir = str(missing)
+        assert "見つからない" in win._export_ai_context() and not missing.exists()
+        (Path(d) / "x" / LG.AI_CONTEXT_DIR).mkdir(parents=True)
+        (Path(d) / "x" / LG.AI_CONTEXT_DIR / "work_tree.md").mkdir()  # 書き込めない状態を作る
+        state.config.report_output_dir = str(Path(d) / "x")
         assert "失敗" in win._export_ai_context()
-        ok("output_dir 未設定は何もしない / 書き出し失敗は警告のみ")
+        ok("output_dir 未設定は何もしない / フォルダが無ければ作らず警告 / 書き出し失敗は警告のみ")
     except Exception as e:
         ng("保存時の AI 用ファイル書き出し", e)
     finally:
         state.config.report_output_dir = orig_dir
+
+
+def test_config_unquote(tmpdir):
+    """config のパス値: エクスプローラーの「パスのコピー」の引用符を取り除く"""
+    print("\n[CFG] config のパス値の引用符除去テスト")
+    import schedule_app
+    ini = Path(tmpdir) / "quoted_config.ini"
+    ini.write_text('[Database]\nserver_dir = "C:\\data\\db"\n'
+                   "[Report]\noutput_dir =  \"C:\\md files\\out\"  \n", encoding="utf-8")
+    orig_user = schedule_app.USER_CONFIG_FILE
+    schedule_app.USER_CONFIG_FILE = Path(tmpdir) / "no_user_config.ini"
+    try:
+        cfg = schedule_app.load_config(ini)
+        assert cfg.report_output_dir == "C:\\md files\\out", repr(cfg.report_output_dir)
+        assert cfg.server_dir == "C:\\data\\db", repr(cfg.server_dir)
+        assert schedule_app._unquote_path("'x'") == "x" and schedule_app._unquote_path('"x') == '"x'
+        ok("output_dir / server_dir の前後の引用符を取り除く")
+    except Exception as e:
+        ng("config の引用符除去", e)
+    finally:
+        schedule_app.USER_CONFIG_FILE = orig_user
 
 
 def test_ui_state(state, version, win, tmpdir):
@@ -3373,6 +3397,7 @@ def main():
         pj_idx, task_idx, ticket_idx, ticket2_idx = make_test_data(state)
 
         test_state_properties(state)
+        test_config_unquote(tmpdir)
 
         win = test_main_window(state, version)
         if win is None:
