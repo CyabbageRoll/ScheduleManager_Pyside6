@@ -1756,12 +1756,12 @@ def test_quick_add_inbox(win, task_idx, tmpdir):
                                           "start": None, "memo": "", "parent": DB.INBOX_PARENT})
         view = win.ai_import_view
         prompt = view._build_task_list()
-        assert "【Task未設定Ticket" in prompt and inbox_idx in prompt
+        assert "# Inbox" in prompt and inbox_idx in prompt
         text = (f"idx: {inbox_idx}\nparent_idx: {task_idx}\n---\n"
                 f"title: AI同名確認\nparent_idx: {task_idx}\n---\n"
                 f"idx: 999999_99zzzzzz\nparent_idx: {task_idx}\n---\n"
                 f"title: AI新規確認\nparent_idx: {task_idx}\n")
-        items, errors, skipped = view._parse_llm_response(text)
+        items, errors, skipped = LG.parse_ai_import(text, state.df_nodes, state.user)
         kinds = [(it["kind"], it.get("idx")) for it in items]
         assert not errors and len(skipped) == 1, (errors, skipped)
         assert kinds[0] == ("move", inbox_idx) and kinds[1] == ("move", extra.name) \
@@ -1820,6 +1820,111 @@ def test_quick_add_inbox(win, task_idx, tmpdir):
         ng("起動時の振り分け表示", e)
     state.nodes_modified = False
     state.schedule_modified = False
+
+
+def test_ai_context(win, task_idx, ticket2_idx):
+    """AI 連携: 作業ツリー・Inbox の書き出し（保存時）と Project1〜Ticket の取り込み"""
+    print("\n[AI] 作業ツリー書き出し / P1〜Ticket 取り込みテスト")
+    import logic as LG
+    import db as DB
+    from PySide6.QtWidgets import QMessageBox
+    state = win.state
+    view = win.ai_import_view
+
+    # 作業ツリー: 自分の未完了チケットは載り、他人・完了は載らない
+    try:
+        mine = DB.create_initial_node(state.user, "ticket", "AIツリー自分", task_idx)
+        done = DB.create_initial_node(state.user, "ticket", "AIツリー完了", task_idx)
+        done["status"] = "done"
+        for n in (mine, done):
+            state.df_nodes.loc[n.name] = n
+        md = LG.build_ai_tree_markdown(state.df_nodes, state.user)
+        assert f"[task] {task_idx} |" in md, md
+        assert f"[ticket] {mine.name} | AIツリー自分" in md, md
+        assert done.name not in md and ticket2_idx not in md, md
+        state.df_nodes = state.df_nodes.drop([mine.name, done.name])
+        ok("作業ツリー: 階層 + 自分の未完了チケットのみ")
+    except Exception as e:
+        ng("作業ツリーの Markdown", e)
+
+    # 書式エラー: 親子の組み合わせ違い・不明な type・不明な親・仮ID の重複
+    try:
+        cases = {
+            "type: task\ntitle: x\nparent: ROOT": "task の親は project4",
+            "type: epic\ntitle: x\nparent: ROOT": "type が不正",
+            "type: project2\ntitle: x\nparent: new9": "parent が見つかりません",
+            ("type: project1\ntitle: a\nparent: ROOT\nid: new1\n---\n"
+             "type: project1\ntitle: b\nparent: ROOT\nid: new1"): "id が重複",
+        }
+        for text, expect in cases.items():
+            _, errors, _ = LG.parse_ai_import(text, state.df_nodes, state.user)
+            assert errors and expect in errors[0], (text, errors)
+        ok("書式エラー: 親子違い・不明 type・不明 parent・仮ID 重複を検出")
+    except Exception as e:
+        ng("書式エラーの検出", e)
+
+    # 取り込み: ROOT から project1〜ticket を仮ID でつなげて作成 + Inbox を新規 Task へ移動
+    try:
+        inbox_t = win._create_quick_ticket({"title": "AI移動確認", "hours": 0, "deadline": None,
+                                            "start": None, "memo": "", "parent": DB.INBOX_PARENT})
+        text = ("```\ntype: project1\ntitle: AI-P1\nparent: ROOT\nid: new1\n---\n"
+                "type: project2\ntitle: AI-P2\nparent: new1\nid: new2\n---\n"
+                "type: project3\ntitle: AI-P3\nparent: new2\nid: new3\n---\n"
+                "type: project4\ntitle: AI-P4\nparent: new3\nid: new4\n---\n"
+                "type: task\ntitle: AI-Task\nparent: new4\nid: new5\nmemo: a: b\n---\n"
+                "type: ticket\ntitle: AI-Ticket\nparent: new5\ndeadline: 2026-12-01\n---\n"
+                f"move: {inbox_t.name}\nparent: new5\n```")
+        n_before = len(state.df_nodes)
+        view.text_edit.setPlainText(text)
+        orig_q = QMessageBox.question
+        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+        try:
+            view._on_import_tickets()
+        finally:
+            QMessageBox.question = orig_q
+        df = state.df_nodes
+        idx = {t: df.index[df["title"] == t][0] for t in
+               ("AI-P1", "AI-P2", "AI-P3", "AI-P4", "AI-Task", "AI-Ticket")}
+        assert df.loc[idx["AI-P1"], "parent_id"] == "0"
+        chain = ["AI-P1", "AI-P2", "AI-P3", "AI-P4", "AI-Task", "AI-Ticket"]
+        for parent, child in zip(chain, chain[1:]):
+            assert df.loc[idx[child], "parent_id"] == idx[parent], child
+            assert df.loc[idx[child], "node_type"] == DB.CHILD_TYPE[df.loc[idx[parent], "node_type"]]
+        assert df.loc[idx["AI-Task"], "memo"] == "a: b"
+        assert df.loc[idx["AI-Ticket"], "deadline"] == "2026-12-01"
+        assert df.loc[idx["AI-P2"], "color"] == df.loc[idx["AI-P1"], "color"], "親の色を引き継がない"
+        auto = df[df["parent_id"].isin([idx[t] for t in chain[:5]])
+                  & df["title"].isin(["詳細作成", "完了"])]
+        assert len(auto) == 10, f"自動チケット {len(auto)} 件"
+        assert len(df) == n_before + 6 + 10
+        assert df.loc[inbox_t.name, "parent_id"] == idx["AI-Task"], "Inbox が新規 Task へ移動しない"
+        ok("取り込み: ROOT〜Ticket を仮ID で作成・自動チケット付与・Inbox を新規 Task へ移動")
+    except Exception as e:
+        ng("P1〜Ticket の取り込み", e)
+
+    # 保存時の書き出し: output_dir/ai_context に work_tree.md / inbox.md
+    orig_dir = state.config.report_output_dir
+    try:
+        d = tempfile.mkdtemp()
+        state.config.report_output_dir = d
+        win._on_save()
+        folder = Path(d) / LG.AI_CONTEXT_DIR
+        tree = (folder / "work_tree.md").read_text(encoding="utf-8")
+        assert "AI-Ticket" in tree and "[project4]" in tree, tree
+        assert (folder / "inbox.md").exists()
+        ok("保存時に ai_context/work_tree.md・inbox.md を書き出す")
+
+        state.config.report_output_dir = ""
+        assert win._export_ai_context() == ""
+        blocker = Path(d) / "file"
+        blocker.write_text("x")
+        state.config.report_output_dir = str(blocker)
+        assert "失敗" in win._export_ai_context()
+        ok("output_dir 未設定は何もしない / 書き出し失敗は警告のみ")
+    except Exception as e:
+        ng("保存時の AI 用ファイル書き出し", e)
+    finally:
+        state.config.report_output_dir = orig_dir
 
 
 def test_ui_state(state, version, win, tmpdir):
@@ -3302,6 +3407,7 @@ def main():
             test_quick_add_same_task_name(win)
             test_save_load(state)
             test_ui_state(state, version, win, tmpdir)
+            test_ai_context(win, task_idx, ticket2_idx)
             test_theme()
             test_requests_0925(win)
             test_analysis_0925(win, pj_idx, task_idx, ticket_idx)

@@ -17,7 +17,7 @@ import pandas as pd
 from db import (
     NODE_TYPES, STATUS_LIST, DAILY_TIME_COLS,
     create_initial_node, generate_idx, build_auto_children, daily_sch_idx,
-    INBOX_PARENT,
+    INBOX_PARENT, CHILD_TYPE,
 )
 
 
@@ -2475,3 +2475,211 @@ def plan_preset(slots: dict, df_nodes: pd.DataFrame, user: str,
         else:
             assign.setdefault(t, []).append(row)
     return {"assign": assign, "skipped": skipped}
+
+
+# ---------- AI 連携（作業ツリーの書き出し・AI 返答の取り込み）----------
+
+AI_CONTEXT_DIR = "ai_context"   # output_dir 配下の書き出し先フォルダ
+AI_ROOT = "ROOT"                # AI 返答で project1 の親（最上位）を表す語
+# 種別 → 親に置ける種別（project1 は ROOT）
+_AI_PARENT_TYPE = {child: parent for parent, child in CHILD_TYPE.items()}
+# 旧書式のキー名 → 新書式のキー名
+_AI_KEY_ALIASES = {"parent_idx": "parent", "idx": "move"}
+
+
+def _one_line(v) -> str:
+    """改行を空白にして 1 行にする（None は空文字）"""
+    return re.sub(r"\s*\n\s*", " ", str(v or "")).strip()
+
+
+def build_ai_tree_markdown(df_nodes: pd.DataFrame, user: str,
+                           today: Optional[datetime.date] = None) -> str:
+    """
+    AI 用の作業ツリー（Project1〜Task の階層 + 各 Task にある自分の未完了チケット）を Markdown にする。
+    Project〜Task は削除済み以外すべて（他メンバー分も含む）。最上位から辿れない項目は含めない。
+    """
+    today = today or datetime.date.today()
+    lines = [f"# 作業ツリー（{today.isoformat()} 時点 / {user}）", "",
+             "- 書式: `[種別] IDX | タイトル | memo`（完了・キャンセル済みはタイトルの後ろに表示）",
+             "- Task の下の `[ticket]` は自分の未完了チケット（`IDX | タイトル | 期限 | memo`）", ""]
+    df = df_nodes[df_nodes["status"] != "deleted"] if not df_nodes.empty else df_nodes
+    children: dict = {}
+    for idx, row in df.sort_values("priority").iterrows():
+        children.setdefault(str(row["parent_id"]), []).append(str(idx))
+    state_label = {"done": "（完了）", "cancel": "（キャンセル）"}
+
+    def _walk(pid: str, depth: int) -> None:
+        for idx in children.get(pid, []):
+            row = df.loc[idx]
+            nt = str(row["node_type"])
+            indent = "  " * depth
+            if nt == "ticket":
+                # チケットは Task の直下にある自分の未完了分だけ
+                if (pid not in df.index or str(df.loc[pid, "node_type"]) != "task"
+                        or row["assigned_to"] != user
+                        or row["status"] in ("done", "cancel")):
+                    continue
+                dl = str(row.get("deadline") or "").strip()
+                parts = [idx, _one_line(row["title"])]
+                if dl:
+                    parts.append(f"期限 {dl}")
+                memo = _one_line(row.get("memo"))
+                if memo:
+                    parts.append(memo)
+                lines.append(f"{indent}- [ticket] " + " | ".join(parts))
+                continue
+            title = _one_line(row["title"]) + state_label.get(str(row["status"]), "")
+            memo = _one_line(row.get("memo"))
+            lines.append(f"{indent}- [{nt}] {idx} | {title}" + (f" | {memo}" if memo else ""))
+            _walk(idx, depth + 1)
+
+    _walk("0", 0)
+    if len(lines) == 5:
+        lines.append("（項目なし）")
+    return "\n".join(lines) + "\n"
+
+
+def build_ai_inbox_markdown(df_nodes: pd.DataFrame, user: str,
+                            today: Optional[datetime.date] = None) -> str:
+    """AI 用に、自分の Inbox（Task 未設定）チケットを Markdown にする"""
+    today = today or datetime.date.today()
+    lines = [f"# Inbox（Task 未設定のチケット / {today.isoformat()} 時点 / {user}）", "",
+             "- 書式: `IDX | タイトル | 見積 | 納期 | memo`", ""]
+    inbox = inbox_tickets(df_nodes, user)
+    for idx, row in inbox.iterrows():
+        est = float(row.get("estimated_hours") or 0)
+        dl = str(row.get("deadline") or "").strip() or "-"
+        lines.append(f"- {idx} | {_one_line(row['title'])} | {f'{est:g}h' if est else '-'} | "
+                     f"{dl} | {_one_line(row.get('memo'))}")
+    if inbox.empty:
+        lines.append("（なし）")
+    return "\n".join(lines) + "\n"
+
+
+def export_ai_context(out_dir, df_nodes: pd.DataFrame, user: str) -> Path:
+    """<out_dir>/ai_context/ に work_tree.md と inbox.md を上書き保存し、フォルダを返す"""
+    folder = Path(out_dir) / AI_CONTEXT_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "work_tree.md").write_text(build_ai_tree_markdown(df_nodes, user), encoding="utf-8")
+    (folder / "inbox.md").write_text(build_ai_inbox_markdown(df_nodes, user), encoding="utf-8")
+    return folder
+
+
+def parse_ai_import(text: str, df_nodes: pd.DataFrame, user: str) -> tuple:
+    """
+    AI の返答から取り込む項目を読み取る（DB には書かない）。
+
+    書式（項目ごとに `---` の行で区切る）:
+        type: project1〜project4 / task / ticket（省略時 ticket）
+        title: タイトル
+        parent: 親の IDX / 同じ返答内の仮ID / ROOT（project1 のとき）
+        id: 仮ID（この項目の下に新しい項目を作るときだけ）
+        deadline: YYYY-MM-DD（省略可） / memo: メモ（省略可）
+      Inbox の振り分け:
+        move: Inbox チケットの IDX
+        parent: 移動先 Task の IDX / 仮ID
+    旧書式（parent_idx: / idx:、$$$items ブロック）も読める。
+
+    戻り値: (items, errors, skipped)
+      items: 上から順。新規 {"kind": "new", "type", "title", "parent", "id", "deadline", "memo"}
+             （parent は既存 IDX・仮ID・"0"（最上位））/ 移動 {"kind": "move", "idx", "title", "parent"}
+      errors: 1 件でもあれば取り込まない / skipped: 取り込まない理由（エラーではない）
+    """
+    items: list = []
+    errors: list = []
+    skipped: list = []
+
+    text = re.sub(r"```\w*\n?", "", text)
+    match = re.search(r"\$\$\$items\s*(.*?)\$\$\$", text, re.DOTALL)
+    block = match.group(1).strip() if match else text.strip()
+    if not re.search(r"(?mi)^\s*(title|move|idx)\s*:", block):
+        errors.append("title: / move: が見つかりません。書式を確認してください")
+        return items, errors, skipped
+
+    inbox = inbox_tickets(df_nodes, user)
+    used_inbox: set = set()  # 同じ Inbox チケットを二重に移動しない
+    temp_types: dict = {}    # 仮ID → 種別
+
+    def _parent_type(pid: str) -> Optional[str]:
+        """親の種別を返す（ROOT は "ROOT"、見つからなければ None）"""
+        if pid in temp_types:
+            return temp_types[pid]
+        if pid.upper() == AI_ROOT:
+            return AI_ROOT
+        if pid in df_nodes.index and df_nodes.loc[pid, "status"] != "deleted":
+            return str(df_nodes.loc[pid, "node_type"])
+        return None
+
+    for entry in re.split(r"(?m)^\s*-{3,}\s*$", block):
+        item: dict = {}
+        for line in entry.splitlines():
+            if ":" in line:
+                key, _, val = line.partition(":")
+                key = key.strip().lower()
+                item[_AI_KEY_ALIASES.get(key, key)] = val.strip()
+        if not item:
+            continue
+        parent = item.get("parent", "")
+
+        # --- Inbox チケットの振り分け ---
+        move_idx = item.get("move", "")
+        if move_idx:
+            if move_idx not in df_nodes.index:
+                skipped.append(f"IDX が見つかりません: {move_idx}")
+                continue
+            title = str(df_nodes.loc[move_idx, "title"])
+            if move_idx not in inbox.index:
+                skipped.append(f"振り分け済み（Inbox にありません）: {title}")
+            elif move_idx in used_inbox:
+                skipped.append(f"同じチケットが重複しています: {title}")
+            elif _parent_type(parent) != "task":
+                skipped.append(f"移動先の Task がありません: {title}")
+            else:
+                used_inbox.add(move_idx)
+                items.append({"kind": "move", "idx": move_idx, "title": title, "parent": parent})
+            continue
+
+        # --- 新規作成 ---
+        ntype = (item.get("type") or "ticket").lower()
+        title = item.get("title", "")
+        if ntype not in NODE_TYPES:
+            errors.append(f"type が不正です: {item.get('type')}（{title or '?'}）")
+            continue
+        if not title:
+            errors.append(f"title が空の項目があります（type: {ntype}）")
+            continue
+        if not parent:
+            errors.append(f"parent が空です: {title}")
+            continue
+        ptype = _parent_type(parent)
+        expected = _AI_PARENT_TYPE.get(ntype, AI_ROOT)
+        if ptype is None:
+            errors.append(f"parent が見つかりません: {parent}（{title}）")
+            continue
+        if ptype != expected:
+            errors.append(f"{ntype} の親は {expected} にしてください: {title}（parent は {ptype}）")
+            continue
+        tid = item.get("id", "")
+        if tid:
+            if tid in temp_types or tid in df_nodes.index or tid.upper() == AI_ROOT:
+                errors.append(f"id が重複しています: {tid}（{title}）")
+                continue
+            temp_types[tid] = ntype
+
+        # Inbox に同名チケット（1 件）があれば、move の書き忘れとみなして移動扱い
+        if ntype == "ticket":
+            key = norm_key(title)
+            same = [i for i in inbox.index
+                    if i not in used_inbox and norm_key(inbox.loc[i, "title"]) == key]
+            if len(same) == 1:
+                used_inbox.add(same[0])
+                items.append({"kind": "move", "idx": same[0],
+                              "title": str(inbox.loc[same[0], "title"]), "parent": parent,
+                              "note": "move 指定なし・同名の Inbox チケットと判断"})
+                continue
+
+        items.append({"kind": "new", "type": ntype, "title": title,
+                      "parent": "0" if ptype == AI_ROOT else parent, "id": tid,
+                      "deadline": item.get("deadline", ""), "memo": item.get("memo", "")})
+
+    return items, errors, skipped

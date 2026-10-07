@@ -1935,12 +1935,17 @@ class MainWindow(QMainWindow):
             self.main_pane.table_pane._update_dirty_indicator()
             self._update_save_btn_style()
             self.main_pane.tree_pane.refresh()
+            ai_note = self._export_ai_context()
             skipped = getattr(self.state, "save_skipped", {})
             if skipped:
                 # 他ユーザーへ移管済みのノードは巻き戻さず保存対象外にした旨を通知
                 self.statusBar().showMessage(
-                    f"保存しました（{len(skipped)} 件は他ユーザーへ移管済みのため保存対象外）", 8000)
+                    f"保存しました（{len(skipped)} 件は他ユーザーへ移管済みのため保存対象外）"
+                    + ai_note, 8000)
                 self.refresh()
+                return
+            if ai_note:
+                self.statusBar().showMessage("保存しました" + ai_note, 8000)
                 return
             self.statusBar().showMessage("保存しました")
             QTimer.singleShot(500, lambda: self.statusBar().clearMessage())
@@ -1957,6 +1962,20 @@ class MainWindow(QMainWindow):
             # 保存失敗時は保存ボタンの赤色を維持するため nodes_modified を True に戻す
             self.state.nodes_modified = True
             self._update_save_btn_style()
+
+    def _export_ai_context(self) -> str:
+        """保存後に AI 用の作業ツリー・Inbox 一覧を <output_dir>/ai_context へ書き出す。
+        output_dir 未設定なら何もしない。失敗しても保存は成功扱いとし、警告文を返す"""
+        out_dir = (self.state.config.report_output_dir or "").strip()
+        if not out_dir:
+            return ""
+        try:
+            LG.export_ai_context(out_dir, self.state.df_nodes, self.state.user)
+        except Exception as e:
+            if self.state.logger:
+                self.state.logger.warning(f"[保存] AI 用ファイルの書き出しに失敗: {e}")
+            return f"（⚠ AI 用ファイルの書き出しに失敗しました: {e}）"
+        return ""
 
     def _on_load(self) -> None:
         if not self._confirm_unsaved("再読込する"):

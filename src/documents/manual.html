@@ -274,7 +274,7 @@
     <li><strong>ポモドーロタイマー（🍅）</strong>: 25分集中→実績を日次スケジュールへ自動記録</li>
     <li><strong>チームログ（Team）</strong>: メンバー全員の勤務状況・連絡事項を一覧表示</li>
     <li><strong>タスク依頼（Request）</strong>: 他メンバーへのタスク・チケット依頼</li>
-    <li><strong>AI取込</strong>: LLM（AI）の返答からチケット・日次スケジュールを自動作成</li>
+    <li><strong>AI取込</strong>: LLM（AI）の返答から Project1〜Ticket・日次スケジュールを自動作成</li>
     <li><strong>工数分析（Analyze）</strong>: 見積vs実績の比較・超過アラート・個人振り返り</li>
   </ul>
 </div>
@@ -306,7 +306,7 @@
   <tr><td><code>server_dir</code></td><td>DBファイルの保存先フォルダ</td><td><code>./db</code>（共有フォルダなら <code>//server/share/db</code>）</td></tr>
   <tr><td><code>daily_task_hour</code></td><td>1日の標準作業時間（時間）</td><td><code>5.0</code></td></tr>
   <tr><td><code>[DisplayNames]</code></td><td>ユーザー名→画面表示名のマッピング</td><td><code>yamada = 山田</code></td></tr>
-  <tr><td><code>output_dir</code></td><td>レポート・当日ログ等の Markdown 出力先フォルダ（<code>[Report]</code>）</td><td><code>//NAS/share/reports</code></td></tr>
+  <tr><td><code>output_dir</code></td><td>レポート・当日ログ・AI 用の作業ツリー等の Markdown 出力先フォルダ（<code>[Report]</code>）</td><td><code>//NAS/share/reports</code></td></tr>
 </table>
 
 <div class="card info">
@@ -653,7 +653,7 @@ Main タブのガントや日次スケジュールの予定を右クリック �
   <li>上限到達、または <code>stale_days</code>（既定3日）を超えて残っている場合は、起動時に振り分け画面が開きます（1日1回）</li>
   <li><strong>振り分け画面</strong>: 移動先 Task は過去のチケット名から自動提案（黄色）。経過日数は 3日超=橙・7日超=赤で表示</li>
   <li>ツリーで Inbox のチケットを Task へドラッグしても振り分けられます</li>
-  <li><strong>AI で振り分け</strong>: AI取込の「プロンプトをコピー」に Inbox 一覧が付きます。LLM の返答を取り込むと、Inbox のチケットは<strong>新規作成されず移動</strong>します</li>
+  <li><strong>AI で振り分け</strong>: AI取込の「プロンプトをコピー」に Inbox 一覧が付きます（保存時に <code>output_dir/ai_context/inbox.md</code> にも書き出されます）。LLM の返答を取り込むと、Inbox のチケットは<strong>新規作成されず移動</strong>します</li>
 </ul>
 
 <hr>
@@ -926,7 +926,7 @@ Main タブのガントや日次スケジュールの予定を右クリック �
 
 <!-- ===================== AI取込 タブ ===================== -->
 <h2 id="ai-tab">🤖 AI取込タブ</h2>
-<p>LLM（AI）に依頼し、その回答を貼り付けて自動取り込みする機能です。<strong>①チケット作成</strong> と <strong>②日次スケジュール設定</strong> の2種類があります。</p>
+<p>LLM（AI）に依頼し、その回答を貼り付けて自動取り込みする機能です。<strong>①項目作成（Project1〜Ticket）</strong> と <strong>②日次スケジュール設定</strong> の2種類があります。</p>
 
 <h3>使い方の流れ（共通）</h3>
 <div class="flow">
@@ -939,24 +939,43 @@ Main タブのガントや日次スケジュールの予定を右クリック �
   <div class="flow-step">④ 📥 取り込み</div>
 </div>
 
-<h3>① チケット作成</h3>
+<h3>① 項目作成（Project1〜Ticket）</h3>
 <ol class="steps">
-  <li>「チケット作成：📋 プロンプトをコピー」→ テンプレート＋既存 Task 一覧がコピーされる</li>
+  <li>「項目作成（P1〜Ticket）：📋 プロンプトをコピー」→ テンプレート＋作業ツリー＋Inbox 一覧がコピーされる</li>
   <li>AI に貼り付け、整理したいメール・指示文も添えて送信</li>
   <li>AI 返答をテキスト欄に貼り付け、「📥 取り込み」→ 確認ダイアログ → DB 登録</li>
   <li>自動的に Edit タブへ切り替わり、登録チケットを確認できる</li>
 </ol>
 <div class="card info">
-  <strong>💡 チケット返答フォーマット</strong>（<code>---</code> 区切りで複数可。コードブロックで囲んでも可）：
-<pre>title: チケットタイトル
-parent_idx: 親Task の IDX（必須・種別 task のみ）
+  <strong>💡 返答フォーマット</strong>（1 項目 = 1 ブロック。<code>---</code> だけの行で区切る。コードブロックで囲んでも可）：
+<pre>type: project1〜project4 / task / ticket（省略時 ticket）
+title: タイトル（必須）
+parent: 親の IDX / 同じ返答内の仮ID / ROOT（project1 のとき）
+id: 仮ID（この項目の下に新しい項目を作るときだけ。new1, new2 …）
 deadline: YYYY-MM-DD（省略可）
 memo: メモ（省略可）
 ---
-title: 2つ目のチケット
-parent_idx: ...</pre>
-  作成されるのは <strong>Ticket</strong> で、親は <strong>Task</strong> である必要があります。
+type: task
+title: 要件定義
+parent: new1
+---
+move: Inbox チケットの IDX（振り分け。新規作成はしない）
+parent: 移動先 Task の IDX / 仮ID</pre>
+  親子の組み合わせは固定です（ROOT → project1 → project2 → project3 → project4 → task → ticket。階層は飛ばせません）。
+  組み合わせ違い・存在しない IDX・仮ID の重複があると、何も登録せずにエラーを表示します。
+  project1〜task を作ると「詳細作成」「完了」チケットが自動で付き、色は親から引き継ぎます。
+  旧書式（<code>parent_idx:</code> / <code>idx:</code>）も読めます。
 </div>
+
+<h3>保存時の自動書き出し（AI 用の作業ツリー）</h3>
+<p><kbd>Ctrl+S</kbd> で保存すると、<code>[Report] output_dir</code> の下に次のファイルを毎回上書きで書き出します（<code>output_dir</code> 未設定なら何もしません）。
+自分で用意したプロンプトと一緒に AI へ渡すと、ボタン操作なしで最新の IDX を参照させられます。</p>
+<table>
+  <tr><th>ファイル</th><th>内容</th></tr>
+  <tr><td><code>ai_context/work_tree.md</code></td><td>Project1〜Task の階層（削除済み以外・他メンバー分も含む）と、各 Task にある自分の未完了チケット</td></tr>
+  <tr><td><code>ai_context/inbox.md</code></td><td>自分の Inbox（Task 未設定）のチケット</td></tr>
+</table>
+<p>書き出しに失敗しても保存は完了します（ステータスバーに警告を表示）。</p>
 
 <h3>② 日次スケジュール設定</h3>
 <ol class="steps">
@@ -1058,7 +1077,7 @@ ticket_idx: ...</pre>
   <tr><td>[GUI]</td><td>ウィンドウサイズ、フォントサイズ、<code>start_tab</code>（起動時タブ: Today/Main/Plan/Edit/前回終了時。プルダウンで選択）、<code>theme</code>（配色: ☀ ライト / 🌙 ダーク / OS の設定に合わせる。再起動で反映）、<code>detail_pane</code>（詳細ペインの起動時開閉: open/closed）</td></tr>
   <tr><td>[Schedule]</td><td>営業時間（始業・終業）、1日の標準作業時間、休日、<code>risk_use_factor</code>（納期リスク予報で見積係数を掛けるか）</td></tr>
   <tr><td>[DailyInfoCombo]</td><td>健・場・安・残 の選択肢リスト</td></tr>
-  <tr><td>[Report]</td><td><code>output_dir</code>: レポート・当日ログの Markdown 出力先フォルダ</td></tr>
+  <tr><td>[Report]</td><td><code>output_dir</code>: レポート・当日ログ・AI 用の作業ツリー（保存時に自動）の Markdown 出力先フォルダ</td></tr>
   <tr><td>[Pomodoro]</td><td><code>work_minutes</code> / <code>break_minutes</code>: 作業・休憩時間（分）</td></tr>
   <tr><td>[Commands]</td><td>カスタムコマンドの登録</td></tr>
 </table>
@@ -1240,7 +1259,8 @@ ticket_idx: ...</pre>
 <h3>Q. AI取込でうまく取り込めません</h3>
 <p>以下を確認してください。</p>
 <ul>
-  <li>チケット作成は <code>title:</code> と <code>parent_idx:</code> が必須。<code>parent_idx</code> は<strong>既存の Task の IDX</strong>であること（複数は <code>---</code> 区切り）</li>
+  <li>項目作成は <code>title:</code> と <code>parent:</code> が必須。<code>type</code> と親の種別の組み合わせが正しいこと（ticket の親は task、task の親は project4 …。複数は <code>---</code> 区切り）</li>
+  <li>仮ID（<code>id:</code>）は、それを <code>parent:</code> に使うブロックより上で定義していること</li>
   <li>日次スケジュールは先頭に <code>date:</code>、各エントリに <code>ticket_idx:</code> / <code>from:</code> / <code>to:</code> があること</li>
   <li>「📋 プロンプトをコピー」で取得した内容を AI に渡してから依頼しているか</li>
   <li>返答はコードブロック（```）で囲まれていても認識します</li>
