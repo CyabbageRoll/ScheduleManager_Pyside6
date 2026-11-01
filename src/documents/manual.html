@@ -781,6 +781,7 @@ Main タブのガントや日次スケジュールの予定を右クリック �
 
 <h3 id="edit-priority">優先順位（priority）について</h3>
 <p>各アイテムには「順番」として優先順位が割り振られます。数字が小さいほど優先度が高く、ガントチャートの作業順序に影響します。</p>
+<p>自動生成の<strong>「完了」チケットは常に最後</strong>に並びます。チケットを追加・移動すると「完了」が自動で末尾へ動き、▲▼ で入れ替えることはできません（過去のデータは保存時に自分の担当分を直します）。他メンバー担当の「完了」は保存できないため動かさず、ステータスバーに警告を出します。また、同じ親の下に未完了の項目が残っていると「完了」を done にはできません。</p>
 
 <ul>
   <li>テーブル上の <strong>▲ / ▼</strong> ボタンで隣接行と優先順位を入れ替えられます（複数選択可）</li>
@@ -936,16 +937,24 @@ Main タブのガントや日次スケジュールの予定を右クリック �
   <div class="flow-arrow">→</div>
   <div class="flow-step">③ AI返答をテキスト欄に貼り付け</div>
   <div class="flow-arrow">→</div>
-  <div class="flow-step">④ 📥 取り込み</div>
+  <div class="flow-step">④ 📥 取り込み → 確認表</div>
 </div>
 
 <h3>① 項目作成（Project1〜Ticket）</h3>
 <ol class="steps">
   <li>「項目作成（P1〜Ticket）：📋 プロンプトをコピー」→ テンプレート＋作業ツリー＋Inbox 一覧がコピーされる</li>
   <li>AI に貼り付け、整理したいメール・指示文も添えて送信</li>
-  <li>AI 返答をテキスト欄に貼り付け、「📥 取り込み」→ 確認ダイアログ → DB 登録</li>
-  <li>自動的に Edit タブへ切り替わり、登録チケットを確認できる</li>
+  <li>AI 返答をテキスト欄に貼り付け、「📥 取り込み」→ <strong>確認表</strong>で内容を確認して取り込む</li>
+  <li>確認表を閉じると Edit タブへ切り替わり、取り込んだ項目を確認できる。内容がよければ <kbd>Ctrl+S</kbd> で保存（<kbd>Ctrl+Z</kbd> で取り消せます）</li>
 </ol>
+<h4>確認表の使い方</h4>
+<ul>
+  <li>行ごとに<strong>親</strong>（Prj1 からの階層で表示。文字を入れると絞り込み）・<strong>開始日</strong>・<strong>納期</strong>を変更できます。親の候補は、その種別に置ける未完了の項目と、同じ表の新規項目（🆕）です</li>
+  <li>チェックした行だけを取り込みます。最初はすべてチェックされています</li>
+  <li>新規の親のチェックを外すと子も外れ、子にチェックを付けると親にも付きます（子だけは取り込めません）</li>
+  <li>✗ の行（親が不明・完了済みの親・開始日が納期より後）は取り込めません。直すと配下の行とともにチェックが戻ります。⚠ は確認用の注意です（同じ親に同名あり、日付が読めず空欄にした等）</li>
+  <li>全行を取り込むと表は閉じ、テキスト欄も空になります。行が残っている間は表が開いたままで、「キャンセル」で残りを取り込まずに閉じます（テキスト欄は残ります）</li>
+</ul>
 <div class="card info">
   <strong>💡 返答フォーマット</strong>（1 項目 = 1 ブロック。<code>---</code> だけの行で区切る。コードブロックで囲んでも可）：
 <pre>type: project1〜project4 / task / ticket（省略時 ticket）
@@ -958,11 +967,13 @@ memo: メモ（省略可）
 type: task
 title: 要件定義
 parent: new1
+start: YYYY-MM-DD（開始日。省略可）
+deadline: YYYY-MM-DD（納期。省略可）
 ---
 move: Inbox チケットの IDX（振り分け。新規作成はしない）
 parent: 移動先 Task の IDX / 仮ID</pre>
   親子の組み合わせは固定です（ROOT → project1 → project2 → project3 → project4 → task → ticket。階層は飛ばせません）。
-  組み合わせ違い・存在しない IDX・仮ID の重複があると、何も登録せずにエラーを表示します。
+  組み合わせ違いや存在しない IDX は、確認表の ✗ の行として表示され、親を選び直せます。不明な <code>type</code>・タイトルなし・仮ID の重複は行にできないため、表の上に表示します。
   project1〜task を作ると「詳細作成」「完了」チケットが自動で付き、色は親から引き継ぎます。
   旧書式（<code>parent_idx:</code> / <code>idx:</code>）も読めます。
 </div>
@@ -1260,7 +1271,7 @@ ticket_idx: ...</pre>
 <p>以下を確認してください。</p>
 <ul>
   <li>項目作成は <code>title:</code> と <code>parent:</code> が必須。<code>type</code> と親の種別の組み合わせが正しいこと（ticket の親は task、task の親は project4 …。複数は <code>---</code> 区切り）</li>
-  <li>仮ID（<code>id:</code>）は、それを <code>parent:</code> に使うブロックより上で定義していること</li>
+  <li>仮ID（<code>id:</code>）と <code>parent:</code> の綴りが一致していること。合わないときは確認表で親を選び直せます</li>
   <li>日次スケジュールは先頭に <code>date:</code>、各エントリに <code>ticket_idx:</code> / <code>from:</code> / <code>to:</code> があること</li>
   <li>「📋 プロンプトをコピー」で取得した内容を AI に渡してから依頼しているか</li>
   <li>返答はコードブロック（```）で囲まれていても認識します</li>

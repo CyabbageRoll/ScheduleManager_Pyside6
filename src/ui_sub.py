@@ -18,10 +18,12 @@ from PySide6.QtWidgets import (
     QSizePolicy, QRadioButton, QButtonGroup, QCalendarWidget, QMenu,
     QDialog, QDialogButtonBox, QSpinBox, QDoubleSpinBox,
     QTreeWidget, QTreeWidgetItem, QStyledItemDelegate, QPlainTextEdit,
-    QApplication, QGridLayout,
+    QApplication, QGridLayout, QCompleter,
 )
 from PySide6.QtCore import Qt, Signal, QDate, QTimer
-from PySide6.QtGui import QColor, QFont, QAction, QCursor, QPen
+from PySide6.QtGui import (
+    QAction, QBrush, QColor, QCursor, QFont, QPen, QStandardItem, QStandardItemModel,
+)
 from PySide6.QtWidgets import QToolTip
 
 import db as DB
@@ -4328,6 +4330,262 @@ class DashboardView(QWidget):
                         zero_text=f"{reported}/{len(self.state.members)} 人入力済")
 
 
+# ---------- AI 取り込みの確認表 ----------
+
+class AIImportDialog(QDialog):
+    """
+    AI 返答の取り込み前の確認表。親・開始日・納期を行ごとに変更でき、チェックした行だけを取り込む。
+    新規の親の行にチェックがない子は取り込めない（親を外すと子も外れ、子を付けると親も付く）。
+    反映はインメモリ（Ctrl+Z 可・Ctrl+S で保存）。行が残っている間は開いたままにする。
+    """
+    _COLS = ["", "種別", "タイトル", "親（Prj1 からの階層）", "開始日", "納期", "状態"]
+    _TYPE_LABEL = {"project1": "Prj1", "project2": "Prj2", "project3": "Prj3",
+                   "project4": "Prj4", "task": "Task", "ticket": "Ticket"}
+
+    def __init__(self, state, items: list, notices: list, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self.items = items
+        self.created: list = []
+        self.moved: list = []
+        for n, it in enumerate(items):
+            it["checked"] = True
+            # 仮ID のない新規の親も、確認表で親として選べるようにする
+            if it["kind"] == "new" and it["type"] != "ticket" and not it["id"]:
+                it["id"] = f"__new{n}"
+        self.setWindowTitle("🤖 AI 取り込みの確認")
+        self.resize(1320, 520)
+        lay = QVBoxLayout(self)
+
+        self.notice = QLabel("\n".join(f"⚠ {m}" for m in notices))
+        self.notice.setWordWrap(True)
+        self.notice.setVisible(bool(notices))
+        lay.addWidget(self.notice)
+
+        self.table = QTableWidget(0, len(self._COLS))
+        self.table.setHorizontalHeaderLabels(self._COLS)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.verticalHeader().setVisible(False)
+        for c, w in enumerate([30, 55, 210, 440, 175, 175]):
+            self.table.setColumnWidth(c, w)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemChanged.connect(self._on_item_changed)
+        lay.addWidget(self.table, stretch=1)
+
+        self.info = InfoLabel()
+        lay.addWidget(self.info)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        self.import_btn = QPushButton()
+        self.cancel_btn = QPushButton("キャンセル")
+        for btn, slot in ((self.import_btn, self._on_import), (self.cancel_btn, self.reject)):
+            btn.setStyleSheet(STYLE_BUTTON)
+            btn.setAutoDefault(False)  # 親の入力中の Enter で取り込まない
+            btn.clicked.connect(slot)
+            row.addWidget(btn)
+        lay.addLayout(row)
+
+        self._rebuild()
+
+    # ── 行どうしの親子 ──
+
+    def _new_parent(self, it: dict) -> Optional[dict]:
+        """親が同じ表の新規の行ならその行を返す（種別が合わない指定は親として扱わない）"""
+        parent = it.get("parent", "")
+        return next((r for r in self.items if parent and r.get("id") == parent
+                     and r["type"] == LG.ai_parent_type(it["type"])), None)
+
+    def _descendants(self, it: dict) -> list:
+        children = [r for r in self.items if self._new_parent(r) is it]
+        return children + [d for c in children for d in self._descendants(c)]
+
+    def _path(self, it: dict) -> str:
+        """Prj1 から新規の行までの階層パス（親の候補の表示に使う）"""
+        new_parent = self._new_parent(it)
+        if new_parent:
+            base = self._path(new_parent)
+        elif it.get("parent") in self.state.df_nodes.index:
+            base = " > ".join(LG.node_path_titles(self.state.df_nodes, it["parent"]))
+        else:
+            base = "（親未定）" if LG.ai_parent_type(it["type"]) else ""
+        return f"{base} > 🆕{it['title']}" if base else f"🆕{it['title']}"
+
+    # ── 表の構築 ──
+
+    def _build_models(self) -> None:
+        """親の候補を種別ごとに 1 つ作り、全行のコンボで共有する（候補が多くても遅くしない）"""
+        self._models: dict = {}
+        self._new_items: dict = {}  # 仮ID → 候補リストの項目（親の変更で表示を更新する）
+        df = self.state.df_nodes
+        for ntype in {it["type"] for it in self.items if LG.ai_parent_type(it["type"])}:
+            model = QStandardItemModel(self)
+            first = QStandardItem("（親を選択）")
+            first.setData("", Qt.ItemDataRole.UserRole)
+            model.appendRow(first)
+            for label, idx in LG.ai_parent_candidates(df, ntype):
+                entry = QStandardItem(label)
+                entry.setData(idx, Qt.ItemDataRole.UserRole)
+                model.appendRow(entry)
+            for r in self.items:
+                if r.get("id") and r["type"] == LG.ai_parent_type(ntype):
+                    entry = QStandardItem(self._path(r))
+                    entry.setData(r["id"], Qt.ItemDataRole.UserRole)
+                    model.appendRow(entry)
+                    self._new_items[r["id"]] = entry
+            self._models[ntype] = model
+
+    def _parent_cell(self, it: dict) -> QWidget:
+        if not LG.ai_parent_type(it["type"]):
+            return QLabel("（最上位）")
+        combo = _NoWheelComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setModel(self._models[it["type"]])
+        comp = combo.completer()
+        comp.setFilterMode(Qt.MatchFlag.MatchContains)
+        comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        combo.setCurrentIndex(max(combo.findData(it.get("parent", "")), 0))
+        combo.setToolTip(combo.currentText())
+        combo.lineEdit().setCursorPosition(0)  # 長いパスでも Prj1 側から見せる
+        combo.currentIndexChanged.connect(lambda _i, c=combo, r=it: self._on_parent_changed(c, r))
+        combo.lineEdit().editingFinished.connect(lambda c=combo: self._on_parent_typed(c))
+        return combo
+
+    def _date_cell(self, it: dict, key: str) -> QWidget:
+        box = QWidget()
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        btn = DateButton(allow_empty=True, initial_date=it.get(key, ""))
+        btn.date_changed.connect(lambda d, r=it, k=key: self._on_date_changed(r, k, d))
+        clear = QPushButton("✕")
+        clear.setFixedWidth(24)
+        clear.setAutoDefault(False)
+        clear.clicked.connect(btn.clear_date)
+        lay.addWidget(btn, stretch=1)
+        lay.addWidget(clear)
+        return box
+
+    def _rebuild(self) -> None:
+        self._build_models()
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(self.items))
+        for row, it in enumerate(self.items):
+            check = QTableWidgetItem()
+            check.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            self.table.setItem(row, 0, check)
+            type_lbl = "移動" if it["kind"] == "move" else self._TYPE_LABEL[it["type"]]
+            self.table.setItem(row, 1, QTableWidgetItem(type_lbl))
+            title = QTableWidgetItem(it["title"])
+            title.setToolTip(it.get("memo", ""))
+            self.table.setItem(row, 2, title)
+            self.table.setCellWidget(row, 3, self._parent_cell(it))
+            self.table.setCellWidget(row, 4, self._date_cell(it, "start"))
+            self.table.setCellWidget(row, 5, self._date_cell(it, "deadline"))
+            self.table.setItem(row, 6, QTableWidgetItem())
+        self.table.blockSignals(False)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        """各行の問題を判定し直し、チェックと表示を揃える"""
+        df = self.state.df_nodes
+        for it in self.items:
+            problem = LG.ai_row_problem(it, self.items, df)
+            if it.get("problem") and not problem:  # 直した行と、その配下のチェックを戻す
+                for r in [it] + self._descendants(it):
+                    r["checked"] = True
+            it["problem"] = problem
+        changed = True
+        while changed:
+            changed = False
+            for it in self.items:
+                parent = self._new_parent(it)
+                if it["checked"] and (it["problem"] or (parent and not parent["checked"])):
+                    it["checked"] = False
+                    changed = True
+
+        self.table.blockSignals(True)
+        for row, it in enumerate(self.items):
+            check = self.table.item(row, 0)
+            check.setCheckState(Qt.CheckState.Checked if it["checked"]
+                                else Qt.CheckState.Unchecked)
+            flags = Qt.ItemFlag.ItemIsUserCheckable
+            check.setFlags(flags if it["problem"] else flags | Qt.ItemFlag.ItemIsEnabled)
+            warning = LG.ai_row_warning(it, df)
+            cell = self.table.item(row, 6)
+            cell.setText(f"✗ {it['problem']}" if it["problem"]
+                         else f"⚠ {warning}" if warning else "")
+            cell.setToolTip(cell.text())
+            color = C.ROW_ERROR_BG if it["problem"] else C.ROW_WARN_BG if warning else None
+            cell.setBackground(QColor(color) if color else QBrush())
+        self.table.blockSignals(False)
+        count = sum(it["checked"] for it in self.items)
+        self.import_btn.setText(f"📥 取り込み（{count} 件）")
+        self.import_btn.setEnabled(count > 0)
+
+    # ── 操作 ──
+
+    def _on_item_changed(self, cell: QTableWidgetItem) -> None:
+        if cell.column() != 0:
+            return
+        it = self.items[cell.row()]
+        it["checked"] = cell.checkState() == Qt.CheckState.Checked
+        parent = self._new_parent(it) if it["checked"] else None
+        while parent:
+            parent["checked"] = True
+            parent = self._new_parent(parent)
+        self._refresh()
+
+    def _on_parent_changed(self, combo: QComboBox, it: dict) -> None:
+        it["parent"] = combo.currentData(Qt.ItemDataRole.UserRole) or ""
+        combo.setToolTip(combo.currentText())
+        combo.lineEdit().setCursorPosition(0)
+        # 親が変わると、この行の配下の候補の表示（階層パス）も変わる
+        for r in [it] + self._descendants(it):
+            if r.get("id") in self._new_items:
+                self._new_items[r["id"]].setText(self._path(r))
+        self._refresh()
+
+    def _on_parent_typed(self, combo: QComboBox) -> None:
+        """手入力は候補と一致したときだけ確定し、それ以外は元の表示に戻す"""
+        i = combo.findText(combo.currentText())
+        if i >= 0:
+            combo.setCurrentIndex(i)
+        else:
+            combo.setEditText(combo.itemText(combo.currentIndex()))
+
+    def _on_date_changed(self, it: dict, key: str, date_str: str) -> None:
+        it[key] = date_str
+        it["note"] = ""  # 日付を読めなかった注意は、手で直したら消す
+        self._refresh()
+
+    def _on_import(self) -> None:
+        targets = [it for it in self.items if it["checked"]]
+        if not targets:
+            return
+        result = LG.apply_ai_import(self.state.df_nodes, targets, self.state.user)
+        self.created += result["created"]
+        self.moved += result["moved"]
+        for parent_id in result["parents"]:
+            self.state.keep_done_last(parent_id)
+        self.state.nodes_modified = True
+        self.state.notify_dirty()
+
+        self.items = [it for it in self.items if not it["checked"]]
+        if not self.items:
+            self.accept()
+            return
+        for it in self.items:  # 取り込んだ親は既存の項目として扱う
+            it["parent"] = result["resolved"].get(it["parent"], it["parent"])
+        self._rebuild()
+        self.info.set_info(f"{len(targets)} 件を取り込みました。残り {len(self.items)} 件です")
+
+
 # ---------- AI取込ビュー ----------
 
 class AIImportView(QWidget):
@@ -4337,7 +4595,7 @@ class AIImportView(QWidget):
     【項目（Project1〜Ticket）取り込み】
     ① 作成プロンプト: テンプレート + 作業ツリー・Inbox 一覧をクリップボードにコピー
        （同じ一覧は保存時に output_dir/ai_context へ自動で書き出される）
-    ② 取り込み: type: / title: / parent: 形式をパース → 確認ダイアログ → DB登録
+    ② 取り込み: type: / title: / parent: 形式をパース → 確認表（AIImportDialog）→ インメモリ反映
 
     【日次スケジュール取り込み】
     ③ 日次スケジュール作成プロンプト: テンプレート + チケット一覧をクリップボードにコピー
@@ -4439,118 +4697,27 @@ class AIImportView(QWidget):
             return
 
         items, errors, skipped = LG.parse_ai_import(text, self.state.df_nodes, self.state.user)
-        if errors:
-            self.info.set_error("書式エラー: " + " / ".join(errors))
-            return
         if not items:
             self.info.set_error("取り込める内容が見つかりませんでした"
-                                + (f"（スキップ: {' / '.join(skipped)}）" if skipped else ""))
+                                + (f"（{' / '.join(errors + skipped)}）" if errors or skipped else ""))
             return
 
-        df = self.state.df_nodes
-        temp_titles = {it["id"]: it["title"] for it in items if it.get("id")}
-
-        def _parent_title(pid: str) -> str:
-            if pid == "0":
-                return "（最上位）"
-            if pid in temp_titles:
-                return temp_titles[pid] + "（新規）"
-            return str(df.loc[pid, "title"]) if pid in df.index else pid
-
-        moves = [it for it in items if it["kind"] == "move"]
-        news = [it for it in items if it["kind"] == "new"]
-        lines = []
-        if moves:
-            lines.append(f"■ Inbox から移動 {len(moves)} 件（新規作成しません）")
-            lines += [f"  {it['title']} → {_parent_title(it['parent'])}"
-                      + (f"  ※{it['note']}" if it.get("note") else "") for it in moves]
-        if news:
-            lines.append(f"■ 新規作成 {len(news)} 件")
-            lines += [f"  [{it['type']}] {it['title']} → {_parent_title(it['parent'])}"
-                      for it in news]
-        if skipped:
-            lines.append(f"■ スキップ {len(skipped)} 件")
-            lines += [f"  {m}" for m in skipped]
-        reply = QMessageBox.question(
-            self, "取り込み確認",
-            "以下の内容で取り込みます。よろしいですか？\n\n" + "\n".join(lines),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        dlg = AIImportDialog(self.state, items, errors + skipped, self)
+        dlg.exec()
+        imported = dlg.created + dlg.moved
+        if not imported:
             return
-
-        # 1) 新規: 上から順に DB へ直接登録（仮ID は作成した IDX に置き換える）
-        resolved: dict = {}
-        imported_idxs = []
-        for it in news:
-            df = self.state.df_nodes
-            parent_id = resolved.get(it["parent"], it["parent"])
-            siblings = df[(df["parent_id"] == parent_id) & (df["status"] != "deleted")]
-            ds = DB.create_initial_node(
-                owner=self.state.user,
-                node_type=it["type"],
-                title=it["title"],
-                parent_id=parent_id,
-                priority=int(siblings["priority"].max()) + 1 if not siblings.empty else 1,
-            )
-            if parent_id in df.index:
-                ds["color"] = str(df.loc[parent_id, "color"] or ds["color"])  # 親の色を引き継ぐ
-            if it.get("deadline"):
-                ds["deadline"] = it["deadline"]
-            if it.get("memo"):
-                ds["memo"] = it["memo"]
-            # 親ノード（task 以上）には「詳細作成」「完了」チケットを自動生成（画面から作るときと同じ）
-            nodes = [ds] + (DB.build_auto_children(ds, self.state.user)
-                            if it["type"] != "ticket" else [])
-            try:
-                for node in nodes:
-                    self.state.db.upsert_node(node)
-            except Exception as e:
-                QMessageBox.critical(self, "取り込みエラー",
-                                     f"DB への登録に失敗しました: {it['title']}\n{e}")
-                break
-            # DB 全件の再読込はせず、取り込んだ行だけをメモリへ追加する
-            # （再読込すると他の未保存の編集が失われるため）
-            for node in nodes:
-                self.state.df_nodes.loc[node.name] = node
-            imported_idxs.append(str(ds.name))
-            if it.get("id"):
-                resolved[it["id"]] = str(ds.name)
-        if imported_idxs:
-            # DB へ直接登録した行はメモリから戻すと食い違うため、ここを Undo の起点にする
-            self.state.reset_undo()
-
-        # 2) Inbox の移動: インメモリ（Ctrl+Z で取り消し可・Ctrl+S で保存）
-        moved_idxs = []
-        today = datetime.date.today().isoformat()
-        df = self.state.df_nodes
-        for it in moves:
-            parent_id = resolved.get(it["parent"], it["parent"])
-            if parent_id not in df.index:
-                continue  # 移動先の新規 Task が登録エラーで作られなかった
-            siblings = df[df["parent_id"] == parent_id]
-            df.loc[it["idx"], "parent_id"] = parent_id
-            df.loc[it["idx"], "priority"] = (int(siblings["priority"].max()) + 1
-                                             if not siblings.empty else 1)
-            df.loc[it["idx"], "updated_at"] = today
-            moved_idxs.append(it["idx"])
-        if moved_idxs:
-            self.state.nodes_modified = True
-            self.state.notify_dirty()
-
-        if not imported_idxs and not moved_idxs:
-            return
+        if not dlg.items:
+            self.text_edit.clear()  # 全件取り込んだら消す（二重登録の防止）
         self.state.refresh()
 
         if self.state.logger:
             self.state.logger.info(
-                f"[AI取込] 新規 {len(imported_idxs)} 件 / Inbox 移動 {len(moved_idxs)} 件"
-                f" user={self.state.user} new={imported_idxs} moved={moved_idxs}")
-        msg = f"新規 {len(imported_idxs)} 件を取り込み、Inbox から {len(moved_idxs)} 件を振り分けました"
-        if moved_idxs:
-            msg += "（振り分けは Ctrl+S で保存）"
-        self.info.set_info(msg)
-        self.import_done.emit(imported_idxs + moved_idxs)
+                f"[AI取込] 新規 {len(dlg.created)} 件 / Inbox 移動 {len(dlg.moved)} 件"
+                f" user={self.state.user} new={dlg.created} moved={dlg.moved}")
+        self.info.set_info(f"新規 {len(dlg.created)} 件を取り込み、Inbox から "
+                           f"{len(dlg.moved)} 件を振り分けました（Ctrl+S で保存 / Ctrl+Z で取り消し）")
+        self.import_done.emit(imported)
 
     @staticmethod
     def _strip_code_fences(text: str) -> str:

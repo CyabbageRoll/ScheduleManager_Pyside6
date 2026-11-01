@@ -664,6 +664,57 @@ def schedule_tickets(df: pd.DataFrame, member: str, daily_h: float, holidays,
     return result
 
 
+# ---------- 「完了」チケットの順序 ----------
+
+DONE_TICKET_TITLE = "完了"
+DONE_BLOCKED_MSG = "⚠ 「完了」は他メンバーの担当のため末尾へ移動できません"
+
+
+def is_done_ticket(df_nodes: pd.DataFrame, idx: str) -> bool:
+    """自動生成の「完了」チケットか（check_auto_done と同じくタイトルで判定する）"""
+    return (str(df_nodes.loc[idx, "node_type"]) == "ticket"
+            and str(df_nodes.loc[idx, "title"]) == DONE_TICKET_TITLE)
+
+
+def keep_done_last(df_nodes: pd.DataFrame, parent_id: str, user: str) -> tuple:
+    """
+    parent_id 直下の「完了」チケットを兄弟の末尾へ移す（df_nodes をその場で更新）。
+    他ユーザーの行は保存されないため動かさない。戻り値: (動かしたか, 動かせない行があるか)
+    """
+    if parent_id in ("0", INBOX_PARENT) or df_nodes.empty:
+        return False, False
+    children = df_nodes[(df_nodes["parent_id"] == parent_id) & (df_nodes["status"] != "deleted")]
+    is_done = (children["node_type"] == "ticket") & (children["title"] == DONE_TICKET_TITLE)
+    dones, others = children[is_done], children[~is_done]
+    if dones.empty or others.empty:
+        return False, False
+    last = int(others["priority"].max())
+    top = int(children["priority"].max())
+    moved = blocked = False
+    for idx in dones.sort_values("priority").index:
+        if int(dones.at[idx, "priority"]) > last:
+            continue
+        if str(dones.at[idx, "assigned_to"]) != user:
+            blocked = True
+            continue
+        top += 1
+        df_nodes.loc[idx, "priority"] = top
+        moved = True
+    return moved, blocked
+
+
+def keep_all_done_last(df_nodes: pd.DataFrame, user: str) -> int:
+    """自分が担当する「完了」チケットをすべて末尾へ移し、動かした親の数を返す"""
+    if df_nodes.empty:
+        return 0
+    mine = df_nodes[(df_nodes["node_type"] == "ticket")
+                    & (df_nodes["title"] == DONE_TICKET_TITLE)
+                    & (df_nodes["assigned_to"] == user)
+                    & (df_nodes["status"] != "deleted")]
+    return sum(keep_done_last(df_nodes, str(pid), user)[0]
+               for pid in mine["parent_id"].unique())
+
+
 # ---------- 完了チェック（spec 2.2 自動 done 伝播） ----------
 
 def check_auto_done(df_nodes: pd.DataFrame, changed_idx: str) -> List[str]:
@@ -706,6 +757,7 @@ def status_change_error(df_nodes: pd.DataFrame, idx: str,
     仕様 2.3 のステータス変更制約を判定する。変更不可なら理由、可なら None を返す。
       - 未完了（todo/regularly）の子ノードがある親は done にできない
       - 親ノードが done のとき、子ノードを todo/regularly に戻せない
+      - 「完了」チケットは、未完了の兄弟があると done にできない
       - Inbox（Task 未設定）のチケットは done / regularly にできない（振り分けが先）
     """
     if idx not in df_nodes.index:
@@ -718,6 +770,12 @@ def status_change_error(df_nodes: pd.DataFrame, idx: str,
                                  & (df_nodes["status"].isin(_OPEN_STATUSES))]
         if not open_children.empty:
             return "未完了の子ノードがあるため done にできません（子を先に完了させてください）"
+        if is_done_ticket(df_nodes, idx):
+            siblings = df_nodes[(df_nodes["parent_id"] == df_nodes.loc[idx, "parent_id"])
+                                & (df_nodes["status"].isin(_OPEN_STATUSES))
+                                & (df_nodes["title"] != DONE_TICKET_TITLE)]
+            if not siblings.empty:
+                return "未完了の兄弟があるため「完了」を done にできません（先に他を完了させてください）"
     elif new_status in _OPEN_STATUSES:
         pid = str(df_nodes.loc[idx, "parent_id"] or "")
         if pid in df_nodes.index and str(df_nodes.loc[pid, "status"]) == "done":
@@ -2480,8 +2538,7 @@ def plan_preset(slots: dict, df_nodes: pd.DataFrame, user: str,
 # ---------- AI 連携（作業ツリーの書き出し・AI 返答の取り込み）----------
 
 AI_CONTEXT_DIR = "ai_context"   # output_dir 配下の書き出し先フォルダ
-AI_ROOT = "ROOT"                # AI 返答で project1 の親（最上位）を表す語
-# 種別 → 親に置ける種別（project1 は ROOT）
+# 種別 → 親に置ける種別（project1 は最上位のためキーなし）
 _AI_PARENT_TYPE = {child: parent for parent, child in CHILD_TYPE.items()}
 # 旧書式のキー名 → 新書式のキー名
 _AI_KEY_ALIASES = {"parent_idx": "parent", "idx": "move"}
@@ -2565,25 +2622,42 @@ def export_ai_context(out_dir, df_nodes: pd.DataFrame, user: str) -> Path:
     return folder
 
 
+def ai_parent_type(node_type: str) -> Optional[str]:
+    """node_type の親に置ける種別を返す（project1 は None）"""
+    return _AI_PARENT_TYPE.get(node_type)
+
+
+def _ai_date(value: str) -> tuple:
+    """日付文字列を YYYY-MM-DD に揃える。戻り値: (日付 or 空文字, 日付として読めなかったか)"""
+    if not value:
+        return "", False
+    try:
+        d = datetime.datetime.strptime(value.replace("/", "-"), "%Y-%m-%d")
+    except ValueError:
+        return "", True
+    return d.date().isoformat(), False
+
+
 def parse_ai_import(text: str, df_nodes: pd.DataFrame, user: str) -> tuple:
     """
-    AI の返答から取り込む項目を読み取る（DB には書かない）。
+    AI の返答から確認表の行を読み取る（DB にもメモリにも書かない）。
 
     書式（項目ごとに `---` の行で区切る）:
         type: project1〜project4 / task / ticket（省略時 ticket）
         title: タイトル
         parent: 親の IDX / 同じ返答内の仮ID / ROOT（project1 のとき）
         id: 仮ID（この項目の下に新しい項目を作るときだけ）
-        deadline: YYYY-MM-DD（省略可） / memo: メモ（省略可）
+        start: 開始日 / deadline: 納期（YYYY-MM-DD・省略可） / memo: メモ（省略可）
       Inbox の振り分け:
         move: Inbox チケットの IDX
         parent: 移動先 Task の IDX / 仮ID
     旧書式（parent_idx: / idx:、$$$items ブロック）も読める。
 
     戻り値: (items, errors, skipped)
-      items: 上から順。新規 {"kind": "new", "type", "title", "parent", "id", "deadline", "memo"}
-             （parent は既存 IDX・仮ID・"0"（最上位））/ 移動 {"kind": "move", "idx", "title", "parent"}
-      errors: 1 件でもあれば取り込まない / skipped: 取り込まない理由（エラーではない）
+      items: 上から順の行。親の誤りは行のまま返す（ai_row_problem で判定し、確認表で直す）
+        {"kind": "new"|"move", "type", "title", "parent"（既存 IDX・仮ID・"0"（最上位））,
+         "id", "start", "deadline", "memo", "note"（確認表に出す注意）, "idx"（move のみ）}
+      errors: 行にできない項目 / skipped: 取り込まない理由
     """
     items: list = []
     errors: list = []
@@ -2598,17 +2672,16 @@ def parse_ai_import(text: str, df_nodes: pd.DataFrame, user: str) -> tuple:
 
     inbox = inbox_tickets(df_nodes, user)
     used_inbox: set = set()  # 同じ Inbox チケットを二重に移動しない
-    temp_types: dict = {}    # 仮ID → 種別
+    temp_ids: set = set()
 
-    def _parent_type(pid: str) -> Optional[str]:
-        """親の種別を返す（ROOT は "ROOT"、見つからなければ None）"""
-        if pid in temp_types:
-            return temp_types[pid]
-        if pid.upper() == AI_ROOT:
-            return AI_ROOT
-        if pid in df_nodes.index and df_nodes.loc[pid, "status"] != "deleted":
-            return str(df_nodes.loc[pid, "node_type"])
-        return None
+    def _move_row(idx: str, parent: str, start: str, deadline: str, notes: list) -> dict:
+        row = df_nodes.loc[idx]
+        used_inbox.add(idx)
+        return {"kind": "move", "type": "ticket", "idx": idx, "title": str(row["title"]),
+                "parent": parent, "id": "", "memo": str(row.get("memo") or ""),
+                "start": start or _date_str(row.get("start_available")),
+                "deadline": deadline or _date_str(row.get("deadline")),
+                "note": " / ".join(notes)}
 
     for entry in re.split(r"(?m)^\s*-{3,}\s*$", block):
         item: dict = {}
@@ -2620,23 +2693,25 @@ def parse_ai_import(text: str, df_nodes: pd.DataFrame, user: str) -> tuple:
         if not item:
             continue
         parent = item.get("parent", "")
+        start, bad_start = _ai_date(item.get("start", ""))
+        deadline, bad_deadline = _ai_date(item.get("deadline", ""))
+        notes = []
+        if bad_start:
+            notes.append(f"開始日が読めないため空欄にしました: {item['start']}")
+        if bad_deadline:
+            notes.append(f"納期が読めないため空欄にしました: {item['deadline']}")
 
         # --- Inbox チケットの振り分け ---
         move_idx = item.get("move", "")
         if move_idx:
             if move_idx not in df_nodes.index:
                 skipped.append(f"IDX が見つかりません: {move_idx}")
-                continue
-            title = str(df_nodes.loc[move_idx, "title"])
-            if move_idx not in inbox.index:
-                skipped.append(f"振り分け済み（Inbox にありません）: {title}")
+            elif move_idx not in inbox.index:
+                skipped.append(f"振り分け済み（Inbox にありません）: {df_nodes.loc[move_idx, 'title']}")
             elif move_idx in used_inbox:
-                skipped.append(f"同じチケットが重複しています: {title}")
-            elif _parent_type(parent) != "task":
-                skipped.append(f"移動先の Task がありません: {title}")
+                skipped.append(f"同じチケットが重複しています: {df_nodes.loc[move_idx, 'title']}")
             else:
-                used_inbox.add(move_idx)
-                items.append({"kind": "move", "idx": move_idx, "title": title, "parent": parent})
+                items.append(_move_row(move_idx, parent, start, deadline, notes))
             continue
 
         # --- 新規作成 ---
@@ -2648,23 +2723,12 @@ def parse_ai_import(text: str, df_nodes: pd.DataFrame, user: str) -> tuple:
         if not title:
             errors.append(f"title が空の項目があります（type: {ntype}）")
             continue
-        if not parent:
-            errors.append(f"parent が空です: {title}")
-            continue
-        ptype = _parent_type(parent)
-        expected = _AI_PARENT_TYPE.get(ntype, AI_ROOT)
-        if ptype is None:
-            errors.append(f"parent が見つかりません: {parent}（{title}）")
-            continue
-        if ptype != expected:
-            errors.append(f"{ntype} の親は {expected} にしてください: {title}（parent は {ptype}）")
-            continue
         tid = item.get("id", "")
         if tid:
-            if tid in temp_types or tid in df_nodes.index or tid.upper() == AI_ROOT:
+            if tid in temp_ids or tid in df_nodes.index:
                 errors.append(f"id が重複しています: {tid}（{title}）")
                 continue
-            temp_types[tid] = ntype
+            temp_ids.add(tid)
 
         # Inbox に同名チケット（1 件）があれば、move の書き忘れとみなして移動扱い
         if ntype == "ticket":
@@ -2672,14 +2736,113 @@ def parse_ai_import(text: str, df_nodes: pd.DataFrame, user: str) -> tuple:
             same = [i for i in inbox.index
                     if i not in used_inbox and norm_key(inbox.loc[i, "title"]) == key]
             if len(same) == 1:
-                used_inbox.add(same[0])
-                items.append({"kind": "move", "idx": same[0],
-                              "title": str(inbox.loc[same[0], "title"]), "parent": parent,
-                              "note": "move 指定なし・同名の Inbox チケットと判断"})
+                notes.append("move 指定なし・同名の Inbox チケットと判断")
+                items.append(_move_row(same[0], parent, start, deadline, notes))
                 continue
 
         items.append({"kind": "new", "type": ntype, "title": title,
-                      "parent": "0" if ptype == AI_ROOT else parent, "id": tid,
-                      "deadline": item.get("deadline", ""), "memo": item.get("memo", "")})
+                      "parent": "0" if ntype == "project1" else parent, "id": tid,
+                      "start": start, "deadline": deadline, "memo": item.get("memo", ""),
+                      "note": " / ".join(notes)})
 
     return items, errors, skipped
+
+
+def ai_row_problem(item: dict, items: list, df_nodes: pd.DataFrame) -> str:
+    """確認表の行を取り込めない理由を返す（取り込めるなら空文字）"""
+    expected = ai_parent_type(item["type"])
+    if expected:
+        parent = item.get("parent", "")
+        new_parent = next((it for it in items if parent and it.get("id") == parent), None)
+        if new_parent:
+            ptype = new_parent["type"]
+        elif parent in df_nodes.index and df_nodes.loc[parent, "status"] != "deleted":
+            ptype = str(df_nodes.loc[parent, "node_type"])
+            if df_nodes.loc[parent, "status"] in ("done", "cancel"):
+                return "親が完了・中止済みです。親を選択してください"
+        else:
+            return "親を選択してください"
+        if ptype != expected:
+            return f"親は {expected} を選択してください（今は {ptype}）"
+    if item.get("start") and item.get("deadline") and item["start"] > item["deadline"]:
+        return "開始日が納期より後です"
+    return ""
+
+
+def ai_row_warning(item: dict, df_nodes: pd.DataFrame) -> str:
+    """確認表の行の注意を返す（取り込みは止めない）"""
+    notes = [item["note"]] if item.get("note") else []
+    if item["kind"] == "new":
+        same = df_nodes[(df_nodes["parent_id"] == item.get("parent", ""))
+                        & (df_nodes["status"] != "deleted")
+                        & (df_nodes["title"] == item["title"])]
+        if not same.empty:
+            notes.append("同じ親に同名の項目があります")
+    return " / ".join(notes)
+
+
+def ai_parent_candidates(df_nodes: pd.DataFrame, node_type: str) -> List[tuple]:
+    """node_type の親に選べる既存項目を [(階層パス, IDX), ...] で返す（完了・中止・削除済みを除く）。
+    同じパスが複数あると見分けられないため、その場合は IDX を添える"""
+    ptype = ai_parent_type(node_type)
+    if not ptype or df_nodes.empty:
+        return []
+    rows = df_nodes[(df_nodes["node_type"] == ptype)
+                    & (~df_nodes["status"].isin(["done", "cancel", "deleted"]))]
+    paths = [(" > ".join(node_path_titles(df_nodes, str(i))), str(i)) for i in rows.index]
+    counts: dict = {}
+    for p, _ in paths:
+        counts[p] = counts.get(p, 0) + 1
+    return sorted((f"{p} ({i})" if counts[p] > 1 else p, i) for p, i in paths)
+
+
+def apply_ai_import(df_nodes: pd.DataFrame, items: list, user: str) -> dict:
+    """
+    確認表で選んだ行を df_nodes に反映する（インメモリ。Ctrl+Z 可・Ctrl+S で保存）。
+    親の行が子より下にあってもよいよう、新規は階層の上から順に作る。
+    戻り値: {"created": [IDX], "moved": [IDX], "resolved": {仮ID: IDX}, "parents": {親 IDX}}
+    """
+    today = datetime.date.today().isoformat()
+    resolved: dict = {}
+    created: list = []
+    moved: list = []
+    parents: set = set()
+
+    def _next_priority(parent_id: str) -> int:
+        siblings = df_nodes[(df_nodes["parent_id"] == parent_id)
+                            & (df_nodes["status"] != "deleted")]
+        return int(siblings["priority"].max()) + 1 if not siblings.empty else 1
+
+    news = [it for it in items if it["kind"] == "new"]
+    for it in sorted(news, key=lambda x: NODE_TYPES.index(x["type"])):
+        parent_id = resolved.get(it["parent"], it["parent"])
+        ds = create_initial_node(user, it["type"], it["title"], parent_id=parent_id,
+                                 priority=_next_priority(parent_id))
+        if parent_id in df_nodes.index:
+            ds["color"] = str(df_nodes.loc[parent_id, "color"] or ds["color"])  # 親の色を引き継ぐ
+        for key, col in (("start", "start_available"), ("deadline", "deadline"), ("memo", "memo")):
+            if it.get(key):
+                ds[col] = it[key]
+        df_nodes.loc[ds.name] = ds
+        # 親ノード（task 以上）には「詳細作成」「完了」チケットを自動生成（画面から作るときと同じ）
+        if it["type"] != "ticket":
+            for child in build_auto_children(ds, user):
+                df_nodes.loc[child.name] = child
+        created.append(str(ds.name))
+        parents.add(parent_id)
+        if it.get("id"):
+            resolved[it["id"]] = str(ds.name)
+
+    for it in items:
+        if it["kind"] != "move":
+            continue
+        parent_id = resolved.get(it["parent"], it["parent"])
+        df_nodes.loc[it["idx"], "priority"] = _next_priority(parent_id)
+        df_nodes.loc[it["idx"], "parent_id"] = parent_id
+        df_nodes.loc[it["idx"], "start_available"] = it.get("start") or None
+        df_nodes.loc[it["idx"], "deadline"] = it.get("deadline") or None
+        df_nodes.loc[it["idx"], "updated_at"] = today
+        moved.append(it["idx"])
+        parents.add(parent_id)
+
+    return {"created": created, "moved": moved, "resolved": resolved, "parents": parents}
