@@ -1768,12 +1768,13 @@ def test_quick_add_inbox(win, task_idx, tmpdir):
             and kinds[2][0] == "new", kinds
         n_before = len(state.df_nodes)
         view.text_edit.setPlainText(text)
-        orig_q = QMessageBox.question
-        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+        import ui_sub
+        orig_exec = ui_sub.AIImportDialog.exec
+        ui_sub.AIImportDialog.exec = lambda self: self._on_import()
         try:
             view._on_import_tickets()
         finally:
-            QMessageBox.question = orig_q
+            ui_sub.AIImportDialog.exec = orig_exec
         df = state.df_nodes
         assert df.loc[inbox_idx, "parent_id"] == task_idx
         assert df.loc[extra.name, "parent_id"] == task_idx
@@ -1827,7 +1828,9 @@ def test_ai_context(win, task_idx, ticket2_idx):
     print("\n[AI] 作業ツリー書き出し / P1〜Ticket 取り込みテスト")
     import logic as LG
     import db as DB
-    from PySide6.QtWidgets import QMessageBox
+    import ui_sub
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QDialog
     state = win.state
     view = win.ai_import_view
 
@@ -1847,21 +1850,140 @@ def test_ai_context(win, task_idx, ticket2_idx):
     except Exception as e:
         ng("作業ツリーの Markdown", e)
 
-    # 書式エラー: 親子の組み合わせ違い・不明な type・不明な親・仮ID の重複
+    # 読み取り: 行にできないものは errors、親の誤りは行のまま問題として返す
     try:
-        cases = {
-            "type: task\ntitle: x\nparent: ROOT": "task の親は project4",
-            "type: epic\ntitle: x\nparent: ROOT": "type が不正",
-            "type: project2\ntitle: x\nparent: new9": "parent が見つかりません",
-            ("type: project1\ntitle: a\nparent: ROOT\nid: new1\n---\n"
-             "type: project1\ntitle: b\nparent: ROOT\nid: new1"): "id が重複",
-        }
-        for text, expect in cases.items():
-            _, errors, _ = LG.parse_ai_import(text, state.df_nodes, state.user)
-            assert errors and expect in errors[0], (text, errors)
-        ok("書式エラー: 親子違い・不明 type・不明 parent・仮ID 重複を検出")
+        _, errors, _ = LG.parse_ai_import("type: epic\ntitle: x\nparent: ROOT",
+                                          state.df_nodes, state.user)
+        assert errors and "type が不正" in errors[0], errors
+        text = ("type: project1\ntitle: a\nparent: ROOT\nid: new1\n---\n"
+                "type: project1\ntitle: b\nparent: ROOT\nid: new1")
+        items, errors, _ = LG.parse_ai_import(text, state.df_nodes, state.user)
+        assert len(items) == 1 and "id が重複" in errors[0], (items, errors)
+        for text, expect in (("type: task\ntitle: x\nparent: ROOT", "親を選択"),
+                             ("type: project2\ntitle: x\nparent: new9", "親を選択"),
+                             (f"type: project2\ntitle: x\nparent: {task_idx}", "親は project1")):
+            items, errors, _ = LG.parse_ai_import(text, state.df_nodes, state.user)
+            problem = LG.ai_row_problem(items[0], items, state.df_nodes)
+            assert not errors and expect in problem, (text, errors, problem)
+        ok("読み取り: 不明 type・仮ID 重複は通知、親の誤りは行のまま問題にする")
     except Exception as e:
-        ng("書式エラーの検出", e)
+        ng("AI 返答の読み取り", e)
+
+    try:
+        text = (f"type: ticket\ntitle: 日付確認\nparent: {task_idx}\n"
+                "start: 2026/1/5\ndeadline: 来週")
+        items, _, _ = LG.parse_ai_import(text, state.df_nodes, state.user)
+        it = items[0]
+        assert it["start"] == "2026-01-05" and it["deadline"] == "" and "読めない" in it["note"], it
+        it["deadline"] = "2026-01-01"
+        assert "開始日が納期より後" in LG.ai_row_problem(it, items, state.df_nodes)
+        ok("日付: 表記を揃え、読めない日付は空欄＋注意、開始日 > 納期は取り込めない")
+    except Exception as e:
+        ng("取り込みの日付", e)
+
+    # 親の候補: 完了の親を外す / 同じパスは IDX で見分ける
+    try:
+        p1 = DB.create_initial_node(state.user, "project1", "候補P1", "0")
+        same = [DB.create_initial_node(state.user, "project2", "同名P2", p1.name) for _ in range(2)]
+        closed = DB.create_initial_node(state.user, "project2", "完了P2", p1.name)
+        closed["status"] = "done"
+        for n in [p1, closed] + same:
+            state.df_nodes.loc[n.name] = n
+        cands = LG.ai_parent_candidates(state.df_nodes, "project3")
+        labels = [c[0] for c in cands if "候補P1" in c[0]]
+        assert len(labels) == 2 and len(set(labels)) == 2 and same[0].name in " ".join(labels), labels
+        item = {"kind": "new", "type": "project3", "title": "x", "parent": closed.name}
+        assert "完了・中止" in LG.ai_row_problem(item, [item], state.df_nodes)
+        state.df_nodes = state.df_nodes.drop([p1.name, closed.name] + [n.name for n in same])
+        ok("親の候補: 完了の親は不可、同じパスは IDX で区別")
+    except Exception as e:
+        ng("親の候補", e)
+
+    # 確認表: 最初は全部チェック、親を外すと子も外れ、子を付けると親も付く
+    def _rows(text):
+        items, errors, skipped = LG.parse_ai_import(text, state.df_nodes, state.user)
+        return ui_sub.AIImportDialog(state, items, errors + skipped, win)
+
+    def _check(dlg, title, on):
+        row = next(r for r, it in enumerate(dlg.items) if it["title"] == title)
+        dlg.table.item(row, 0).setCheckState(Qt.CheckState.Checked if on
+                                             else Qt.CheckState.Unchecked)
+
+    def _checked(dlg):
+        return [it["title"] for it in dlg.items if it["checked"]]
+
+    chain = ("type: project1\ntitle: 表P1\nparent: ROOT\nid: new1\n---\n"
+             "type: project2\ntitle: 表P2\nparent: new1\nid: new2\n---\n"
+             "type: project3\ntitle: 表P3\nparent: new2\n")
+    try:
+        dlg = _rows(chain)
+        assert _checked(dlg) == ["表P1", "表P2", "表P3"], _checked(dlg)
+        _check(dlg, "表P1", False)
+        assert _checked(dlg) == [], _checked(dlg)
+        assert "0 件" in dlg.import_btn.text() and not dlg.import_btn.isEnabled()
+        _check(dlg, "表P3", True)
+        assert _checked(dlg) == ["表P1", "表P2", "表P3"], _checked(dlg)
+        ok("確認表: 初期は全チェック、親を外すと子も外れ、子を付けると親も付く")
+    except Exception as e:
+        ng("確認表のチェック連動", e)
+
+    # 確認表: 一部だけ取り込むと残りは親を実 IDX にして表に残り、全部取り込むと閉じる
+    try:
+        n_before = len(state.df_nodes)
+        dlg = _rows(chain)
+        _check(dlg, "表P3", False)
+        dlg._on_import()
+        df = state.df_nodes
+        p2 = df.index[df["title"] == "表P2"][0]
+        assert [it["title"] for it in dlg.items] == ["表P3"] and dlg.items[0]["parent"] == p2
+        assert dlg.table.rowCount() == 1 and dlg.result() == 0, "残りがあるのに閉じた"
+        assert dlg.table.cellWidget(0, 3).currentData(Qt.ItemDataRole.UserRole) == p2
+        _check(dlg, "表P3", True)
+        dlg._on_import()
+        assert dlg.result() == QDialog.DialogCode.Accepted, "全件取り込んでも閉じない"
+        assert len(state.df_nodes) == n_before + 3 + 6
+        assert state.db.read_nodes().index.isin([p2]).sum() == 0, "保存前に DB へ書かれた"
+        assert state.nodes_modified, "Ctrl+S 待ちにならない"
+        ok("確認表: 一部取り込み→残りは残る、全件取り込みで閉じる、保存までは DB に書かない")
+    except Exception as e:
+        ng("確認表の一部取り込み", e)
+
+    # 確認表: 問題のある行は未チェック、親を選ぶと配下ごとチェックが戻る
+    try:
+        dlg = _rows("type: project2\ntitle: 誤P2\nparent: new9\nid: new1\n---\n"
+                    "type: project3\ntitle: 誤P3\nparent: new1\n---\n"
+                    "type: task\ntitle: 誤Task\nparent: ROOT\n")
+        assert _checked(dlg) == [], _checked(dlg)
+        assert dlg.table.item(0, 6).text().startswith("✗")
+        assert not dlg.table.item(0, 0).flags() & Qt.ItemFlag.ItemIsEnabled
+        combo = dlg.table.cellWidget(0, 3)
+        combo.setCurrentIndex(combo.findData(state.df_nodes.index[
+            state.df_nodes["title"] == "表P1"][0]))
+        assert _checked(dlg) == ["誤P2", "誤P3"], _checked(dlg)
+        ok("確認表: 問題のある行は取り込めず、親を直すと配下ごとチェックが戻る")
+    except Exception as e:
+        ng("確認表の問題行", e)
+
+    # 確認表: 親の変更・日付の変更が取り込みに反映され、親が子より下でも作れる
+    try:
+        dlg = _rows("type: ticket\ntitle: 表Ticket\nparent: new1\n---\n"
+                    f"type: task\ntitle: 表Task\nparent: {task_idx}\nid: new1\n")
+        assert "親は project4" in dlg.items[1]["problem"], dlg.items[1]
+        p4 = state.df_nodes.index[state.df_nodes["node_type"] == "project4"][0]
+        combo = dlg.table.cellWidget(1, 3)
+        combo.setCurrentIndex(combo.findData(p4))
+        assert "🆕表Task" in dlg.table.cellWidget(0, 3).currentText()
+        dlg._on_date_changed(dlg.items[0], "deadline", "2026-12-24")
+        dlg._on_date_changed(dlg.items[0], "start", "2026-12-20")
+        dlg._on_import()
+        df = state.df_nodes
+        ticket = df[df["title"] == "表Ticket"].iloc[0]
+        task = df.index[df["title"] == "表Task"][0]
+        assert ticket["parent_id"] == task and df.loc[task, "parent_id"] == p4
+        assert ticket["deadline"] == "2026-12-24" and ticket["start_available"] == "2026-12-20"
+        ok("確認表: 親・日付の変更を反映し、親が下の行でも正しく作成")
+    except Exception as e:
+        ng("確認表の編集", e)
 
     # 取り込み: ROOT から project1〜ticket を仮ID でつなげて作成 + Inbox を新規 Task へ移動
     try:
@@ -1876,29 +1998,32 @@ def test_ai_context(win, task_idx, ticket2_idx):
                 f"move: {inbox_t.name}\nparent: new5\n```")
         n_before = len(state.df_nodes)
         view.text_edit.setPlainText(text)
-        orig_q = QMessageBox.question
-        QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
+        orig_exec = ui_sub.AIImportDialog.exec
+        ui_sub.AIImportDialog.exec = lambda self: self._on_import()
         try:
             view._on_import_tickets()
         finally:
-            QMessageBox.question = orig_q
+            ui_sub.AIImportDialog.exec = orig_exec
+        assert view.text_edit.toPlainText() == "", "全件取り込み後もテキストが残っている"
         df = state.df_nodes
         idx = {t: df.index[df["title"] == t][0] for t in
                ("AI-P1", "AI-P2", "AI-P3", "AI-P4", "AI-Task", "AI-Ticket")}
         assert df.loc[idx["AI-P1"], "parent_id"] == "0"
-        chain = ["AI-P1", "AI-P2", "AI-P3", "AI-P4", "AI-Task", "AI-Ticket"]
-        for parent, child in zip(chain, chain[1:]):
+        chain_t = ["AI-P1", "AI-P2", "AI-P3", "AI-P4", "AI-Task", "AI-Ticket"]
+        for parent, child in zip(chain_t, chain_t[1:]):
             assert df.loc[idx[child], "parent_id"] == idx[parent], child
             assert df.loc[idx[child], "node_type"] == DB.CHILD_TYPE[df.loc[idx[parent], "node_type"]]
         assert df.loc[idx["AI-Task"], "memo"] == "a: b"
         assert df.loc[idx["AI-Ticket"], "deadline"] == "2026-12-01"
         assert df.loc[idx["AI-P2"], "color"] == df.loc[idx["AI-P1"], "color"], "親の色を引き継がない"
-        auto = df[df["parent_id"].isin([idx[t] for t in chain[:5]])
+        auto = df[df["parent_id"].isin([idx[t] for t in chain_t[:5]])
                   & df["title"].isin(["詳細作成", "完了"])]
         assert len(auto) == 10, f"自動チケット {len(auto)} 件"
         assert len(df) == n_before + 6 + 10
         assert df.loc[inbox_t.name, "parent_id"] == idx["AI-Task"], "Inbox が新規 Task へ移動しない"
-        ok("取り込み: ROOT〜Ticket を仮ID で作成・自動チケット付与・Inbox を新規 Task へ移動")
+        kids = df[df["parent_id"] == idx["AI-Task"]].sort_values("priority")["title"].tolist()
+        assert kids[-1] == "完了", kids
+        ok("取り込み: ROOT〜Ticket を仮ID で作成・自動チケット付与・Inbox を移動・「完了」は末尾")
     except Exception as e:
         ng("P1〜Ticket の取り込み", e)
 
@@ -1928,6 +2053,104 @@ def test_ai_context(win, task_idx, ticket2_idx):
         ng("保存時の AI 用ファイル書き出し", e)
     finally:
         state.config.report_output_dir = orig_dir
+
+
+def test_done_ticket(win):
+    """「完了」チケット: 常に末尾・未完了の兄弟があると done 不可"""
+    print("\n[完了] 「完了」チケットの順序とステータステスト")
+    import logic as LG
+    import db as DB
+    state = win.state
+    user = state.user
+    tp = win.main_pane.table_pane
+
+    def _titles(parent):
+        df = state.df_nodes
+        kids = df[(df["parent_id"] == parent) & (df["status"] != "deleted")]
+        return kids.sort_values("priority")["title"].tolist()
+
+    p4 = DB.create_initial_node(user, "project4", "完了確認P4", "0")
+    task = DB.create_initial_node(user, "task", "完了確認Task", p4.name)
+    for n in [p4, task] + DB.build_auto_children(task, user):
+        state.df_nodes.loc[n.name] = n
+    done_idx = state.df_nodes.index[(state.df_nodes["parent_id"] == task.name)
+                                    & (state.df_nodes["title"] == "完了")][0]
+
+    try:
+        win._create_quick_ticket({"title": "追加1", "hours": 0, "deadline": None, "start": None,
+                                  "memo": "", "parent": task.name})
+        assert _titles(task.name) == ["詳細作成", "追加1", "完了"], _titles(task.name)
+        tp.update_for_parent(task.name)
+        tp._add_from_blank_row("追加2")
+        assert _titles(task.name)[-2:] == ["追加2", "完了"], _titles(task.name)
+        ok("追加したチケットの後ろに「完了」が来る（Ctrl+N・Edit の空行）")
+    except Exception as e:
+        ng("「完了」を末尾に保つ", e)
+
+    try:
+        tp._rebuild_table()
+        before = _titles(task.name)
+        rows = [r for r in range(tp.table.rowCount())
+                if tp.table.item(r, 0) and tp.table.item(r, 0).text() == "完了"]
+        tp.table.setCurrentCell(rows[0], 0)
+        tp._swap_adjacent(-1)
+        tp.table.setCurrentCell(rows[0] - 1, 0)
+        tp._swap_adjacent(1)
+        assert _titles(task.name) == before, _titles(task.name)
+        ok("▲▼ で「完了」とは入れ替えできない")
+    except Exception as e:
+        ng("「完了」の入れ替え防止", e)
+
+    try:
+        # 他メンバー担当の「完了」は動かさず警告する
+        warns = []
+        orig_warn = state.warn_func
+        state.warn_func = warns.append
+        state.df_nodes.loc[done_idx, "assigned_to"] = "tanaka@email.com"
+        win._create_quick_ticket({"title": "追加3", "hours": 0, "deadline": None, "start": None,
+                                  "memo": "", "parent": task.name})
+        state.warn_func = orig_warn
+        assert _titles(task.name)[-1] == "追加3" and warns == [LG.DONE_BLOCKED_MSG], warns
+        state.df_nodes.loc[done_idx, "assigned_to"] = user
+
+        # 既存データは保存時に直す
+        state.df_nodes.loc[done_idx, "priority"] = 1
+        state.save()
+        assert state.done_moved == 1 and _titles(task.name)[-1] == "完了", _titles(task.name)
+        assert int(state.db.read_nodes().loc[done_idx, "priority"]) \
+            == int(state.df_nodes.loc[done_idx, "priority"]), "保存されていない"
+        state.save()
+        assert state.done_moved == 0, "直した後も動かしている"
+        ok("他メンバーの「完了」は警告のみ、既存データは保存時に自分の分を直す")
+    except Exception as e:
+        ng("他メンバーの「完了」・既存データ", e)
+
+    try:
+        df = state.df_nodes
+        assert "未完了の兄弟" in (LG.status_change_error(df, done_idx, "done") or "")
+        kids = df[(df["parent_id"] == task.name) & (df["title"] != "完了")].index
+        df.loc[kids[0], "status"] = "regularly"
+        for i in kids[1:]:
+            df.loc[i, "status"] = "cancel"
+        assert "未完了の兄弟" in (LG.status_change_error(df, done_idx, "done") or "")
+        df.loc[kids[0], "status"] = "done"
+        assert LG.status_change_error(df, done_idx, "done") is None
+        twin = DB.create_initial_node(user, "ticket", "完了", task.name)
+        df.loc[twin.name] = twin
+        assert LG.status_change_error(df, done_idx, "done") is None, "「完了」どうしで詰まる"
+        df.drop(twin.name, inplace=True)
+        assert LG.status_change_error(df, kids[0], "done") is None, "通常チケットまで制限された"
+        LG.apply_status(df, done_idx, "done")
+        assert df.loc[task.name, "status"] == "done", "親の自動 done が動かない"
+        ok("未完了の兄弟があると「完了」は done 不可、全部終われば親も自動 done")
+    except Exception as e:
+        ng("「完了」の done 制約", e)
+    state.df_nodes = state.df_nodes.drop(
+        state.df_nodes.index[state.df_nodes["parent_id"] == task.name].tolist()
+        + [task.name, p4.name])
+    state.db.save_nodes(state.df_nodes, user)
+    state.reload_nodes()
+    state.nodes_modified = False
 
 
 def test_config_unquote(tmpdir):
@@ -3432,6 +3655,7 @@ def main():
             test_quick_add_same_task_name(win)
             test_save_load(state)
             test_ui_state(state, version, win, tmpdir)
+            test_done_ticket(win)
             test_ai_context(win, task_idx, ticket2_idx)
             test_theme()
             test_requests_0925(win)

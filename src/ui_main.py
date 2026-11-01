@@ -1184,6 +1184,7 @@ class MainWindow(QMainWindow):
         # AppState にリフレッシュ関数・dirty 通知コールバックを登録
         state.refresh_func = self.refresh
         state.dirty_changed_func = self._update_save_btn_style
+        state.warn_func = lambda msg: self.statusBar().showMessage(msg, 8000)
 
         # 元に戻す / やり直し（編集のたびに状態を記録。1 操作内の複数変更は 1 回にまとめる）
         self._qa_recent_tasks: list = []  # クイック追加で最近使った Task（候補の上位表示用）
@@ -1748,6 +1749,7 @@ class MainWindow(QMainWindow):
         ds["start_available"] = r["start"].isoformat() if r["start"] else None
         ds["memo"] = r["memo"]
         self.state.df_nodes.loc[ds.name] = ds
+        self.state.keep_done_last(parent)
         if parent != DB.INBOX_PARENT:
             if parent in self._qa_recent_tasks:
                 self._qa_recent_tasks.remove(parent)
@@ -1936,6 +1938,8 @@ class MainWindow(QMainWindow):
             self._update_save_btn_style()
             self.main_pane.tree_pane.refresh()
             ai_note = self._export_ai_context()
+            if getattr(self.state, "done_moved", 0):
+                self.refresh()  # 既存データの「完了」を末尾へ直した分を表へ反映する
             skipped = getattr(self.state, "save_skipped", {})
             if skipped:
                 # 他ユーザーへ移管済みのノードは巻き戻さず保存対象外にした旨を通知
@@ -2005,6 +2009,9 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self._on_load()
+        if LG.keep_all_done_last(self.state.df_nodes, self.state.user):
+            self.state.nodes_modified = True
+            self.refresh()
         self.statusBar().showMessage(f"{dlg.imported_count} 件をインポートしました", 8000)
 
     def _on_gantt_edit_requested(self, idx: str) -> None:
@@ -2566,6 +2573,8 @@ class TreePane(QWidget):
             return
         for ds in nodes:
             self.state.df_nodes.loc[ds.name] = ds
+        for pid in {str(ds["parent_id"]) for ds in nodes}:
+            self.state.keep_done_last(pid)
         self.state.nodes_modified = True
         self.state.notify_dirty()
         self.state.refresh()
@@ -2639,6 +2648,7 @@ class TreePane(QWidget):
         # インメモリ更新・dirty フラグ・ツリー再構築
         df.loc[dragged_idx, "parent_id"] = new_parent_idx
         df.loc[dragged_idx, "updated_at"] = datetime.date.today().isoformat()
+        self.state.keep_done_last(new_parent_idx)
         self._selected_idx = dragged_idx
         self.state.nodes_modified = True
         self.state.notify_dirty()
@@ -3143,6 +3153,10 @@ class TablePane(QWidget):
         else:
             self.state.df_nodes.loc[idx, field] = value
             self.state.df_nodes.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+            if field in ("priority", "title") and self.state.keep_done_last(
+                    str(self.state.df_nodes.loc[idx, "parent_id"])):
+                # itemChanged の処理中は再描画できないため次のターンへ遅延する
+                QTimer.singleShot(0, self._rebuild_table)
         self._mark_dirty()
         # status/color 変更はテーブル外観（背景色等）を再描画
         if field in ("status", "color"):
@@ -3349,6 +3363,10 @@ class TablePane(QWidget):
             return
         if idx_cur not in self.state.df_nodes.index or idx_adj not in self.state.df_nodes.index:
             return
+        df = self.state.df_nodes
+        if LG.is_done_ticket(df, idx_cur) != LG.is_done_ticket(df, idx_adj):
+            self.info.set_info("⚠ 「完了」チケットは常に最後のため入れ替えできません")
+            return
         # 入れ替え相手が他ユーザーのノードだと片方の priority しか保存されないため不可
         user = self.state.user
         if (str(self.state.df_nodes.loc[idx_cur, "assigned_to"]) != user
@@ -3461,6 +3479,7 @@ class TablePane(QWidget):
         if child_type != "ticket":
             for _child in DB.build_auto_children(ds, self.state.user):
                 self.state.df_nodes.loc[_child.name] = _child
+        self.state.keep_done_last(self._parent_idx)
         self._mark_dirty()
         self.info.set_info(f"追加: {title}")
         # itemChanged シグナル処理中に setRowCount(0) を呼ぶと
@@ -4393,6 +4412,7 @@ class _NodeEditDialog(QDialog):
         df.loc[ds.name] = ds
         if str(ds["status"]) != old_status:
             LG.apply_status(df, ds.name, str(ds["status"]))
+        self.state.keep_done_last(str(ds["parent_id"]))
         return ds
 
     def get_series(self) -> pd.Series:
@@ -4817,6 +4837,7 @@ class InboxTriageDialog(QDialog):
             df.loc[idx, "parent_id"] = task_idx
             df.loc[idx, "priority"] = int(siblings["priority"].max()) + 1 if not siblings.empty else 1
             df.loc[idx, "updated_at"] = today
+            self.state.keep_done_last(task_idx)
             moved += 1
         if not moved:
             self.info.set_info("⚠ 移動先を選んだ行がありません")

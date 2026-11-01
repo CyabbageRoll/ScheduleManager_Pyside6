@@ -27,6 +27,8 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
+import logic as LG
+
 # -------------------------------------------------------
 # 定数
 # -------------------------------------------------------
@@ -325,6 +327,17 @@ class AppState:
         if callable(func):
             func()
 
+    def keep_done_last(self, parent_id: str) -> bool:
+        """親の直下の「完了」チケットを末尾へ移す。動かしたら True を返し、
+        他メンバーの担当で動かせないときは warn_func（MainWindow が登録）で知らせる"""
+        moved, blocked = LG.keep_done_last(self.df_nodes, str(parent_id), self.login_user)
+        if moved:
+            self.nodes_modified = True
+        func = getattr(self, "warn_func", None)
+        if blocked and callable(func):
+            func(LG.DONE_BLOCKED_MSG)
+        return moved
+
     def _log(self, level: str, msg: str) -> None:
         """ロガーがセットされていれば指定レベルで出力する"""
         if self.logger:
@@ -340,6 +353,10 @@ class AppState:
             raise RuntimeError("dbが利用中です。しばらく時間をおいて実行してください")
         self.save_skipped = {}
         try:
+            # 「完了」が末尾にない既存データも、保存のたびに自分の担当分を直す
+            self.done_moved = LG.keep_all_done_last(self.df_nodes, self.login_user)
+            if self.done_moved:
+                self.nodes_modified = True
             # nodes_modified が True のときのみ save_nodes を呼ぶ（DB アクセス最小化）
             if self.nodes_modified:
                 self.save_skipped = self.db.save_nodes(self.df_nodes, self.login_user) or {}

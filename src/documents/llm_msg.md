@@ -28,7 +28,8 @@ type: 種類（project1〜project4 / task / ticket のいずれか）
 title: タイトル（必須）
 parent: 親の IDX（必須。作業ツリーの IDX をそのまま、または下記の仮ID、project1 は ROOT）
 id: 仮ID（この項目の下に新しい項目を作るときだけ。new1, new2, … のように new + 数字）
-deadline: YYYY-MM-DD 形式の期日（省略可）
+start: YYYY-MM-DD 形式の開始日（省略可）
+deadline: YYYY-MM-DD 形式の納期（省略可）
 memo: メモや補足（省略可）
 
 ## 例（既存の Task の下にチケット / 新しい project4 → task → ticket をまとめて作成）
@@ -59,7 +60,7 @@ parent: new2
 - 既に作業ツリーにある項目と同じものは作らないでください
 - 担当者は自動的にあなたのアカウントに設定されます
 - project1〜task を作ると、その下に「詳細作成」「完了」チケットが自動で作られます（出力不要）
-- 不明な場合は deadline や memo を省略してください
+- 不明な場合は start や deadline、memo を省略してください
 
 ## Inbox（Task 未設定のチケット）の振り分け
 
