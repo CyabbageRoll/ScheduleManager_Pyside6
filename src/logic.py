@@ -241,7 +241,7 @@ def collect_daily_segments(df_daily: pd.DataFrame, df_nodes: pd.DataFrame,
         title, task_title = "（削除済み）", ""   # ノードが無い（削除済み）枠
         if df_nodes is not None and not df_nodes.empty \
                 and t_idx in df_nodes.index:
-            title = str(df_nodes.loc[t_idx, "title"])
+            title = display_title(df_nodes, t_idx)
             pid = str(df_nodes.loc[t_idx, "parent_id"])
             if pid in df_nodes.index:
                 task_title = str(df_nodes.loc[pid, "title"])
@@ -664,6 +664,75 @@ def schedule_tickets(df: pd.DataFrame, member: str, daily_h: float, holidays,
     return result
 
 
+# ---------- Task 作業用チケット（Task を日次に割り当てるための「-」）----------
+
+TASK_WORK_TITLE = "-"
+
+
+def task_work_mask(df_nodes: pd.DataFrame) -> pd.Series:
+    """Task 作業用チケット（Task の直下にあるタイトル「-」のチケット）の行。
+    Project 直下・Inbox の「-」は普通のチケットとして扱う（今までどおり割り当てられるように）"""
+    if df_nodes.empty:
+        return pd.Series(False, index=df_nodes.index)
+    tasks = df_nodes.index[df_nodes["node_type"] == "task"]
+    return ((df_nodes["node_type"] == "ticket") & (df_nodes["title"] == TASK_WORK_TITLE)
+            & df_nodes["parent_id"].isin(tasks))
+
+
+def placeholder_mask(df_nodes: pd.DataFrame) -> pd.Series:
+    """done の判定で数えない「-」チケット（Task 直下に限らず Project 直下も。Inbox は除く）。
+    「-」はやること用の置き場なので、「完了」や親を done にする妨げにしない"""
+    if df_nodes.empty:
+        return pd.Series(False, index=df_nodes.index)
+    return ((df_nodes["node_type"] == "ticket") & (df_nodes["title"] == TASK_WORK_TITLE)
+            & (~df_nodes["parent_id"].isin(["0", INBOX_PARENT])))
+
+
+def is_task_work(df_nodes: pd.DataFrame, idx: str) -> bool:
+    if idx not in df_nodes.index:
+        return False
+    pid = str(df_nodes.loc[idx, "parent_id"])
+    return (str(df_nodes.loc[idx, "node_type"]) == "ticket"
+            and str(df_nodes.loc[idx, "title"]) == TASK_WORK_TITLE
+            and pid in df_nodes.index and str(df_nodes.loc[pid, "node_type"]) == "task")
+
+
+def display_title(df_nodes: pd.DataFrame, idx: str) -> str:
+    """画面表示用のタイトル。Task 作業用チケットは「📌親の名前」にする"""
+    if idx not in df_nodes.index:
+        return "（削除済み）"
+    if is_task_work(df_nodes, idx):
+        pid = str(df_nodes.loc[idx, "parent_id"])
+        if pid in df_nodes.index:
+            return f"📌{df_nodes.loc[pid, 'title']}"
+    return str(df_nodes.loc[idx, "title"])
+
+
+def get_task_work_ticket(df_nodes: pd.DataFrame, task_idx: str, user: str) -> tuple:
+    """
+    Task に日次を割り当てるための自分の作業用チケットを返す（なければ作る。df_nodes をその場で更新）。
+    既存の「-」も使い回し、完了・中止なら todo に戻す（同じ Task に何枚も作らないため）。
+    戻り値: (IDX, 作ったか)
+    """
+    df = df_nodes
+    mine = df[task_work_mask(df) & (df["parent_id"] == task_idx)
+              & (df["assigned_to"] == user) & (df["status"] != "deleted")]
+    if not mine.empty:
+        open_ = mine[mine["status"].isin(_OPEN_STATUSES)]
+        idx = str((open_ if not open_.empty else mine).sort_values("priority").index[0])
+        if df.loc[idx, "status"] not in _OPEN_STATUSES:
+            df.loc[idx, "status"] = "todo"
+            df.loc[idx, "actual_end"] = None
+            df.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+        return idx, False
+    siblings = df[(df["parent_id"] == task_idx) & (df["status"] != "deleted")]
+    ds = create_initial_node(user, "ticket", TASK_WORK_TITLE, parent_id=task_idx,
+                             priority=int(siblings["priority"].max()) + 1 if not siblings.empty else 1,
+                             color=str(df.loc[task_idx, "color"] or ""))
+    df.loc[ds.name] = ds
+    return str(ds.name), True
+
+
 # ---------- 「完了」チケットの順序 ----------
 
 DONE_TICKET_TITLE = "完了"
@@ -739,6 +808,7 @@ def check_auto_done(df_nodes: pd.DataFrame, changed_idx: str) -> List[str]:
     siblings = df_nodes[
         (df_nodes["parent_id"] == parent_id)
         & (~df_nodes["status"].isin(["cancel", "deleted", "done"]))
+        & (~placeholder_mask(df_nodes))
     ]
     # 全て完了・取消・削除の場合のみ親を done にする
     if siblings.empty:
@@ -766,14 +836,17 @@ def status_change_error(df_nodes: pd.DataFrame, idx: str,
             and new_status in ("done", "regularly")):
         return "Inbox のチケットは Task へ振り分けてから変更してください"
     if new_status == "done":
+        # 「-」チケットは親が done になると一緒に終わるため、未完了として数えない
         open_children = df_nodes[(df_nodes["parent_id"] == idx)
-                                 & (df_nodes["status"].isin(_OPEN_STATUSES))]
+                                 & (df_nodes["status"].isin(_OPEN_STATUSES))
+                                 & (~placeholder_mask(df_nodes))]
         if not open_children.empty:
             return "未完了の子ノードがあるため done にできません（子を先に完了させてください）"
         if is_done_ticket(df_nodes, idx):
             siblings = df_nodes[(df_nodes["parent_id"] == df_nodes.loc[idx, "parent_id"])
                                 & (df_nodes["status"].isin(_OPEN_STATUSES))
-                                & (df_nodes["title"] != DONE_TICKET_TITLE)]
+                                & (df_nodes["title"] != DONE_TICKET_TITLE)
+                                & (~placeholder_mask(df_nodes))]
             if not siblings.empty:
                 return "未完了の兄弟があるため「完了」を done にできません（先に他を完了させてください）"
     elif new_status in _OPEN_STATUSES:
@@ -934,6 +1007,12 @@ def apply_status(df_nodes: pd.DataFrame, idx: str, new_status: str) -> List[str]
     for pid in check_auto_done(df_nodes, idx):
         if str(df_nodes.loc[pid, "status"]) != "done":
             _set(pid, "done")
+    # done になった親の「-」チケットも一緒に終える
+    for pid in [i for i in changed if df_nodes.loc[i, "status"] == "done"]:
+        works = df_nodes[placeholder_mask(df_nodes) & (df_nodes["parent_id"] == pid)
+                         & (df_nodes["status"].isin(_OPEN_STATUSES))]
+        for w in works.index:
+            _set(w, "done")
     return changed
 
 
@@ -1555,7 +1634,8 @@ def calc_estimate_accuracy(df_nodes: pd.DataFrame, user: str) -> List[dict]:
         return res
     done = df_nodes[(df_nodes["node_type"] == "ticket")
                     & (df_nodes["status"] == "done")
-                    & (df_nodes["assigned_to"] == user)]
+                    & (df_nodes["assigned_to"] == user)
+                    & (~task_work_mask(df_nodes))]  # Task 作業用は見積がないため除く
     for idx, r in done.iterrows():
         est = float(r.get("estimated_hours", 0) or 0)
         act = float(r.get("actual_hours", 0) or 0)
@@ -1942,7 +2022,7 @@ def similar_ticket_hours(df_nodes: pd.DataFrame, title: str, user: str,
     if not src or df_nodes.empty:
         return None
     done = df_nodes[(df_nodes["node_type"] == "ticket") & (df_nodes["status"] == "done")
-                    & (df_nodes["assigned_to"] == user)]
+                    & (df_nodes["assigned_to"] == user) & (~task_work_mask(df_nodes))]
     hits = []
     for idx, r in done.iterrows():
         if idx == exclude_idx:
@@ -2336,7 +2416,8 @@ def achievement_summary(df_nodes: pd.DataFrame, df_daily: pd.DataFrame, user: st
     } for i, h in top]
 
     done = df_nodes[(df_nodes["node_type"] == "ticket") & (df_nodes["status"] == "done")
-                    & (df_nodes["assigned_to"] == user)] if not df_nodes.empty else df_nodes
+                    & (df_nodes["assigned_to"] == user)
+                    & (~task_work_mask(df_nodes))] if not df_nodes.empty else df_nodes
     completed = []
     for i, r in done.iterrows():
         end = _date_str(r.get("actual_end"))
@@ -2573,7 +2654,7 @@ def build_ai_tree_markdown(df_nodes: pd.DataFrame, user: str,
             if nt == "ticket":
                 # チケットは Task の直下にある自分の未完了分だけ
                 if (pid not in df.index or str(df.loc[pid, "node_type"]) != "task"
-                        or row["assigned_to"] != user
+                        or is_task_work(df, idx) or row["assigned_to"] != user
                         or row["status"] in ("done", "cancel")):
                     continue
                 dl = str(row.get("deadline") or "").strip()
@@ -2601,24 +2682,35 @@ def build_ai_inbox_markdown(df_nodes: pd.DataFrame, user: str,
     """AI 用に、自分の Inbox（Task 未設定）チケットを Markdown にする"""
     today = today or datetime.date.today()
     lines = [f"# Inbox（Task 未設定のチケット / {today.isoformat()} 時点 / {user}）", "",
-             "- 書式: `IDX | タイトル | 見積 | 納期 | memo`", ""]
+             "- 書式: `IDX | タイトル | 見積 | 納期 | memo | AIヒント`",
+             "- AIヒントは、振り分け先を選ぶ手がかりとして利用者が書いたもの（チケットの内容ではない）", ""]
     inbox = inbox_tickets(df_nodes, user)
     for idx, row in inbox.iterrows():
         est = float(row.get("estimated_hours") or 0)
         dl = str(row.get("deadline") or "").strip() or "-"
+        body, hint = split_ai_hint(row.get("memo"))
         lines.append(f"- {idx} | {_one_line(row['title'])} | {f'{est:g}h' if est else '-'} | "
-                     f"{dl} | {_one_line(row.get('memo'))}")
+                     f"{dl} | {_one_line(body)} | {_one_line(hint)}")
     if inbox.empty:
         lines.append("（なし）")
     return "\n".join(lines) + "\n"
 
 
-def export_ai_context(out_dir, df_nodes: pd.DataFrame, user: str) -> Path:
-    """<out_dir>/ai_context/ に work_tree.md と inbox.md を上書き保存し、フォルダを返す"""
+def export_ai_context(out_dir, df_nodes: pd.DataFrame, user: str,
+                      df_daily: Optional[pd.DataFrame] = None, df_log=None,
+                      today: Optional[datetime.date] = None) -> Path:
+    """<out_dir>/ai_context/ に work_tree.md・inbox.md と、当月・前月の worklog_YYYY-MM.md を
+    上書き保存し、フォルダを返す（前月も作り直すのは、月初に前月末を直した分を反映するため）"""
+    today = today or datetime.date.today()
     folder = Path(out_dir) / AI_CONTEXT_DIR
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "work_tree.md").write_text(build_ai_tree_markdown(df_nodes, user), encoding="utf-8")
     (folder / "inbox.md").write_text(build_ai_inbox_markdown(df_nodes, user), encoding="utf-8")
+    if df_daily is not None:
+        prev = today.replace(day=1) - datetime.timedelta(days=1)
+        for y, m in ((prev.year, prev.month), (today.year, today.month)):
+            (folder / f"worklog_{y:04d}-{m:02d}.md").write_text(
+                build_worklog_markdown(df_daily, df_nodes, df_log, user, y, m), encoding="utf-8")
     return folder
 
 
@@ -2636,6 +2728,145 @@ def _ai_date(value: str) -> tuple:
     except ValueError:
         return "", True
     return d.date().isoformat(), False
+
+
+# ---------- Inbox の AI ヒント・セル入力 ----------
+
+# AI ヒント（振り分けを AI に頼むときの手がかり）はメモ末尾のこの行に保存する（DB の列を増やさないため）
+AI_HINT_PREFIX = "[AIヒント] "
+
+
+def split_ai_hint(memo) -> tuple:
+    """メモを (本文, AI ヒント) に分ける"""
+    lines = str(memo or "").splitlines()
+    hints = [ln[len(AI_HINT_PREFIX):].strip() for ln in lines if ln.startswith(AI_HINT_PREFIX)]
+    body = "\n".join(ln for ln in lines if not ln.startswith(AI_HINT_PREFIX)).strip("\n")
+    return body, " ".join(h for h in hints if h)
+
+
+def join_ai_hint(body: str, hint: str) -> str:
+    """本文と AI ヒントを 1 つのメモにする（ヒントが空なら本文だけ）"""
+    hint = " ".join(str(hint or "").split())
+    body = str(body or "").strip("\n")
+    if not hint:
+        return body
+    return f"{body}\n{AI_HINT_PREFIX}{hint}" if body else f"{AI_HINT_PREFIX}{hint}"
+
+
+def parse_hours_text(text: str) -> tuple:
+    """表のセルに入力した工数を読む。戻り値: (時間 or None（空欄）, 読めたか)"""
+    t = _nfkc(str(text or "")).lower().replace(" ", "")
+    if t in ("", "-"):
+        return None, True
+    h = _parse_hours_token(t)
+    return (math.ceil(h * 4 - 1e-9) / 4, True) if h is not None and h >= 0 else (None, False)
+
+
+def parse_date_text(text: str, holidays=("SAT", "SUN"),
+                    today: Optional[datetime.date] = None) -> tuple:
+    """表のセルに入力した日付を読む（クイック追加と同じ書き方: 金曜・11/14・明日 等）。
+    戻り値: (YYYY-MM-DD or None（空欄）, 読めたか)"""
+    t = _nfkc(str(text or "")).lower().replace(" ", "")
+    if t in ("", "-"):
+        return None, True
+    d = _parse_date_token(t, today or datetime.date.today(), {h.upper() for h in holidays})
+    return (d.isoformat(), True) if d else (None, False)
+
+
+# ---------- 月次の作業記録（振り返り用に AI へ渡す）----------
+
+def build_worklog_markdown(df_daily: pd.DataFrame, df_nodes: pd.DataFrame, df_log,
+                           user: str, year: int, month: int) -> str:
+    """
+    1 か月分の自分の作業記録を Markdown にする。記録のある日だけ、日ごとに
+    勤務時間・体調/勤務地・作業内訳・Done にした項目・作業ログ・連絡事項を並べる。
+    """
+    ym = f"{year:04d}-{month:02d}"
+    days = [datetime.date(year, month, d).isoformat()
+            for d in range(1, calendar.monthrange(year, month)[1] + 1)]
+    mine = df_nodes[(df_nodes["assigned_to"] == user) & (df_nodes["status"] != "deleted")] \
+        if not df_nodes.empty else df_nodes
+
+    # Done にした項目（実績完了日で日付を決める）
+    done_by_day: dict = {}
+    for idx, r in mine[(mine["status"] == "done") & (~placeholder_mask(mine))].iterrows():
+        d = _date_str(r.get("actual_end"))
+        if d.startswith(ym):
+            done_by_day.setdefault(d, []).append(str(idx))
+
+    # 作業ログ（メモに追記した [MM/DD HH:MM] 本文。年は対象月から決める）
+    logs_by_day: dict = {}
+    for idx, r in mine.iterrows():
+        for line in str(r.get("memo") or "").splitlines():
+            m = WORK_LOG_RE.match(line.strip())
+            if m and int(m.group(1)) == month:
+                d = f"{ym}-{m.group(2)}"
+                logs_by_day.setdefault(d, []).append(
+                    (f"{m.group(3)}:{m.group(4)}", _one_line(r["title"]), m.group(5)))
+
+    def _path(idx: str) -> str:
+        return " > ".join(node_path_titles(df_nodes, idx)) if idx in df_nodes.index else "（削除済み）"
+
+    body: list = []
+    total = 0.0
+    by_task: dict = {}
+    n_days = 0
+    for d in days:
+        sch_idx = daily_sch_idx(d, user)
+        segs = collect_daily_segments(df_daily, df_nodes, d, user)
+        notes, health, place = "", "", ""
+        if df_log is not None and not df_log.empty and sch_idx in df_log.index:
+            lg = df_log.loc[sch_idx]
+            notes = str(lg.get("notes", "") or "").strip()
+            health = str(lg.get("health_status", "") or "")
+            place = str(lg.get("work_place", "") or "")
+        dones, logs = done_by_day.get(d, []), logs_by_day.get(d, [])
+        if not (segs or dones or logs or notes):
+            continue
+        n_days += 1
+        wd = "月火水木金土日"[datetime.date.fromisoformat(d).weekday()]
+        body += ["", f"## {d}（{wd}）", ""]
+        wh = calc_working_hours(df_daily, sch_idx)
+        if wh["total"] > 0:
+            body.append(f"- 勤務: {col_to_hhmm(wh['from'])}〜{col_to_hhmm(wh['to'])}"
+                        f"（休憩 {wh['break']:.2f}h、合計 {wh['total']:.2f}h）")
+        if health or place:
+            body.append(f"- 体調: {health or '-'} / 勤務地: {place or '-'}")
+        if segs:
+            body += ["", "### 作業内訳", "", "| 時間帯 | チケット | 階層 | 時間(h) |", "|---|---|---|---|"]
+            for seg in segs:
+                t_idx = seg["ticket_idx"]
+                parent = (str(df_nodes.loc[t_idx, "parent_id"])
+                          if t_idx in df_nodes.index else "")
+                task_path = _path(parent) if parent in df_nodes.index else "-"
+                body.append(f"| {seg['from']}〜{seg['to']} | {_md_escape(seg['title'])}"
+                            f" | {_md_escape(task_path)} | {seg['hours']:.2f} |")
+                total += seg["hours"]
+                by_task[task_path] = by_task.get(task_path, 0.0) + seg["hours"]
+        if dones:
+            body += ["", "### Done にした項目", ""]
+            for idx in dones:
+                r = df_nodes.loc[idx]
+                hours = ""
+                if r["node_type"] == "ticket":
+                    hours = (f"（見積 {float(r.get('estimated_hours') or 0):g}h"
+                             f" / 実績 {float(r.get('actual_hours') or 0):g}h）")
+                body.append(f"- [{r['node_type']}] {_path(idx)}{hours}")
+        if logs:
+            body += ["", "### 作業ログ", ""]
+            body += [f"- {hm} {title}: {_one_line(text)}" for hm, title, text in sorted(logs)]
+        if notes:
+            body += ["", "### メモ・連絡事項", "", notes]
+
+    head = [f"# 作業記録 {ym}（{user}）", "",
+            f"- 作業時間の合計: {total:g}h（記録のある日 {n_days} 日）"]
+    if by_task:
+        head += ["", "## 階層別の作業時間", "", "| 階層（チケットの親） | 時間(h) |", "|---|---|"]
+        head += [f"| {_md_escape(k)} | {v:g} |"
+                 for k, v in sorted(by_task.items(), key=lambda kv: -kv[1])]
+    if not n_days:
+        head += ["", "（記録なし）"]
+    return "\n".join(head + body) + "\n"
 
 
 def parse_ai_import(text: str, df_nodes: pd.DataFrame, user: str) -> tuple:
@@ -2841,6 +3072,7 @@ def apply_ai_import(df_nodes: pd.DataFrame, items: list, user: str) -> dict:
         df_nodes.loc[it["idx"], "parent_id"] = parent_id
         df_nodes.loc[it["idx"], "start_available"] = it.get("start") or None
         df_nodes.loc[it["idx"], "deadline"] = it.get("deadline") or None
+        df_nodes.loc[it["idx"], "memo"] = split_ai_hint(df_nodes.loc[it["idx"], "memo"])[0]
         df_nodes.loc[it["idx"], "updated_at"] = today
         moved.append(it["idx"])
         parents.add(parent_id)

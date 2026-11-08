@@ -336,7 +336,6 @@
   <tr><td><kbd>📌 Now</kbd></td><td>いまの予定と次の予定を常に手前の小窓に表示（通知なし）。<a href="#now-window">詳細</a></td></tr>
   <tr><td><kbd>🔎 詳細</kbd></td><td>右側の詳細ペイン（ノード詳細＋レポート）の表示/非表示を切替（Main/Plan/Edit で有効）。<a href="#detail-pane">詳細</a></td></tr>
   <tr><td><kbd>📖 Manual</kbd></td><td>このマニュアルをブラウザで開く</td></tr>
-  <tr><td><kbd>📥 Inbox n</kbd></td><td>Task 未設定チケットの件数。クリックで振り分け画面。<a href="#inbox">詳細</a></td></tr>
   <tr><td><kbd>🍅 ポモドーロ</kbd></td><td>集中タイマー。終了時に実績を日次スケジュールへ自動記録。<a href="#pomodoro">詳細</a></td></tr>
 </table>
 
@@ -346,6 +345,7 @@
   <span class="tab-btn">📊 Main</span>
   <span class="tab-btn">🗺 Plan</span>
   <span class="tab-btn">✏ Edit</span>
+  <span class="tab-btn">📥 Inbox <small>3</small></span>
   <span class="tab-btn">👥 Team</span>
   <span class="tab-btn">🔍 Search</span>
   <span class="tab-btn badge-red">📨 Request <small>3</small></span>
@@ -354,7 +354,8 @@
   <span class="tab-btn">ℹ Version</span>
   <span class="tab-btn">⚙ Config</span>
 </p>
-<p>未処理の Request が届いているとき、Request タブのボタンが<strong>赤背景</strong>で件数を表示します。</p>
+<p>未処理の Request が届いているとき、Request タブのボタンが<strong>赤背景</strong>で件数を表示します。Inbox タブには Inbox の件数が付き、上限到達・滞留のときは<strong>橙背景</strong>になります。</p>
+<p>中央のタブは、左の日次スケジュールや右の詳細ペインを広げると 300px まで縮みます。表示しきれない分は横にスクロールして見られます。</p>
 <p>各タブは <kbd>Ctrl</kbd>+<kbd>1</kbd>〜<kbd>9</kbd> でも切り替えられます（左から順）。</p>
 
 <h3>メンバー切替ボタン（2行目）</h3>
@@ -457,6 +458,17 @@
 <div class="card warn">
   <strong>⚠ 注意</strong>: 割り当てられるのは<strong>自分が担当するチケットのみ</strong>です。他のメンバーのチケットは割り当てられません。
 </div>
+
+<h4 id="task-work">Task をそのまま割り当てる（📌 Task 全体）</h4>
+<p>チケットに分けるほどではない細かい作業は、Task に直接時間を付けられます。</p>
+<ul>
+  <li>時間帯を選んで、ガントの <strong>Task の行をクリック</strong>。または右クリック →（プロジェクト）→「<strong>📌 Task 名（Task 全体）</strong>」</li>
+  <li>実際には、その Task の下にある自分の<strong>作業用チケット（タイトル「-」）</strong>に記録されます。無ければ自動で作り、あれば使い回します（完了済みなら todo に戻します）。他メンバーの Task でも、自分の担当として作ります</li>
+  <li>日次スケジュール・Now・作業記録では「<strong>📌Task 名</strong>」と表示されます。Main のガントには行を出しません（Task の行だけ表示）。Edit では灰色の「-」行で、状態（todo / regularly）もここか詳細ペインで変えられます。regularly のまま割り当てられます</li>
+  <li>「-」のチケットは（Project 直下のものも含め）親や「完了」を done にする妨げになりません。親が done になると一緒に done になります（実績工数はそのまま残ります）</li>
+  <li>見積がないため、見積アシスト・納期リスクの係数・成果のまとめの見積精度からは除きます</li>
+  <li>Task の直下にある「-」という名前のチケットは、以前から作っていたものも作業用チケットとして扱います。Project 直下や Inbox の「-」は普通のチケットのままです</li>
+</ul>
 
 <p><strong>Free ボタン</strong>: 選択したスロットに入力済みのチケットを消去します。</p>
 <p><strong>予定の時間を伸ばす・縮める</strong>: 予定の下端（最後の枠の下の線）にカーソルを合わせると上下の矢印に変わります。
@@ -645,14 +657,22 @@ Main タブのガントや日次スケジュールの予定を右クリック �
   チケットの新規作成・編集ダイアログにも同じ表示があり、「使う」で見積工数に反映できます（マウスを乗せると内訳が出ます）。
 </div>
 
-<h3 id="inbox">📥 Inbox（Task 未設定チケット）</h3>
+<h3 id="inbox">📥 Inbox タブ（Task 未設定チケット）</h3>
+<p>やることをとりあえずメモしておき、後でチケットとして Task に振り分けるためのタブです。メモ帳のように 1 行ずつ打ち込めます。</p>
 <ul>
-  <li>Edit ツリー先頭の <strong>📥 Inbox</strong>・ツールバーの <kbd>📥 Inbox n</kbd>・Today のバナーから確認できます</li>
+  <li><strong>追加</strong>: 表の最下行（桃色）に入力して <kbd>Enter</kbd>。クイック追加と同じ書き方で、工数・納期・<code>#メモ</code>を一緒に入れられます（<code>@Task</code> は振り分け先になり、まだ移動はしません）。続けて次の行を入力できます</li>
+  <li><strong>編集</strong>: タイトル・見積・開始日・納期・メモ・AI ヒントのセルはダブルクリックか、そのまま文字を打つと編集できます。日付は <code>11/14</code>・<code>金曜</code>・<code>明日</code> のようにも書けます。読めない値は元に戻ります</li>
+  <li><strong>振り分け先 Task</strong>: 文字を入れると絞り込めます。過去のチケット名から自動提案した先は黄色です。選んだだけでは移動せず、「<strong>✔ 振り分け</strong>」を押すと先を選んだ行をまとめて移動します（選んだ先はアプリを閉じるまで覚えています）</li>
+  <li><strong>AI ヒント</strong>: AI に振り分けを頼むときの手がかり（例: 顧客A・調査系・単発）。チケットの内容ではなく、振り分けの判断材料です。メモ末尾の <code>[AIヒント] …</code> の行に保存し、Task へ振り分けると自動で消えます</li>
+  <li>「🤖 AI 振り分け用にコピー」で、作業ツリーと Inbox 一覧（AI ヒント付き）をコピーできます。返答は AI取込タブで取り込みます</li>
+  <li>件数上限はこのタブでは止めません（上限を超えると見出しが赤になります）。<kbd>Ctrl</kbd>+<kbd>N</kbd> と Edit では従来どおり上限で止めます</li>
+</ul>
+<ul>
+  <li>Inbox タブ・Edit ツリー先頭の <strong>📥 Inbox</strong>・Today のバナーから確認できます</li>
   <li>Inbox のチケットは <strong>done / regularly にできません</strong>（Task へ振り分けてから）。日次スケジュールへの割り当ては可能です</li>
   <li>上限（<code>[Inbox] max_items</code>、既定10件）に達すると、クイック追加では <code>@Task</code> の指定が必須になります</li>
-  <li>上限到達、または <code>stale_days</code>（既定3日）を超えて残っている場合は、起動時に振り分け画面が開きます（1日1回）</li>
-  <li><strong>振り分け画面</strong>: 移動先 Task は過去のチケット名から自動提案（黄色）。経過日数は 3日超=橙・7日超=赤で表示</li>
-  <li>ツリーで Inbox のチケットを Task へドラッグしても振り分けられます</li>
+  <li>上限到達、または <code>stale_days</code>（既定3日）を超えて残っている場合は、起動時に Inbox タブが開きます（1日1回）。経過日数は 3日超=橙・7日超=赤で表示</li>
+  <li>ツリーで Inbox のチケットを Task へドラッグしても振り分けられます（AI ヒントは消えます）</li>
   <li><strong>AI で振り分け</strong>: AI取込の「プロンプトをコピー」に Inbox 一覧が付きます（保存時に <code>output_dir/ai_context/inbox.md</code> にも書き出されます）。LLM の返答を取り込むと、Inbox のチケットは<strong>新規作成されず移動</strong>します</li>
 </ul>
 
@@ -781,7 +801,7 @@ Main タブのガントや日次スケジュールの予定を右クリック �
 
 <h3 id="edit-priority">優先順位（priority）について</h3>
 <p>各アイテムには「順番」として優先順位が割り振られます。数字が小さいほど優先度が高く、ガントチャートの作業順序に影響します。</p>
-<p>自動生成の<strong>「完了」チケットは常に最後</strong>に並びます。チケットを追加・移動すると「完了」が自動で末尾へ動き、▲▼ で入れ替えることはできません（過去のデータは保存時に自分の担当分を直します）。他メンバー担当の「完了」は保存できないため動かさず、ステータスバーに警告を出します。また、同じ親の下に未完了の項目が残っていると「完了」を done にはできません。</p>
+<p>自動生成の<strong>「完了」チケットは常に最後</strong>に並びます。チケットを追加・移動すると「完了」が自動で末尾へ動き、▲▼ で入れ替えることはできません（過去のデータは保存時に自分の担当分を直します）。他メンバー担当の「完了」は保存できないため動かさず、ステータスバーに警告を出します。また、同じ親の下に未完了の項目が残っていると「完了」を done にはできません（「-」のチケットは数えません）。</p>
 
 <ul>
   <li>テーブル上の <strong>▲ / ▼</strong> ボタンで隣接行と優先順位を入れ替えられます（複数選択可）</li>
@@ -984,7 +1004,8 @@ parent: 移動先 Task の IDX / 仮ID</pre>
 <table>
   <tr><th>ファイル</th><th>内容</th></tr>
   <tr><td><code>ai_context/work_tree.md</code></td><td>Project1〜Task の階層（削除済み以外・他メンバー分も含む）と、各 Task にある自分の未完了チケット</td></tr>
-  <tr><td><code>ai_context/inbox.md</code></td><td>自分の Inbox（Task 未設定）のチケット</td></tr>
+  <tr><td><code>ai_context/inbox.md</code></td><td>自分の Inbox（Task 未設定）のチケット（AI ヒント付き）</td></tr>
+  <tr><td><code>ai_context/worklog_YYYY-MM.md</code></td><td>月ごとの自分の作業記録（振り返り用）。月の合計・階層別の時間と、記録のある日ごとの勤務時間・体調/勤務地・作業内訳・Done にした項目・作業ログ・連絡事項。保存のたびに<strong>当月と前月</strong>を作り直します</td></tr>
 </table>
 <p>書き出しに失敗しても保存は完了します（ステータスバーに警告を表示）。</p>
 
