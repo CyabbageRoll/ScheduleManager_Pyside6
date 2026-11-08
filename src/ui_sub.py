@@ -89,7 +89,7 @@ class GanttView(QWidget):
     EDF スケジューリングで算出した作業日を 🔨 マーカーで表示し、
     開始可能日は左縦線、納期は 🏁 で示す。
     """
-    ticket_clicked    = Signal(str)  # チケット行クリック時に IDX を送出
+    ticket_clicked    = Signal(str)  # チケット・Task 行クリック時に IDX を送出
     edit_requested    = Signal(str)  # Edit メニュー選択時に IDX を送出
     request_requested = Signal(str)  # 項目3: Request メニュー選択時に IDX を送出
     worklog_requested = Signal(str)  # F1: 作業ログ追加メニュー選択時に IDX を送出
@@ -367,6 +367,8 @@ class GanttView(QWidget):
                 & (df["node_type"] == "ticket")
                 & (~df["status"].isin(["cancel", "deleted"]))
             ].sort_values("priority").index.tolist()
+            # Task 作業用チケット（「-」）は行を出さない（Task の行をクリックして割り当てる）
+            work_idxs = [i for i in task_ticket_idxs if LG.is_task_work(df, i)]
 
             # フィルター後の表示チケットを収集（global_scheduleに含まれるもの優先）
             schedule_dict = global_schedule  # 参照を共有
@@ -382,9 +384,11 @@ class GanttView(QWidget):
                 if filter_status != "all" and t_status != filter_status:
                     continue
                 visible_tickets.append(t_idx)
+            has_work = any(i in visible_tickets for i in work_idxs)
+            visible_tickets = [i for i in visible_tickets if i not in work_idxs]
 
-            # 表示対象チケットがない場合はタスク行もスキップ
-            if not visible_tickets:
+            # 表示対象チケットがない場合はタスク行もスキップ（「-」だけの Task は行を残す）
+            if not visible_tickets and not has_work:
                 continue
 
             # ── Task ヘッダー行を挿入（Project 階層パスをタイトルに付記）──
@@ -417,6 +421,7 @@ class GanttView(QWidget):
                 f"納期      : {task_dl_str}" if task_dl_str else "納期      : —",
                 f"親        : {parent_path}" if parent_path else "親        : —",
                 f"見積工数  : {child_est:.1f}h  / 実績: {child_act:.1f}h",
+                "日次の時間帯を選んでこの行をクリックすると、Task 全体として割り当てます",
             ]
             task_tooltip = "\n".join(task_tip_lines)
 
@@ -586,13 +591,14 @@ class GanttView(QWidget):
         QToolTip.hideText()
 
     def _on_cell_clicked(self, row: int, col: int) -> None:
-        """セルクリック → Ticket IDX を ticket_clicked として送出"""
+        """セルクリック → Ticket / Task の IDX を ticket_clicked として送出
+        （Task は日次の時間帯を選んでいれば Task 全体として割り当てる）"""
         item = self.table.item(row, 0)
         if not item:
             return
         idx = item.data(Qt.ItemDataRole.UserRole)
         if idx and idx in self.state.df_nodes.index:
-            if self.state.df_nodes.loc[idx, "node_type"] == "ticket":
+            if self.state.df_nodes.loc[idx, "node_type"] in ("ticket", "task"):
                 self.ticket_clicked.emit(idx)
 
     def _on_context_menu(self, pos) -> None:

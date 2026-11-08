@@ -689,7 +689,7 @@ def main() -> None:
     window.restore_ui_state()
     window.setWindowTitle(f"{APP_NAME}  [{config.get_display_name(config.username)}]")
     window.show()
-    # Inbox が上限到達・滞留のときだけ振り分け画面を出す（表示完了後に実行）
+    # Inbox が上限到達・滞留のときだけ Inbox タブを開く（表示完了後に実行）
     from PySide6.QtCore import QTimer
     QTimer.singleShot(0, window.maybe_prompt_inbox)
 

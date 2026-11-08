@@ -16,13 +16,14 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate, QDateEdit, QAbstractItemDelegate, QMenu, QInputDialog,
     QTableWidgetSelectionRange,
     QApplication, QStyle, QProgressBar, QGridLayout, QListWidget, QListWidgetItem,
+    QCompleter,
 )
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QDate, Signal, QEvent, QTimer, QUrl, QRectF, QSettings
+from PySide6.QtCore import Qt, QDate, Signal, QEvent, QTimer, QUrl, QRectF, QSettings, QSize
 from PySide6.QtGui import (
     QColor, QFont, QKeySequence, QShortcut, QAction, QPen, QDesktopServices,
-    QBrush, QPainter, QPainterPath,
+    QBrush, QPainter, QPainterPath, QStandardItem, QStandardItemModel,
 )
 
 import db as DB
@@ -47,6 +48,7 @@ IDX_AIIMPORT = 7
 IDX_VERSION  = 8
 IDX_CONFIG   = 9
 IDX_TODAY    = 10
+IDX_INBOX    = 11
 
 # 日次スケジュールのプリセット（個人用・共有しない）。個人設定の user_config.ini と同じ場所に置く
 PRESET_FILE = Path(__file__).parent.parent / "schedule_presets.json"
@@ -444,6 +446,11 @@ class DailyScheduleWidget(QWidget):
             idx.row() for idx in self.schedule_table.selectedIndexes()
         ))
         is_ticket = self.state.df_nodes.loc[ticket_idx, "node_type"] == "ticket"
+        if (rows and self.state.current_member == self.state.user
+                and self.state.df_nodes.loc[ticket_idx, "node_type"] == "task"):
+            self._assign_task(rows, ticket_idx)
+            self.schedule_table.clearSelection()
+            return
 
         # 自分のチケットのみ割り当て可能
         assigned_to = str(self.state.df_nodes.loc[ticket_idx, "assigned_to"]) if is_ticket else ""
@@ -463,6 +470,9 @@ class DailyScheduleWidget(QWidget):
             title = self.state.df_nodes.loc[ticket_idx, "title"] if is_ticket else ""
             if title:
                 self.info.set_info(f"選択中: {title}")
+            elif self.state.current_member == self.state.user:
+                self.info.set_info("日次の時間帯を選んでから Task の行をクリックすると、"
+                                   "Task 全体として割り当てます")
 
     def _assign_to_rows(self, rows: list, ticket_idx: str) -> bool:
         """指定スロット行に自分担当チケットを割り当てる。
@@ -477,7 +487,7 @@ class DailyScheduleWidget(QWidget):
         node = self.state.df_nodes.loc[ticket_idx]
         is_own_ticket = (node["node_type"] == "ticket"
                          and str(node["assigned_to"]) == self.state.user)
-        title = str(node["title"])
+        title = LG.display_title(self.state.df_nodes, ticket_idx)
         if not is_own_ticket:
             self.info.set_info(f"⚠ {title} は自分のチケットではありません")
             return False
@@ -485,6 +495,19 @@ class DailyScheduleWidget(QWidget):
         self.state.push_recent_ticket(ticket_idx)
         self.info.set_info(f"割り当て完了: {title}")
         return True
+
+    def _assign_task(self, rows: list, task_idx: str) -> bool:
+        """Task を割り当てる。実際は Task の下の自分の作業用チケット（「-」）へ割り当てる
+        （なければ作る。他メンバーの Task でも自分の担当として作る）"""
+        df = self.state.df_nodes
+        if df.loc[task_idx, "status"] in ("done", "cancel", "deleted"):
+            self.info.set_info("⚠ 完了・中止の Task には割り当てできません")
+            return False
+        work_idx, created = LG.get_task_work_ticket(df, task_idx, self.state.user)
+        if created:
+            self.state.keep_done_last(task_idx)
+        self.state.nodes_modified = True
+        return self._assign_to_rows(rows, work_idx)
 
     # ── 右クリックメニューによる割り当て ──
 
@@ -506,7 +529,7 @@ class DailyScheduleWidget(QWidget):
         clicked = self.schedule_table.item(self.schedule_table.rowAt(pos.y()), 1)
         log_idx = clicked.data(Qt.ItemDataRole.UserRole) if clicked else None
         if log_idx and log_idx in df.index and log_idx != "hour":
-            log_act = menu.addAction(f"📝 作業ログを追加: {df.loc[log_idx, 'title']}")
+            log_act = menu.addAction(f"📝 作業ログを追加: {LG.display_title(df, log_idx)}")
             log_act.triggered.connect(
                 lambda checked=False, ti=log_idx: self.worklog_requested.emit(ti))
             menu.addSeparator()
@@ -524,10 +547,21 @@ class DailyScheduleWidget(QWidget):
                 (df["node_type"] == "ticket")
                 & (df["assigned_to"] == self.state.user)
                 & (df["status"].isin(["todo", "regularly"]))
+                & (~LG.task_work_mask(df))
             ].index
+            # Task 全体として割り当てられる Task（自分の担当、または自分のチケットがある未完了の Task）
+            mine = df[(df["assigned_to"] == self.state.user) & (df["status"] != "deleted")]
+            open_tasks = df[(df["node_type"] == "task")
+                            & (~df["status"].isin(["done", "cancel", "deleted"]))]
+            task_idx = open_tasks[(open_tasks["assigned_to"] == self.state.user)
+                                  | open_tasks.index.isin(mine["parent_id"])].index
+            assignable_idx = assignable_idx.append(task_idx)
 
         # ── 最近使った ──
-        recent_idxs = [i for i in self.state.recent_tickets if i in assignable_idx]
+        # 最近使った作業用チケットは、その Task が割り当て候補にあるときだけ出す
+        recent_idxs = [i for i in self.state.recent_tickets
+                       if i in assignable_idx
+                       or (LG.is_task_work(df, i) and df.loc[i, "parent_id"] in assignable_idx)]
         if recent_idxs:
             menu.addSection("最近使った")
             for t_idx in recent_idxs:
@@ -542,8 +576,10 @@ class DailyScheduleWidget(QWidget):
             sub = menu.addMenu(group_label)
             for t_idx, leaf_label in leaves:
                 act = sub.addAction(leaf_label)
+                assign = (self._assign_task if df.loc[t_idx, "node_type"] == "task"
+                          else self._assign_to_rows)
                 act.triggered.connect(
-                    lambda checked=False, ti=t_idx: self._assign_to_rows(rows, ti)
+                    lambda checked=False, ti=t_idx, fn=assign: fn(rows, ti)
                 )
 
         # ── クリア ──
@@ -556,7 +592,9 @@ class DailyScheduleWidget(QWidget):
         menu.exec(self.schedule_table.viewport().mapToGlobal(pos))
 
     def _ticket_menu_label(self, df: pd.DataFrame, t_idx: str) -> str:
-        """最近使った節用ラベル: 親(Task)名 / チケット名"""
+        """最近使った節用ラベル: 親(Task)名 / チケット名（Task 作業用は「📌Task 名」）"""
+        if LG.is_task_work(df, t_idx):
+            return f"{LG.display_title(df, t_idx)}（Task 全体）"
         title = str(df.loc[t_idx, "title"]) if t_idx in df.index else ""
         pid = str(df.loc[t_idx, "parent_id"] or "") if t_idx in df.index else ""
         parent_title = str(df.loc[pid, "title"]) if pid in df.index else ""
@@ -590,7 +628,9 @@ class DailyScheduleWidget(QWidget):
             # 祖先チェーンを収集（project 系と非 project 系を分ける）
             proj_titles, mid_titles = [], []
             group_node = None
-            cur = str(df.loc[t_idx, "parent_id"] or "") if t_idx in df.index else ""
+            is_task = df.loc[t_idx, "node_type"] == "task"
+            cur = (t_idx if is_task
+                   else str(df.loc[t_idx, "parent_id"] or "") if t_idx in df.index else "")
             while cur and cur != "0" and cur in df.index:
                 ntype = str(df.loc[cur, "node_type"])
                 title = str(df.loc[cur, "title"])
@@ -612,8 +652,11 @@ class DailyScheduleWidget(QWidget):
                            else "（プロジェクト未設定）")
 
             status_icon = "↻ " if str(df.loc[t_idx, "status"]) == "regularly" else ""
-            leaf_parts = mid_titles + [str(df.loc[t_idx, "title"])]
-            leaf_label = status_icon + " / ".join(leaf_parts)
+            if is_task:  # Task 全体（作業用チケットへ割り当てる）。同じ Task のチケットより上に並ぶ
+                leaf_label = "📌 " + " / ".join(mid_titles) + "（Task 全体）"
+            else:
+                leaf_parts = mid_titles + [str(df.loc[t_idx, "title"])]
+                leaf_label = status_icon + " / ".join(leaf_parts)
 
             g = groups.setdefault(group_node, {
                 "label": group_label,
@@ -1054,8 +1097,9 @@ class DailyScheduleWidget(QWidget):
             if t_idx != current_ticket:
                 current_ticket = t_idx
                 group_row = 0
-            # ノードが無い（削除済み）枠は IDX ではなく「削除済み」と表示する
-            title = df_nodes.loc[t_idx, "title"] if t_idx in df_nodes.index else "（削除済み）"
+            # ノードが無い（削除済み）枠は IDX ではなく「削除済み」と表示する。
+            # Task 作業用チケットは Task 名で表示し、2 行目のパスも Task の親から始める
+            title = LG.display_title(df_nodes, t_idx)
             pos = position_marks[i]
             if pos == "single":
                 display[i] = title
@@ -1065,6 +1109,8 @@ class DailyScheduleWidget(QWidget):
                 path_parts: list = []
                 if t_idx in df_nodes.index:
                     pid = str(df_nodes.loc[t_idx, "parent_id"])
+                    if LG.is_task_work(df_nodes, t_idx) and pid in df_nodes.index:
+                        pid = str(df_nodes.loc[pid, "parent_id"])
                     while pid and pid != "0" and pid in df_nodes.index:
                         path_parts.insert(0, str(df_nodes.loc[pid, "title"]))
                         pid = str(df_nodes.loc[pid, "parent_id"])
@@ -1163,6 +1209,45 @@ class DailyScheduleWidget(QWidget):
             current_idx = parent_id
 
 
+_TASK_WORK_TIP = ("📌 Task 作業用チケット（タイトル「-」）\n"
+                  "日次スケジュールに Task を割り当てると、この行に時間が記録されます。\n"
+                  "日次では Task 名で表示され、Task が done になると一緒に done になります")
+
+
+class _CurrentPageStack(QStackedWidget):
+    """表示中のタブだけで大きさを決めるスタック。
+    QStackedWidget は全タブの最大の最小幅を使うため、隠れたタブ（Plan 等）の幅に引っ張られて
+    中央が縮まず、左の日次スケジュールが広げられなかった"""
+
+    def __init__(self):
+        super().__init__()
+        self.currentChanged.connect(lambda _i: self.updateGeometry())
+
+    def sizeHint(self):
+        w = self.currentWidget()
+        return w.sizeHint() if w else super().sizeHint()
+
+    def minimumSizeHint(self):
+        w = self.currentWidget()
+        return w.minimumSizeHint() if w else super().minimumSizeHint()
+
+
+class _HScrollArea(QScrollArea):
+    """中央用: 幅は 300px まで縮めて足りない分を横スクロールにし、高さは中身の最小に従う
+    （縦までスクロールにすると、ウィンドウを低くしたときに二重のスクロールバーになる）"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def minimumSizeHint(self):
+        w = self.widget()
+        bar = self.horizontalScrollBar().sizeHint().height()
+        return QSize(300, (w.minimumSizeHint().height() + bar) if w else 0)
+
+
 class MainWindow(QMainWindow):
     """アプリケーションメインウィンドウ"""
 
@@ -1247,11 +1332,6 @@ class MainWindow(QMainWindow):
             if i == 0:  # 保存ボタン（i==0）の QToolButton 参照を保持
                 self._save_btn = tb.widgetForAction(act)
 
-        # 📥 Inbox（件数表示・上限/滞留で強調。クリックで振り分け画面）
-        self.inbox_btn = QPushButton("📥 Inbox")
-        self.inbox_btn.setToolTip("Task 未設定チケットを振り分けます（Ctrl+N で追加）")
-        self.inbox_btn.clicked.connect(self._open_inbox_triage)
-        tb.addWidget(self.inbox_btn)
         # F3: Now の小窓（表示のみ・通知なし）
         self.now_window = NowWindow(self.state, self)
         self.now_btn = QPushButton("📌 Now")
@@ -1286,6 +1366,7 @@ class MainWindow(QMainWindow):
             ("📊 Main",    IDX_GANTT),
             ("🗺 Plan",    IDX_ROADMAP),
             ("✏ Edit",    IDX_MAIN),
+            ("📥 Inbox",   IDX_INBOX),
             ("👥 Team",    IDX_TEAM),
             ("🔍 Search",  IDX_SEARCH),
             ("📨 Request", IDX_ASSIGN),
@@ -1381,17 +1462,21 @@ class MainWindow(QMainWindow):
         self.schedule_panel = DailyScheduleWidget(self.state)
 
         # スタックウィジェット（各種ビューを切替）
-        self.stack = QStackedWidget()
+        self.stack = _CurrentPageStack()
 
         # 右端の共通詳細ペイン（main/plan/edit で表示、トグルで開閉）
         self.detail_pane = DetailPane(self.state)
         self._detail_visible = self.state.config.detail_pane_open  # トグルボタンの状態
 
         # 外側スプリッター（左: 日次 / 中: スタック / 右: 詳細）
+        # 中央は表示中のタブの最小幅より狭くできるよう、はみ出す分を横スクロールにする
+        center = _HScrollArea()
+        center.setWidget(self.stack)
         outer = QSplitter(Qt.Orientation.Horizontal)
         outer.addWidget(self.schedule_panel)
-        outer.addWidget(self.stack)
+        outer.addWidget(center)
         outer.addWidget(self.detail_pane)
+        outer.setChildrenCollapsible(False)  # 日次・詳細をドラッグで幅 0 にしない
         outer.setSizes([400, 900, 320])
         self._outer_splitter = outer  # 画面状態の記憶用
 
@@ -1409,13 +1494,15 @@ class MainWindow(QMainWindow):
         self.config_view     = ui_sub.ConfigView(self.state)
         self.ai_import_view  = ui_sub.AIImportView(self.state)
         self.dashboard_view  = ui_sub.DashboardView(self.state)
+        self.inbox_view      = InboxView(self.state, self._create_quick_ticket,
+                                         self.ai_import_view._on_get_ticket_prompt)
 
         # 追加順は IDX_* 定数と一致させること（QStackedWidget のインデックス）
         for w in [self.main_pane, self.gantt_view, self.road_view,
                   self.anal_view, self.search_view, self.team_view,
                   self.assign_view, self.ai_import_view,
                   self.ver_view, self.config_view,
-                  self.dashboard_view]:
+                  self.dashboard_view, self.inbox_view]:
             self.stack.addWidget(w)
 
         # ダッシュボードの「開く」 → 対応タブへ遷移
@@ -1641,7 +1728,7 @@ class MainWindow(QMainWindow):
     def _on_dashboard_navigate(self, key: str) -> None:
         """ダッシュボードのカードから対応タブへ遷移する"""
         if key == "inbox":
-            self._open_inbox_triage()
+            self._open_inbox_tab()
             return
         mapping = {"schedule": IDX_GANTT, "edit": IDX_MAIN,
                    "request": IDX_ASSIGN, "team": IDX_TEAM}
@@ -1680,23 +1767,27 @@ class MainWindow(QMainWindow):
         return LG.inbox_summary(self.state.df_nodes, self.state.user,
                                 cfg.inbox_max_items, cfg.inbox_stale_days)
 
-    def _update_inbox_btn(self) -> None:
+    def _update_inbox_tab_badge(self) -> None:
+        """Inbox タブに件数を出し、上限到達・滞留のときは強調する"""
+        btn = self._tab_btns.get(IDX_INBOX)
+        if btn is None:
+            return
         s = self._inbox_summary()
-        self.inbox_btn.setText(f"📥 Inbox {s['count']}")
+        base_label = self._tab_labels.get(IDX_INBOX, "📥 Inbox")
+        btn.setText(f"{base_label} ({s['count']})" if s["count"] else base_label)
         if s["over"] or s["stale"]:
-            self.inbox_btn.setStyleSheet(qss(
-                "QPushButton { background:@warning; color:@on_accent; font-weight:bold;"
-                " border-radius:4px; padding:4px 10px; }"))
+            btn.setStyleSheet(self._tab_style + qss(
+                "QPushButton { background: @warning; color: @on_accent; font-weight: bold; }"
+                "QPushButton:checked { background: @warning_dark; color: @on_accent; }"))
         else:
-            self.inbox_btn.setStyleSheet(STYLE_BUTTON)
+            btn.setStyleSheet(self._tab_style)
 
-    def _open_inbox_triage(self) -> None:
-        dlg = InboxTriageDialog(self.state, self.ai_import_view._on_get_ticket_prompt, self)
-        dlg.exec()
-        self.refresh()
+    def _open_inbox_tab(self) -> None:
+        self._switch_view(IDX_INBOX)
+        self.inbox_view.focus_blank_row()
 
     def maybe_prompt_inbox(self) -> None:
-        """起動時: 上限到達または滞留があるときだけ振り分け画面を出す（1 日 1 回まで）"""
+        """起動時: 上限到達または滞留があるときだけ Inbox タブを開く（1 日 1 回まで）"""
         s = self._inbox_summary()
         if not (s["over"] or s["stale"]):
             return
@@ -1706,7 +1797,7 @@ class MainWindow(QMainWindow):
             return
         settings.setValue("inbox/last_prompt", today)
         settings.sync()
-        self._open_inbox_triage()
+        self._open_inbox_tab()
 
     # ---------- クイック追加（Ctrl+N） ----------
 
@@ -1978,7 +2069,8 @@ class MainWindow(QMainWindow):
         if not Path(out_dir).is_dir():
             return f"（⚠ output_dir のフォルダが見つからないため AI 用ファイルは書き出していません: {out_dir}）"
         try:
-            LG.export_ai_context(out_dir, self.state.df_nodes, self.state.user)
+            LG.export_ai_context(out_dir, self.state.df_nodes, self.state.user,
+                                 self.state.df_daily, self.state.df_daily_log)
         except Exception as e:
             if self.state.logger:
                 self.state.logger.warning(f"[保存] AI 用ファイルの書き出しに失敗: {e}")
@@ -2106,7 +2198,7 @@ class MainWindow(QMainWindow):
             cur.refresh()
         # 未処理 Request の件数に応じてタブボタンを強調表示
         self._update_request_tab_badge()
-        self._update_inbox_btn()
+        self._update_inbox_tab_badge()
         # Plan タブ等の変更後も保存ボタン色を最新状態に同期
         self._update_save_btn_style()
         if self.now_window.isVisible():
@@ -2446,8 +2538,11 @@ class TreePane(QWidget):
             type_short = self._TYPE_LABEL.get(node_type, node_type)
             status_icon = {"done": "✓", "cancel": "✗",
                            "regularly": "↻", "deleted": "🗑"}.get(row["status"], "")
-            label = f"[{type_short}] {status_icon} {row['title']}".strip()
+            title = ("📌 Task 作業（-）" if LG.is_task_work(df, idx) else row["title"])
+            label = f"[{type_short}] {status_icon} {title}".strip()
             item.setText(0, label)
+            if LG.is_task_work(df, idx):
+                item.setToolTip(0, _TASK_WORK_TIP)
 
             # 種別ごとの背景色・文字色
             type_bg = QColor(self._TYPE_BG.get(node_type, C.SURFACE))
@@ -2648,6 +2743,8 @@ class TreePane(QWidget):
         # インメモリ更新・dirty フラグ・ツリー再構築
         df.loc[dragged_idx, "parent_id"] = new_parent_idx
         df.loc[dragged_idx, "updated_at"] = datetime.date.today().isoformat()
+        if current_parent == DB.INBOX_PARENT:  # 振り分けたら AI ヒントは役目を終える
+            df.loc[dragged_idx, "memo"] = LG.split_ai_hint(df.loc[dragged_idx, "memo"])[0]
         self.state.keep_done_last(new_parent_idx)
         self._selected_idx = dragged_idx
         self.state.nodes_modified = True
@@ -3040,6 +3137,7 @@ class TablePane(QWidget):
                     bg = QColor(hex_c)
                     bg.setAlpha(60)
                     is_own = str(row.get("assigned_to", "")) == self.state.user
+                    is_work = LG.is_task_work(self.state.df_nodes, idx)
                     # 実績(h) col=4, 担当者 col=7 は常に読み取り専用
                     _READONLY_COLS = {4, 7}
                     for c, val in enumerate(vals):
@@ -3051,6 +3149,9 @@ class TablePane(QWidget):
                             item.setForeground(QColor(C.TEXT_DONE))
                         else:
                             item.setBackground(bg)
+                        if is_work:
+                            item.setForeground(QColor(C.TEXT_MUTED))
+                            item.setToolTip(_TASK_WORK_TIP)
                         self.table.setItem(r, c, item)
             # 新規入力用の空白行を常に末尾に追加（子ノードを持てる親の場合のみ）
             can_add_child = self._get_child_type() is not None
@@ -4700,155 +4801,303 @@ class QuickAddDialog(QDialog):
         self.accept()
 
 
-# ---------- Inbox 振り分けダイアログ ----------
+# ---------- Inbox タブ ----------
 
-class InboxTriageDialog(QDialog):
+class InboxView(QWidget):
     """
-    Inbox（Task 未設定）チケットを Task へ振り分けるダイアログ（B2）。
-    各行の移動先は、過去チケット名との類似度（logic.suggest_task）で自動提案する。
-    変更はインメモリ（Ctrl+Z 可・Ctrl+S で保存）。
+    📥 Inbox タブ（Task 未設定チケットの入力と振り分け）。
+    最下行に打って Enter でチケットになる（Ctrl+N と同じ書き方: 「資料作成 1.5h 金曜 @設計 #メモ」）。
+    各列はその場で編集できる。振り分け先 Task を選んで「✔ 振り分け」で移動する
+    （選んだだけでは移動しない。過去のチケット名から自動提案した先は黄色）。
+    AI ヒントは振り分けを AI に頼むときの手がかりで、メモ末尾の [AIヒント] 行に保存し、移動時に消す。
+    変更はインメモリ（Ctrl+Z 可・Ctrl+S で保存）。件数上限はここでは止めず、見出しの色で知らせる。
     """
-    _COLS = ["経過", "チケット", "見積", "納期", "メモ", "移動先 Task（入力で絞り込み）"]
-    _SUGGEST_BG = C.SUGGEST_BG  # 自動提案した移動先の背景色
+    _COLS = ["経過", "タイトル", "見積", "開始日", "納期",
+             "振り分け先 Task（入力で絞り込み）", "メモ", "AI ヒント"]
+    C_AGE, C_TITLE, C_EST, C_START, C_DL, C_TASK, C_MEMO, C_HINT = range(8)
+    _HELP = ("最下行に入力して Enter で追加（工数 2h ／ 納期 金曜・11/14 ／ 範囲 11/10〜11/14 ／ "
+             "@Task で振り分け先 ／ # 以降はメモ）。セルはダブルクリックか入力で編集。"
+             "AI ヒントは AI に振り分けを頼むときの手がかり（例: 顧客A・調査系）")
 
-    def __init__(self, state, copy_prompt_func=None, parent=None):
-        super().__init__(parent)
+    def __init__(self, state, create_func, copy_prompt_func):
+        super().__init__()
         self.state = state
-        self._copy_prompt_func = copy_prompt_func
-        self.setWindowTitle("📥 Inbox の振り分け")
-        self.resize(980, 480)
+        self._create = create_func
+        self._copy_prompt = copy_prompt_func
+        self._dest: dict = {}  # IDX → 選んだ振り分け先 Task（このセッションの間だけ保持）
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
 
+        top = QHBoxLayout()
         self.head = QLabel()
-        self.head.setStyleSheet(qss("QLabel { font-weight:bold; color:@inbox; }"))
-        lay.addWidget(self.head)
-
-        self.table = QTableWidget(0, len(self._COLS))
-        self.table.setHorizontalHeaderLabels(self._COLS)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False)
-        for c, w in enumerate([55, 220, 55, 90, 220]):
-            self.table.setColumnWidth(c, w)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        lay.addWidget(self.table, stretch=1)
-
-        self.info = InfoLabel()
-        lay.addWidget(self.info)
-
-        row = QHBoxLayout()
-        self.move_btn = QPushButton("✔ 移動先を選んだ行を移動")
+        top.addWidget(self.head)
+        top.addStretch()
+        self.move_btn = QPushButton("✔ 振り分け（先を選んだ行を移動）")
         self.move_btn.clicked.connect(self._on_move)
         self.del_btn = QPushButton("🗑 選択行を削除")
         self.del_btn.clicked.connect(self._on_delete)
-        self.ai_btn = QPushButton("🤖 AI 振り分け用プロンプトをコピー")
-        self.ai_btn.setToolTip("Task 一覧 + Inbox 一覧をコピーします。\n"
+        self.ai_btn = QPushButton("🤖 AI 振り分け用にコピー")
+        self.ai_btn.setToolTip("作業ツリー + Inbox 一覧（AI ヒント付き）をコピーします。\n"
                                "LLM の返答は AI取込タブの「取り込み」で反映できます")
         self.ai_btn.clicked.connect(self._on_copy_prompt)
-        later_btn = QPushButton("後で")
-        later_btn.clicked.connect(self.reject)
         for b in (self.move_btn, self.del_btn, self.ai_btn):
             b.setStyleSheet(STYLE_BUTTON)
-            row.addWidget(b)
-        row.addStretch()
-        later_btn.setStyleSheet(STYLE_BUTTON)
-        row.addWidget(later_btn)
-        lay.addLayout(row)
+            top.addWidget(b)
+        lay.addLayout(top)
 
-        self._task_items = self._task_choices()
+        self.table = QTableWidget(0, len(self._COLS))
+        self.table.setHorizontalHeaderLabels(self._COLS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
+                                   | QAbstractItemView.EditTrigger.EditKeyPressed
+                                   | QAbstractItemView.EditTrigger.AnyKeyPressed)
+        for c, w in enumerate([50, 240, 60, 95, 95, 300, 200]):
+            self.table.setColumnWidth(c, w)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemChanged.connect(self._on_item_changed)
+        lay.addWidget(self.table, stretch=1)
+
+        help_lbl = QLabel(self._HELP)
+        help_lbl.setWordWrap(True)
+        help_lbl.setStyleSheet(qss("QLabel { color:@text_muted; font-size:8pt; }"))
+        lay.addWidget(help_lbl)
+        self.info = InfoLabel()
+        lay.addWidget(self.info)
+
+    def refresh(self) -> None:
         self._rebuild()
 
-    def _task_choices(self) -> list:
-        """移動先候補 [(階層パス, task_idx), ...]（完了・中止 Task 除く、パス順）"""
+    # ── 表示 ──
+
+    def _cell_text(self, idx: str, col: int) -> str:
+        r = self.state.df_nodes.loc[idx]
+        if col == self.C_TITLE:
+            return str(r["title"])
+        if col == self.C_EST:
+            est = float(r.get("estimated_hours") or 0)
+            return f"{est:g}h" if est else ""
+        if col == self.C_START:
+            return LG._date_str(r.get("start_available"))
+        if col == self.C_DL:
+            return LG._date_str(r.get("deadline"))
+        body, hint = LG.split_ai_hint(r.get("memo"))
+        return body if col == self.C_MEMO else hint
+
+    def _task_model(self) -> QStandardItemModel:
+        """振り分け先の候補（未完了の Task をパス順）。全行のコンボで共有する"""
+        model = QStandardItemModel(self)
+        first = QStandardItem("（未選択）")
+        first.setData("", Qt.ItemDataRole.UserRole)
+        model.appendRow(first)
+        tasks = LG.quick_add_task_candidates(self.state.df_nodes, "", self.state.user,
+                                             limit=100000)
+        for path, t_idx in sorted((path, idx) for idx, path in tasks):
+            item = QStandardItem(path)
+            item.setData(t_idx, Qt.ItemDataRole.UserRole)
+            model.appendRow(item)
+        return model
+
+    def _task_combo(self, idx: str, model: QStandardItemModel) -> QComboBox:
+        from ui_sub import _NoWheelComboBox
+        combo = _NoWheelComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setModel(model)
+        comp = combo.completer()
+        comp.setFilterMode(Qt.MatchFlag.MatchContains)
+        comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         df = self.state.df_nodes
-        tasks = LG.quick_add_task_candidates(df, "", self.state.user, limit=100000)
-        return sorted(((path, idx) for idx, path in tasks), key=lambda x: x[0])
+        dest = self._dest.get(idx)
+        suggested = False
+        if not dest:
+            dest = LG.suggest_task(df, str(df.loc[idx, "title"]),
+                                   LG.split_ai_hint(df.loc[idx, "memo"])[0], self.state.user)
+            suggested = bool(dest)
+        i = combo.findData(dest or "")
+        combo.setCurrentIndex(max(i, 0))
+        if suggested and i > 0:
+            combo.setStyleSheet(f"QComboBox {{ background:{C.SUGGEST_BG}; }}")
+            combo.setToolTip("💡 過去のチケット名から自動提案した振り分け先です")
+        combo.lineEdit().setCursorPosition(0)
+        combo.currentIndexChanged.connect(lambda _i, c=combo, t=idx: self._on_dest_changed(c, t))
+        combo.lineEdit().editingFinished.connect(lambda c=combo: self._on_dest_typed(c))
+        return combo
 
     def _rebuild(self) -> None:
         cfg = self.state.config
         df = self.state.df_nodes
         inbox = LG.inbox_tickets(df, self.state.user)
         s = LG.inbox_summary(df, self.state.user, cfg.inbox_max_items, cfg.inbox_stale_days)
+        over = "（上限を超えています。振り分けてください）" if s["over"] else ""
         self.head.setText(f"📥 Inbox {s['count']} 件（上限 {cfg.inbox_max_items} 件"
-                          f"・最古 {s['oldest_days']} 日前）")
-        self.table.setRowCount(0)
+                          f"・最古 {s['oldest_days']} 日前）{over}")
+        color = "@danger" if s["over"] else "@warning_dark" if s["stale"] else "@inbox"
+        self.head.setStyleSheet(qss(f"QLabel {{ font-weight:bold; color:{color}; }}"))
+
+        model = self._task_model()
         today = datetime.date.today()
-        from PySide6.QtWidgets import QCompleter
-        for idx, r in inbox.iterrows():
-            row = self.table.rowCount()
-            self.table.insertRow(row)
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(inbox) + 1)
+        for row, (idx, r) in enumerate(inbox.iterrows()):
             try:
                 age = (today - datetime.date.fromisoformat(str(r.get("created_at", ""))[:10])).days
             except ValueError:
                 age = 0
-            est = float(r.get("estimated_hours") or 0)
-            vals = [f"{age}日", str(r.get("title", "")),
-                    f"{est:g}h" if est else "-",
-                    str(r.get("deadline") or "") or "-",
-                    str(r.get("memo") or "")]
-            for c, v in enumerate(vals):
-                it = QTableWidgetItem(v)
-                it.setData(Qt.ItemDataRole.UserRole, idx)
-                if c == 0:
-                    # 滞留の色分け: stale_days 超=橙、7 日超=赤
-                    if age > 7:
-                        it.setBackground(QColor(C.ROW_ERROR_BG))
-                    elif age > cfg.inbox_stale_days:
-                        it.setBackground(QColor(C.ROW_WARN_BG))
-                self.table.setItem(row, c, it)
-            combo = QComboBox()
-            combo.setEditable(True)
-            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-            combo.addItem("（未選択）", None)
-            for path, t_idx in self._task_items:
-                combo.addItem(path, t_idx)
-            comp = combo.completer()
-            comp.setFilterMode(Qt.MatchFlag.MatchContains)
-            comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-            sug = LG.suggest_task(df, str(r.get("title", "")), str(r.get("memo") or ""),
-                                  self.state.user)
-            if sug:
-                i = combo.findData(sug)
-                if i >= 0:
-                    combo.setCurrentIndex(i)
-                    combo.setStyleSheet(f"QComboBox {{ background:{self._SUGGEST_BG}; }}")
-                    combo.setToolTip("💡 過去のチケット名から自動提案した移動先です")
-            self.table.setCellWidget(row, 5, combo)
-        has = self.table.rowCount() > 0
-        self.move_btn.setEnabled(has)
-        self.del_btn.setEnabled(has)
+            age_item = QTableWidgetItem(f"{age}日")
+            age_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            # 滞留の色分け: stale_days 超=橙、7 日超=赤
+            if age > 7:
+                age_item.setBackground(QColor(C.ROW_ERROR_BG))
+            elif age > cfg.inbox_stale_days:
+                age_item.setBackground(QColor(C.ROW_WARN_BG))
+            self.table.setItem(row, self.C_AGE, age_item)
+            for col in (self.C_TITLE, self.C_EST, self.C_START, self.C_DL, self.C_MEMO, self.C_HINT):
+                item = QTableWidgetItem(self._cell_text(idx, col))
+                item.setData(Qt.ItemDataRole.UserRole, idx)
+                self.table.setItem(row, col, item)
+            self.table.setCellWidget(row, self.C_TASK, self._task_combo(idx, model))
+        # 最下行: 新規入力（タイトル列だけ入力できる）
+        blank = len(inbox)
+        for col in range(len(self._COLS)):
+            item = QTableWidgetItem("＋" if col == self.C_AGE else "")
+            if col != self.C_TITLE:
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            item.setBackground(QColor(C.INBOX_BG))
+            item.setToolTip("ここに入力して Enter で Inbox に追加")
+            self.table.setItem(blank, col, item)
+        self.table.blockSignals(False)
+        self.move_btn.setEnabled(blank > 0)
+        self.del_btn.setEnabled(blank > 0)
+
+    def focus_blank_row(self) -> None:
+        """最下行（新規入力）のタイトル欄を編集状態にする"""
+        row = self.table.rowCount() - 1
+        self.table.setCurrentCell(row, self.C_TITLE)
+        self.table.editItem(self.table.item(row, self.C_TITLE))
+
+    # ── 編集 ──
+
+    def _on_item_changed(self, item: QTableWidgetItem) -> None:
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        if not idx:
+            if item.column() == self.C_TITLE and item.text().strip():
+                self._add_from_blank(item.text().strip())
+            return
+        df = self.state.df_nodes
+        if idx not in df.index:
+            return
+        col, text = item.column(), item.text().strip()
+        error = ""
+        if col == self.C_TITLE:
+            if text:
+                df.loc[idx, "title"] = text
+            else:
+                error = "タイトルは空にできません"
+        elif col == self.C_EST:
+            hours, ok = LG.parse_hours_text(text)
+            if ok:
+                df.loc[idx, "estimated_hours"] = hours or 0.0
+            else:
+                error = f"工数として読めません: {text}（例: 1.5 / 2h / 30m）"
+        elif col in (self.C_START, self.C_DL):
+            d, ok = LG.parse_date_text(text, self.state.config.holidays)
+            if ok:
+                df.loc[idx, "start_available" if col == self.C_START else "deadline"] = d
+            else:
+                error = f"日付として読めません: {text}（例: 11/14 / 金曜 / 明日）"
+        else:
+            body, hint = LG.split_ai_hint(df.loc[idx, "memo"])
+            df.loc[idx, "memo"] = (LG.join_ai_hint(text, hint) if col == self.C_MEMO
+                                   else LG.join_ai_hint(body, text))
+        if not error:
+            df.loc[idx, "updated_at"] = datetime.date.today().isoformat()
+            self.state.nodes_modified = True
+            self.state.notify_dirty()
+            self.info.set_info("")
+        else:
+            self.info.set_error(error)
+        # 読み取った値で表示を揃える（読めなければ元に戻す）
+        self.table.blockSignals(True)
+        item.setText(self._cell_text(idx, col))
+        self.table.blockSignals(False)
+
+    def _add_from_blank(self, text: str) -> None:
+        p = LG.parse_quick_add(text, holidays=self.state.config.holidays)
+        if not p["title"]:
+            self.info.set_error("チケット名を入力してください")
+            QTimer.singleShot(0, self._rebuild)
+            return
+        dest, note = None, ""
+        if p["task_query"] is not None:
+            dest, n = LG.resolve_task_query(self.state.df_nodes, p["task_query"], self.state.user)
+            if dest is None:
+                note = (f"（@{p['task_query']} は該当 Task がないため振り分け先は未設定）" if n == 0
+                        else f"（@{p['task_query']} は候補が {n} 件あるため振り分け先は未設定）")
+        ds = self._create({"title": p["title"], "hours": p["hours"] or 0.0,
+                           "deadline": p["deadline"], "start": p["start"],
+                           "memo": p["memo"], "parent": DB.INBOX_PARENT})
+        if dest:
+            self._dest[ds.name] = dest
+        warn = " / ".join(p["warnings"])
+        self.info.set_info(f"追加: {p['title']}{note}" + (f"　⚠ {warn}" if warn else ""))
+
+        # itemChanged の処理中は表を作り直せないため、次のターンで全体を更新して次の行へ
+        def _next() -> None:
+            self.state.refresh()
+            self.focus_blank_row()
+        QTimer.singleShot(0, _next)
+
+    def _on_dest_changed(self, combo: QComboBox, idx: str) -> None:
+        self._dest[idx] = combo.currentData(Qt.ItemDataRole.UserRole) or ""
+        combo.setStyleSheet("")
+        combo.setToolTip(combo.currentText())
+        combo.lineEdit().setCursorPosition(0)
+
+    @staticmethod
+    def _on_dest_typed(combo: QComboBox) -> None:
+        """手入力は候補と一致したときだけ確定し、それ以外は元の表示に戻す"""
+        i = combo.findText(combo.currentText())
+        if i >= 0:
+            combo.setCurrentIndex(i)
+        else:
+            combo.setEditText(combo.itemText(combo.currentIndex()))
 
     def _row_idx(self, row: int) -> Optional[str]:
-        it = self.table.item(row, 0)
+        it = self.table.item(row, self.C_TITLE)
         return it.data(Qt.ItemDataRole.UserRole) if it else None
+
+    # ── 操作 ──
 
     def _on_move(self) -> None:
         df = self.state.df_nodes
         today = datetime.date.today().isoformat()
         moved = 0
-        for row in range(self.table.rowCount()):
-            combo = self.table.cellWidget(row, 5)
-            i = combo.findText(combo.currentText())  # 手入力の場合も一致する候補で確定
-            task_idx = combo.itemData(i) if i > 0 else None
+        for row in range(self.table.rowCount() - 1):
             idx = self._row_idx(row)
+            combo = self.table.cellWidget(row, self.C_TASK)
+            task_idx = combo.currentData(Qt.ItemDataRole.UserRole) if combo else ""
             if not task_idx or idx not in df.index:
                 continue
-            siblings = df[df["parent_id"] == task_idx]
+            siblings = df[(df["parent_id"] == task_idx) & (df["status"] != "deleted")]
             df.loc[idx, "parent_id"] = task_idx
             df.loc[idx, "priority"] = int(siblings["priority"].max()) + 1 if not siblings.empty else 1
+            df.loc[idx, "memo"] = LG.split_ai_hint(df.loc[idx, "memo"])[0]  # 振り分けたら役目を終える
             df.loc[idx, "updated_at"] = today
             self.state.keep_done_last(task_idx)
+            self._dest.pop(idx, None)
             moved += 1
         if not moved:
-            self.info.set_info("⚠ 移動先を選んだ行がありません")
+            self.info.set_info("⚠ 振り分け先を選んだ行がありません")
             return
         self.state.nodes_modified = True
         self.state.notify_dirty()
-        self._rebuild()
+        self.state.refresh()
         self.info.set_info(f"{moved} 件を振り分けました（Ctrl+S で保存 / Ctrl+Z で取り消し）")
 
     def _on_delete(self) -> None:
-        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        last = self.table.rowCount() - 1
+        rows = sorted({i.row() for i in self.table.selectedIndexes() if i.row() < last})
         if not rows:
             self.info.set_info("⚠ 削除する行を選択してください")
             return
@@ -4868,11 +5117,11 @@ class InboxTriageDialog(QDialog):
             df.loc[idx, "updated_at"] = today
         self.state.nodes_modified = True
         self.state.notify_dirty()
-        self._rebuild()
+        self.state.refresh()
         if skipped:
             QMessageBox.warning(self, "削除できなかったチケット", "\n".join(skipped))
 
     def _on_copy_prompt(self) -> None:
-        if self._copy_prompt_func:
-            self._copy_prompt_func()
+        if self._copy_prompt:
+            self._copy_prompt()
             self.info.set_info("コピーしました。LLM の返答は AI取込タブで取り込めます")

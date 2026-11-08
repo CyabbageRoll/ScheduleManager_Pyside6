@@ -1785,24 +1785,31 @@ def test_quick_add_inbox(win, task_idx, tmpdir):
         ng("AI 取込の Inbox 振り分け", e)
 
     try:
-        # 振り分け画面: 移動先を選んで移動
+        # Inbox タブ: 振り分け先を選んで移動（選んだだけでは動かない）、AI ヒントは移動時に消える
         t = win._create_quick_ticket({"title": "振り分け画面確認", "hours": 0, "deadline": None,
-                                      "start": None, "memo": "", "parent": DB.INBOX_PARENT})
-        dlg = ui_main.InboxTriageDialog(state)
-        row = next(r for r in range(dlg.table.rowCount()) if dlg._row_idx(r) == t.name)
-        combo = dlg.table.cellWidget(row, 5)
+                                      "start": None, "memo": "本文",
+                                      "parent": DB.INBOX_PARENT})
+        state.df_nodes.loc[t.name, "memo"] = LG.join_ai_hint("本文", "総務・単発")
+        view = win.inbox_view
+        view.refresh()
+        row = next(r for r in range(view.table.rowCount()) if view._row_idx(r) == t.name)
+        assert view.table.item(row, view.C_MEMO).text() == "本文"
+        assert view.table.item(row, view.C_HINT).text() == "総務・単発"
+        combo = view.table.cellWidget(row, view.C_TASK)
         combo.setCurrentIndex(combo.findData(task_idx))
-        dlg._on_move()
+        assert state.df_nodes.loc[t.name, "parent_id"] == DB.INBOX_PARENT, "選んだだけで移動した"
+        view._on_move()
         assert state.df_nodes.loc[t.name, "parent_id"] == task_idx
-        ok("振り分け画面で Task へ移動できる")
+        assert state.df_nodes.loc[t.name, "memo"] == "本文", state.df_nodes.loc[t.name, "memo"]
+        ok("Inbox タブ: 振り分け先を選んでボタンで移動、AI ヒントは消える")
     except Exception as e:
-        ng("振り分け画面", e)
+        ng("Inbox タブの振り分け", e)
 
     try:
         # 起動時表示: 上限/滞留時のみ・1 日 1 回
         calls = []
-        orig_open = win._open_inbox_triage
-        win._open_inbox_triage = lambda: calls.append(1)
+        orig_open = win._open_inbox_tab
+        win._open_inbox_tab = lambda: calls.append(1)
         try:
             win._create_quick_ticket({"title": "起動時確認", "hours": 0, "deadline": None,
                                       "start": None, "memo": "", "parent": DB.INBOX_PARENT})
@@ -1814,7 +1821,7 @@ def test_quick_add_inbox(win, task_idx, tmpdir):
             win.maybe_prompt_inbox()
             assert calls == [1], f"表示回数 {len(calls)}"
         finally:
-            win._open_inbox_triage = orig_open
+            win._open_inbox_tab = orig_open
             cfg.inbox_max_items = 10
         ok("起動時の振り分け表示は上限/滞留時のみ・1 日 1 回")
     except Exception as e:
@@ -2151,6 +2158,255 @@ def test_done_ticket(win):
     state.db.save_nodes(state.df_nodes, user)
     state.reload_nodes()
     state.nodes_modified = False
+
+
+def test_layout_and_inbox_tab(win, task_idx):
+    """中央の幅・Inbox タブの入力・月次の作業記録"""
+    print("\n[1108] 中央の幅 / Inbox タブ / 月次作業記録テスト")
+    import pandas as pd
+    import logic as LG
+    import db as DB
+    import ui_main
+    from PySide6.QtWidgets import QApplication
+    from db import DAILY_SCH_COLS, DAILY_TIME_COLS, DAILY_LOG_COLS, daily_sch_idx
+    state = win.state
+    state.refresh_func = win.refresh  # 画面状態テストの 2 つ目の画面が上書きしているため戻す
+
+    try:
+        # 詳細ペインを開いたままでも日次スケジュールを広げられる（中央は横スクロール）
+        win.resize(1500, 900)
+        win.detail_toggle_btn.setChecked(True)
+        win._switch_view(ui_main.IDX_GANTT)
+        QApplication.processEvents()
+        sp = win._outer_splitter
+        sp.setSizes([900, 100, 320])
+        QApplication.processEvents()
+        left, center, right = sp.sizes()
+        assert left >= 800 and center >= 300 and right > 0, sp.sizes()
+        assert win.stack.minimumSizeHint().width() < 1000, "隠れたタブの幅に引っ張られている"
+        ok(f"詳細ペインを開いても日次を広げられる {sp.sizes()}")
+    except Exception as e:
+        ng("中央の幅", e)
+
+    view = win.inbox_view
+    task_title = str(state.df_nodes.loc[task_idx, "title"])
+    try:
+        win._open_inbox_tab()
+        last = view.table.rowCount() - 1
+        view.table.item(last, view.C_TITLE).setText(
+            f"タブ入力確認 1.5h 2026-12-01 @{task_title} #下書き")
+        for _ in range(3):  # 作成後の表の作り直しは次のイベントループで行う
+            QApplication.processEvents()
+        df = state.df_nodes
+        new = df[df["title"] == "タブ入力確認"]
+        assert len(new) == 1, "最下行から作成されない"
+        idx = new.index[0]
+        assert df.loc[idx, "parent_id"] == DB.INBOX_PARENT, "@Task で即移動した"
+        assert float(df.loc[idx, "estimated_hours"]) == 1.5 and df.loc[idx, "deadline"] == "2026-12-01"
+        assert df.loc[idx, "memo"] == "下書き"
+        assert view._dest.get(idx) == task_idx, "@Task が振り分け先にならない"
+        assert view.table.rowCount() == last + 2, "次の入力行がない"
+        ok("Inbox タブ: 最下行から追加（工数・納期・メモ・@Task は振り分け先）")
+
+        row = next(r for r in range(view.table.rowCount()) if view._row_idx(r) == idx)
+        view.table.item(row, view.C_EST).setText("30m")
+        view.table.item(row, view.C_START).setText("2026/11/20")
+        view.table.item(row, view.C_HINT).setText("顧客A・調査系")
+        view.table.item(row, view.C_MEMO).setText("本文を変更")
+        df = state.df_nodes
+        assert float(df.loc[idx, "estimated_hours"]) == 0.5
+        assert df.loc[idx, "start_available"] == "2026-11-20"
+        assert df.loc[idx, "memo"] == "本文を変更\n[AIヒント] 顧客A・調査系", df.loc[idx, "memo"]
+        view.table.item(row, view.C_DL).setText("あさって以降")
+        assert df.loc[idx, "deadline"] == "2026-12-01", "読めない日付で消えた"
+        assert view.table.item(row, view.C_DL).text() == "2026-12-01", "表示が戻らない"
+        view.table.item(row, view.C_DL).setText("")
+        assert state.df_nodes.loc[idx, "deadline"] is None
+        assert "顧客A・調査系" in LG.build_ai_inbox_markdown(state.df_nodes, state.user)
+        ok("Inbox タブ: セル編集（工数・日付・メモ・AI ヒント）、読めない値は元に戻す")
+
+        btn = win._tab_btns[ui_main.IDX_INBOX]
+        assert "(" in btn.text(), btn.text()
+        ok(f"Inbox タブに件数を表示: {btn.text()}")
+    except Exception as e:
+        ng("Inbox タブの入力", e)
+
+    try:
+        # 月次の作業記録: 作業内訳・Done・作業ログ・連絡事項
+        user = state.user
+        tk = DB.create_initial_node(user, "ticket", "月報確認", task_idx)
+        tk["status"], tk["actual_end"] = "done", "2026-10-05"
+        tk["estimated_hours"], tk["actual_hours"] = 1.0, 0.5
+        tk["memo"] = "[10/05 10:15] レビュー指摘を反映\n[11/01 09:00] 翌月の記録"
+        nodes = state.df_nodes.copy()
+        nodes.loc[tk.name] = tk
+        sch_id = daily_sch_idx("2026-10-05", user)
+        row = {c: "" for c in DAILY_SCH_COLS[1:]}
+        row["Owner"] = user
+        row[DAILY_TIME_COLS[36]] = row[DAILY_TIME_COLS[37]] = tk.name
+        log_row = {c: "" for c in DAILY_LOG_COLS[1:]}
+        log_row.update(Owner=user, health_status="Good", notes="定時退社")
+        md = LG.build_worklog_markdown(pd.DataFrame([row], index=[sch_id]), nodes,
+                                       pd.DataFrame([log_row], index=[sch_id]), user, 2026, 10)
+        assert "## 2026-10-05（月）" in md and "09:00〜09:30" in md, md
+        assert "作業時間の合計: 0.5h（記録のある日 1 日）" in md, md
+        assert "### Done にした項目" in md and "見積 1h / 実績 0.5h" in md
+        assert "10:15 月報確認: レビュー指摘を反映" in md and "翌月の記録" not in md
+        assert "定時退社" in md and "体調: Good" in md
+        assert "（記録なし）" in LG.build_worklog_markdown(
+            pd.DataFrame([row], index=[sch_id]), nodes, None, user, 2026, 9)
+        ok("月次の作業記録: 作業内訳・Done・作業ログ・連絡事項（他の月は含めない）")
+
+        d = tempfile.mkdtemp()
+        LG.export_ai_context(d, nodes, user, pd.DataFrame([row], index=[sch_id]), None,
+                             today=datetime.date(2026, 11, 3))
+        names = sorted(p.name for p in (Path(d) / LG.AI_CONTEXT_DIR).glob("worklog_*.md"))
+        assert names == ["worklog_2026-10.md", "worklog_2026-11.md"], names
+        ok("保存時の書き出し: 当月と前月の worklog_YYYY-MM.md")
+    except Exception as e:
+        ng("月次の作業記録", e)
+
+
+def test_task_work(win):
+    """Task を日次に割り当てる（Task 作業用チケット「-」）。既存の「-」も壊さない"""
+    print("\n[作業用] Task 作業用チケットテスト")
+    import logic as LG
+    import db as DB
+    from PySide6.QtCore import Qt
+    state = win.state
+    user = state.user
+    state.refresh_func = win.refresh
+    df = state.df_nodes
+    p4 = DB.create_initial_node(user, "project4", "作業用P4", "0")
+    task = DB.create_initial_node(user, "task", "作業用Task", p4.name)
+    other_task = DB.create_initial_node("tanaka@email.com", "task", "他人Task", p4.name)
+    other_task["assigned_to"] = "tanaka@email.com"
+    # 既存の「-」: 自分の完了済み（実績 3h）・Project 直下・他人の「-」
+    old = DB.create_initial_node(user, "ticket", "-", task.name, 1)
+    old["status"], old["actual_hours"], old["actual_end"] = "done", 3.0, "2026-10-01"
+    proj_dash = DB.create_initial_node(user, "ticket", "-", p4.name, 5)
+    theirs = DB.create_initial_node("tanaka@email.com", "ticket", "-", other_task.name, 1)
+    theirs["assigned_to"] = "tanaka@email.com"
+    nodes = [p4, task, other_task, old, proj_dash, theirs] + DB.build_auto_children(task, user)
+    for n in nodes:
+        df.loc[n.name] = n
+    done_idx = df.index[(df["parent_id"] == task.name) & (df["title"] == "完了")][0]
+    detail_idx = df.index[(df["parent_id"] == task.name) & (df["title"] == "詳細作成")][0]
+
+    try:
+        assert LG.is_task_work(df, old.name) and not LG.is_task_work(df, proj_dash.name)
+        assert LG.display_title(df, old.name) == "📌作業用Task"
+        assert LG.display_title(df, proj_dash.name) == "-", "Project 直下の「-」まで変わった"
+        ok("判定: Task 直下の「-」だけを作業用とし、表示は「📌Task 名」")
+    except Exception as e:
+        ng("作業用チケットの判定", e)
+
+    try:
+        panel = win.schedule_panel
+        n_before = len(df)
+        assert panel._assign_task([36, 37], task.name), "Task を割り当てられない"
+        df = state.df_nodes
+        assert len(df) == n_before, "既存の「-」を使わず新しく作った"
+        assert df.loc[old.name, "status"] == "todo" and float(df.loc[old.name, "actual_hours"]) == 3.5
+        sch = DB.daily_sch_idx(state.current_date, user)
+        assert state.df_daily.loc[sch, "C0900"] == old.name
+        segs = LG.collect_daily_segments(state.df_daily, df, state.current_date, user)
+        assert any(sg["title"] == "📌作業用Task" for sg in segs), segs
+        ok("既存の「-」を使い回し（完了は todo に戻す）、実績は 3h に積み上がる")
+
+        assert panel._assign_task([40], other_task.name)
+        df = state.df_nodes
+        mine = df[(df["parent_id"] == other_task.name) & (df["title"] == "-")
+                  & (df["assigned_to"] == user)]
+        assert len(mine) == 1, "他人の Task に自分の作業用チケットができない"
+        assert df.loc[theirs.name, "assigned_to"] == "tanaka@email.com"
+        kids = df[(df["parent_id"] == other_task.name)].sort_values("priority")["title"].tolist()
+        assert kids[-1] != "-" or "完了" not in kids, kids
+        ok("他メンバーの Task には自分の担当で作業用チケットを作る")
+    except Exception as e:
+        ng("Task の割り当て", e)
+
+    try:
+        # Main（ガント）: 「-」の行は出さず、「-」だけの Task も行を残してクリックで割り当て
+        import ui_main
+        gv = win.gantt_view
+        win._switch_view(ui_main.IDX_GANTT)
+        for key in ("todo", "regularly", "all"):
+            gv._status_radios[key].setChecked(True)
+            gv._rebuild_table()
+            ids = [gv.table.item(r, 0).data(Qt.ItemDataRole.UserRole)
+                   for r in range(gv.table.rowCount()) if gv.table.item(r, 0)]
+            assert old.name not in ids, f"{key}: 「-」の行が出ている"
+        state.df_nodes.loc[old.name, "status"] = "regularly"
+        gv._status_radios["regularly"].setChecked(True)
+        gv._rebuild_table()
+        rows = [r for r in range(gv.table.rowCount()) if gv.table.item(r, 0)
+                and gv.table.item(r, 0).data(Qt.ItemDataRole.UserRole) == task.name]
+        assert rows, "「-」だけの Task の行がない（regularly）"
+        panel = win.schedule_panel
+        panel.schedule_table.clearSelection()
+        panel.schedule_table.selectRow(52)  # 13:00
+        gv._on_cell_clicked(rows[0], 1)
+        sch = DB.daily_sch_idx(state.current_date, user)
+        assert state.df_daily.loc[sch, "C1300"] == old.name, "Task 行のクリックで割り当てられない"
+        assert state.df_nodes.loc[old.name, "status"] == "regularly", "regularly が変わった"
+        gv._status_radios["todo"].setChecked(True)
+        state.df_daily.loc[sch, "C1300"] = ""
+        state.df_nodes.loc[old.name, "actual_hours"] = 3.5
+        ok("Main: 「-」の行は出さず、Task の行クリックで割り当て（regularly のまま）")
+    except Exception as e:
+        ng("Main の「-」の表示と Task 行の割り当て", e)
+
+    try:
+        groups = win.schedule_panel._assignable_groups(
+            df, df.index[df.index.isin([task.name, proj_dash.name])])
+        labels = [lbl for _, leaves in groups for _, lbl in leaves]
+        assert "📌 作業用Task（Task 全体）" in labels and "-" in labels, labels
+        ok("割り当てメニュー: 「📌 Task（Task 全体）」と Project 直下の「-」は従来どおり")
+    except Exception as e:
+        ng("割り当てメニュー", e)
+
+    try:
+        df = state.df_nodes
+        LG.apply_status(df, detail_idx, "done")
+        assert LG.status_change_error(df, done_idx, "done") is None, "「-」が完了を止めている"
+        LG.apply_status(df, done_idx, "done")
+        assert df.loc[task.name, "status"] == "done", "Task が自動 done にならない"
+        assert df.loc[old.name, "status"] == "done", "「-」が一緒に done にならない"
+        assert float(df.loc[old.name, "actual_hours"]) == 3.5, "工数が変わった"
+        assert not win.schedule_panel._assign_task([44], task.name), "完了 Task に割り当てできた"
+        ok("「-」は Task・「完了」の done を止めず、Task と一緒に done（工数はそのまま）")
+
+        # Project 直下の「-」も「完了」の確認から外し、Project と一緒に done にする
+        p4b = DB.create_initial_node(user, "project4", "作業用P4b", "0")
+        dash_b = DB.create_initial_node(user, "ticket", "-", p4b.name, 9)
+        p_done = DB.build_auto_children(p4b, user)
+        for c in [p4b, dash_b] + p_done:
+            df.loc[c.name] = c
+        p_done_idx = [c.name for c in p_done if c["title"] == "完了"][0]
+        df.loc[[c.name for c in p_done if c["title"] == "詳細作成"][0], "status"] = "done"
+        assert LG.status_change_error(df, p_done_idx, "done") is None, "Project 直下の「-」が止めている"
+        LG.apply_status(df, p_done_idx, "done")
+        assert df.loc[p4b.name, "status"] == "done" and df.loc[dash_b.name, "status"] == "done"
+        df.drop([p4b.name, dash_b.name] + [c.name for c in p_done], inplace=True)
+        ok("「完了」の兄弟の確認から「-」を外す（Project 直下も。親と一緒に done）")
+
+        df.loc[old.name, "estimated_hours"] = 0.25
+        assert all(a["title"] != "-" for a in LG.calc_estimate_accuracy(df, user))
+        assert "[ticket] " + old.name not in LG.build_ai_tree_markdown(df, user)
+        ok("見積の統計・AI 用の作業ツリーから「-」を外す")
+    except Exception as e:
+        ng("作業用チケットの done・統計", e)
+
+    state.df_nodes = state.df_nodes.drop(
+        [i for i in state.df_nodes.index
+         if state.df_nodes.loc[i, "parent_id"] in (task.name, other_task.name, p4.name)]
+        + [p4.name])
+    sch = DB.daily_sch_idx(state.current_date, user)
+    for col in ("C0900", "C0915", "C1000"):
+        state.df_daily.loc[sch, col] = ""
+    state.nodes_modified = False
+    state.schedule_modified = False
 
 
 def test_config_unquote(tmpdir):
@@ -3656,6 +3912,8 @@ def main():
             test_save_load(state)
             test_ui_state(state, version, win, tmpdir)
             test_done_ticket(win)
+            test_layout_and_inbox_tab(win, task_idx)
+            test_task_work(win)
             test_ai_context(win, task_idx, ticket2_idx)
             test_theme()
             test_requests_0925(win)
