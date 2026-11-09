@@ -786,6 +786,52 @@ def keep_all_done_last(df_nodes: pd.DataFrame, user: str) -> int:
 
 # ---------- 完了チェック（spec 2.2 自動 done 伝播） ----------
 
+def make_received_ticket(src: pd.Series, new_idx: str, user: str,
+                         today: str) -> pd.Series:
+    """依頼で受け取るチケットの行を作る（依頼元の行は変更しない）。
+    依頼元が done/cancel でも受け取った側はこれから作業するので todo にする
+    （regularly だけはそのまま regularly）。完了日・実績工数は依頼元のものなので引き継がない"""
+    row = src.copy()
+    row.name = new_idx
+    row["assigned_to"] = user
+    row["status"] = "regularly" if str(src.get("status")) == "regularly" else "todo"
+    row["actual_end"] = None
+    row["actual_hours"] = 0.0
+    row["created_at"] = today
+    row["updated_at"] = today
+    return row
+
+
+def done_ancestors(df_nodes: pd.DataFrame, idx: str) -> List[str]:
+    """idx の祖先（親・その親…）のうち done のものを近い順に返す。
+    done の親の下に未完了の子は置けない（仕様 2.3）ため、受け取ったチケットに合わせて戻す対象"""
+    found: List[str] = []
+    seen = set()
+    pid = str(df_nodes.loc[idx, "parent_id"]) if idx in df_nodes.index else ""
+    while pid in df_nodes.index and pid not in seen:
+        seen.add(pid)
+        if df_nodes.loc[pid, "status"] == "done":
+            found.append(pid)
+        pid = str(df_nodes.loc[pid, "parent_id"])
+    return found
+
+
+def reopen_done_parents(df_nodes: pd.DataFrame, user: str, parents) -> List[str]:
+    """自分担当の done のうち、parents（他メンバーの未完了の子がある親）とその done の祖先を
+    todo に戻す（自分担当のみ。保存できるのは自分の分だけのため）。戻した IDX を返す"""
+    out: List[str] = []
+    for i in parents:
+        if i not in df_nodes.index or df_nodes.loc[i, "status"] != "done":
+            continue
+        for j in [i] + done_ancestors(df_nodes, i):
+            if (j not in out and df_nodes.loc[j, "assigned_to"] == user
+                    and df_nodes.loc[j, "status"] == "done"):
+                df_nodes.loc[j, "status"] = "todo"
+                df_nodes.loc[j, "actual_end"] = None
+                out.append(j)
+    return out
+
+
 def check_auto_done(df_nodes: pd.DataFrame, changed_idx: str) -> List[str]:
     """
     「完了」チケットが done になったとき、親ノードを自動 done にする（仕様 2.2）。

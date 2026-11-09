@@ -546,6 +546,41 @@ class Database:
         finally:
             conn.close()
 
+    def reopen_nodes_bulk(self, idxs: list) -> None:
+        """ステータスを todo に戻す（完了日も消す）。他メンバー担当の行も対象のため、
+        他列は DB の最新値を保持し、古いメモリ内容で上書きしないよう UPDATE で行う"""
+        if not idxs:
+            return
+        today = datetime.date.today().isoformat()
+        conn = self._connect()
+        try:
+            for idx in idxs:
+                conn.execute(
+                    "UPDATE nodes SET status='todo', actual_end=NULL, updated_at=? WHERE IDX=?",
+                    [today, idx],
+                )
+            conn.commit()
+            self._log(f"reopen_nodes_bulk: {len(idxs)} 件 → todo")
+        except Exception as e:
+            self._loge(f"[DB] reopen_nodes_bulk エラー: {e}")
+            raise
+        finally:
+            conn.close()
+
+    def open_child_parents(self, user: str) -> set:
+        """他メンバー担当の未完了（todo/regularly）ノードがぶら下がる親の IDX の集合。
+        依頼の承諾で親を todo に戻したあと、古い表示のまま保存して done に戻さないために使う
+        （「-」チケットは done の判定で数えないため除く）"""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT parent_id FROM nodes"
+                " WHERE status IN ('todo','regularly') AND assigned_to != ?"
+                " AND NOT (node_type='ticket' AND title='-')", [user]).fetchall()
+            return {r[0] for r in rows}
+        finally:
+            conn.close()
+
     def save_nodes(self, df: pd.DataFrame, user: str) -> dict:
         """ユーザー自身が担当するノードを DB に保存する。
         DB 上で既に他ユーザーへ担当が移っている行（Request 承諾による移管）は
