@@ -352,6 +352,7 @@ class AppState:
             self._log("warning", "[保存] ロック取得失敗 - 他ユーザーが保存中の可能性")
             raise RuntimeError("dbが利用中です。しばらく時間をおいて実行してください")
         self.save_skipped = {}
+        self.reopened = []
         try:
             # 「完了」が末尾にない既存データも、保存のたびに自分の担当分を直す
             self.done_moved = LG.keep_all_done_last(self.df_nodes, self.login_user)
@@ -359,6 +360,10 @@ class AppState:
                 self.nodes_modified = True
             # nodes_modified が True のときのみ save_nodes を呼ぶ（DB アクセス最小化）
             if self.nodes_modified:
+                # 他メンバーが自分の done の下で未完了を持った（依頼の承諾など）なら、
+                # 古い表示のまま done で上書きせず todo に戻して保存する
+                self.reopened = LG.reopen_done_parents(
+                    self.df_nodes, self.login_user, self.db.open_child_parents(self.login_user))
                 self.save_skipped = self.db.save_nodes(self.df_nodes, self.login_user) or {}
                 # 他ユーザーへ移管済みの行はメモリ上の担当者も DB に合わせる
                 for idx, owner in self.save_skipped.items():

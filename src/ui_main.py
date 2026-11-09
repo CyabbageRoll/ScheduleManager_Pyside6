@@ -288,6 +288,7 @@ class DailyScheduleWidget(QWidget):
         super().__init__()
         self.state = state
         self._selected_ticket: Optional[str] = None
+        self._top_row: Optional[int] = None   # 表示中の時間帯の先頭行（None は未表示 → begin_time）
         self._preset_path = PRESET_FILE
 
         self.setMinimumWidth(200)
@@ -930,7 +931,12 @@ class DailyScheduleWidget(QWidget):
                            + (f" ／ 飛ばした枠: {skipped}" if skipped else ""))
 
     def refresh(self) -> None:
-        """スケジュール表示を更新する"""
+        """スケジュール表示を更新する（表示中の時間帯は保つ）"""
+        # 非表示の間は位置が取れないため、前回覚えた行を使う
+        if self._top_row is not None and self.schedule_table.isVisible():
+            r = self.schedule_table.rowAt(0)
+            if r >= 0:
+                self._top_row = r
         self._rebuild_schedule()
         self._adjust_row_heights()
         self._load_log_values()
@@ -1005,7 +1011,8 @@ class DailyScheduleWidget(QWidget):
             self.state.db.save_permanent_notice(self.state.user, ever_text)
 
     def _adjust_row_heights(self) -> None:
-        """begin_time〜end_timeがビューポートに収まるよう行高を調整し begin_time へスクロール"""
+        """begin_time〜end_timeがビューポートに収まるよう行高を調整してスクロールする。
+        最初は begin_time を先頭に、以降は表示していた時間帯（_top_row）を先頭に戻す"""
         begin = self.state.config.daily_begin_time
         end = self.state.config.daily_end_time
         work_rows = max(1, (end - begin) * 4)
@@ -1013,12 +1020,15 @@ class DailyScheduleWidget(QWidget):
         if viewport_h > 10:
             row_h = max(10, viewport_h // work_rows)
             self.schedule_table.verticalHeader().setDefaultSectionSize(row_h)
-        # begin_time の行を最上部へスクロール
-        begin_item = self.schedule_table.item(begin * 4, 0)
-        if begin_item:
+        top = begin * 4 if self._top_row is None else self._top_row
+        top_item = self.schedule_table.item(top, 0)
+        if top_item:
             self.schedule_table.scrollToItem(
-                begin_item, QAbstractItemView.ScrollHint.PositionAtTop
+                top_item, QAbstractItemView.ScrollHint.PositionAtTop
             )
+        # 表示されて位置が決まってから、以降は表示中の時間帯を保つ
+        if self._top_row is None and viewport_h > 10 and self.schedule_table.isVisible():
+            self._top_row = top
 
     def _rebuild_schedule(self) -> None:
         """
@@ -1569,6 +1579,8 @@ class MainWindow(QMainWindow):
         # タブボタンのチェック状態を更新（選択中のビューを強調）
         for vi, btn in getattr(self, "_tab_btns", {}).items():
             btn.setChecked(vi == view_idx)
+        # 選んだままの時間帯に、別画面での確認クリックでチケットが入る事故を防ぐ
+        self.schedule_panel.schedule_table.clearSelection()
         # 日次スケジュールパネルはガントビューのみ表示
         show = view_idx == IDX_GANTT
         self.schedule_panel.setVisible(show)
@@ -1738,6 +1750,8 @@ class MainWindow(QMainWindow):
         """項目7: メンバー選択時にボタンのチェック状態を更新"""
         self._commit_pending_edits()  # 切替前に入力中の日次ログを確定
         self.state.current_member = member
+        # 前のメンバー表示で選んだ時間帯は引き継がない（誤割り当て防止）
+        self.schedule_panel.schedule_table.clearSelection()
         # ボタンのチェック状態を更新
         for m, btn in getattr(self, "_member_btns", {}).items():
             btn.setChecked(m == member)
@@ -1966,6 +1980,7 @@ class MainWindow(QMainWindow):
         s.setValue("plan/filter_own", rv._filter_own)
         s.setValue("plan/col_extra", rv._date_col_extra)
         s.setValue("plan/col_widths", list(rv.fixed_col_widths))
+        s.setValue("search/member", self.search_view.f_member.currentData() or "")
         s.sync()
 
     def restore_ui_state(self) -> None:
@@ -2000,6 +2015,11 @@ class MainWindow(QMainWindow):
                     view.fixed_col_widths = [max(int(w), 20) for w in widths]
                 except (TypeError, ValueError):
                     pass
+        # Search の担当者（いなくなったメンバーなら「全員」のまま）
+        sv_member = self.search_view.f_member
+        i = sv_member.findData(s.value("search/member", "", type=str))
+        if i >= 0:
+            sv_member.setCurrentIndex(i)
         rv = self.road_view
         rv.apply_saved_view(
             s.value("plan/level", rv._current_level, type=str),
@@ -2029,8 +2049,12 @@ class MainWindow(QMainWindow):
             self._update_save_btn_style()
             self.main_pane.tree_pane.refresh()
             ai_note = self._export_ai_context()
-            if getattr(self.state, "done_moved", 0):
-                self.refresh()  # 既存データの「完了」を末尾へ直した分を表へ反映する
+            reopened = getattr(self.state, "reopened", [])
+            if reopened:
+                ai_note = (f"（他メンバーの未完了チケットがあるため、Done の親 {len(reopened)} 件を"
+                           " todo に戻しました）" + ai_note)
+            if getattr(self.state, "done_moved", 0) or reopened:
+                self.refresh()  # 既存データの「完了」を末尾へ直した分・todo に戻した親を表へ反映する
             skipped = getattr(self.state, "save_skipped", {})
             if skipped:
                 # 他ユーザーへ移管済みのノードは巻き戻さず保存対象外にした旨を通知

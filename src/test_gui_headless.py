@@ -2267,6 +2267,176 @@ def test_layout_and_inbox_tab(win, task_idx):
         ng("月次の作業記録", e)
 
 
+def test_accept_status(win, task_idx):
+    """依頼の承諾: 依頼元が done/cancel でも todo、regularly は regularly で受け取る"""
+    print("\n[承諾ステータス] 依頼で受け取るチケットの状態テスト")
+    import db as DB
+    import logic as LG
+    from PySide6.QtWidgets import QMessageBox
+    state = win.state
+    me = state.user
+    sender = "sender_accept@email.com"
+    patched = {k: getattr(QMessageBox, k) for k in ("information", "critical")}
+    for k in patched:
+        setattr(QMessageBox, k, staticmethod(lambda *a, **kw: QMessageBox.StandardButton.Ok))
+    asg = win.assign_view
+    orig_sel = asg._own_selected_ids
+    try:
+        expect = {"done": "todo", "cancel": "todo", "todo": "todo", "regularly": "regularly"}
+        srcs = {}
+        for st in expect:
+            idx = DB.generate_idx(sender)
+            state.df_nodes.loc[idx] = state.df_nodes.loc[task_idx].copy()
+            state.df_nodes.loc[idx, ["node_type", "parent_id", "title", "status", "assigned_to",
+                                     "actual_hours", "actual_end"]] = [
+                "ticket", task_idx, f"依頼_{st}", st, sender, 2.5,
+                "2026-11-01" if st == "done" else None]
+            state.db.upsert_nodes_bulk([state.df_nodes.loc[idx]])
+            state.db.create_assignment(idx, sender, me, "")
+            srcs[idx] = st
+        state.df_assignments = state.db.read_assignments()
+        a = state.df_assignments
+        ids = list(a[a["ticket_id"].isin(srcs) & (a["status"] == "pending")].index)
+        asg._own_selected_ids = lambda: ids
+        asg._on_accept()
+        df = state.df_nodes
+        db_nodes = state.db.read_nodes()
+        for src_idx, st in srcs.items():
+            got = df[(df["title"] == f"依頼_{st}") & (df["assigned_to"] == me)]
+            assert len(got) == 1, f"{st}: 受け取ったチケットが {len(got)} 件"
+            r = got.iloc[0]
+            assert r["status"] == expect[st], f"{st} → {r['status']}"
+            assert not r["actual_end"] and float(r["actual_hours"]) == 0.0, \
+                f"{st}: 完了日・実績を引き継いだ {r['actual_end']} {r['actual_hours']}"
+            assert db_nodes.loc[got.index[0], "status"] == expect[st], "DB 側の状態が違う"
+            assert df.loc[src_idx, "status"] == st and db_nodes.loc[src_idx, "status"] == st, \
+                "依頼元のチケットが変わった"
+        ok("依頼元が done/cancel でも todo、regularly は regularly で受け取る（完了日・実績は引き継がない）")
+    except Exception as e:
+        ng("承諾時のステータス", e)
+    try:
+        # Done の Project4 → Done の Task の下のチケットを受け取る → 親は todo、「完了」は done のまま
+        df = state.df_nodes
+        p3 = str(df.loc[str(df.loc[task_idx, "parent_id"]), "parent_id"])
+        def add(ntype, parent, title, st):
+            i = DB.generate_idx(sender)
+            state.df_nodes.loc[i] = state.df_nodes.loc[task_idx].copy()
+            state.df_nodes.loc[i, ["node_type", "parent_id", "title", "status", "assigned_to",
+                                   "actual_end"]] = [ntype, parent, title, st, sender,
+                                                     "2026-11-01" if st == "done" else None]
+            state.db.upsert_nodes_bulk([state.df_nodes.loc[i]])
+            return i
+        p4 = add("project4", p3, "承諾_P4", "done")
+        tk = add("task", p4, "承諾_Task", "done")
+        fin = add("ticket", tk, "完了", "done")
+        src = add("ticket", tk, "承諾_チケット", "done")
+        state.db.create_assignment(src, sender, me, "")
+        state.df_assignments = state.db.read_assignments()
+        a = state.df_assignments
+        ids = list(a[(a["ticket_id"] == src) & (a["status"] == "pending")].index)
+        asg._own_selected_ids = lambda: ids
+        asg._on_accept()
+        df = state.df_nodes
+        db_nodes = state.db.read_nodes()
+        for i in (p4, tk):
+            assert df.loc[i, "status"] == "todo" and not df.loc[i, "actual_end"], f"{i} メモリ"
+            assert db_nodes.loc[i, "status"] == "todo" and not db_nodes.loc[i, "actual_end"], f"{i} DB"
+            assert db_nodes.loc[i, "assigned_to"] == sender, "親の担当者が変わった"
+        assert df.loc[fin, "status"] == "done" and db_nodes.loc[fin, "status"] == "done", \
+            "「完了」チケットまで戻った"
+        got = df[(df["parent_id"] == tk) & (df["assigned_to"] == me)]
+        assert len(got) == 1 and got.iloc[0]["status"] == "todo"
+        assert LG.status_change_error(df, got.index[0], "todo") is None
+        ok("Done の親の下で受け取ると親（祖先）を todo に戻す（「完了」は done のまま・DB にも反映）")
+    except Exception as e:
+        ng("承諾時の Done の親", e)
+    try:
+        # 依頼元の側: 自分の Done の Task の下で他メンバーが承諾（DB だけに未完了の子）
+        # → 古い表示のまま保存しても done で上書きせず、Task とその Done の祖先を todo に戻す
+        df = state.df_nodes
+        p3 = str(df.loc[str(df.loc[task_idx, "parent_id"]), "parent_id"])
+        def mine(ntype, parent, title, st):
+            i = DB.generate_idx(me)
+            state.df_nodes.loc[i] = state.df_nodes.loc[task_idx].copy()
+            state.df_nodes.loc[i, ["node_type", "parent_id", "title", "status", "assigned_to",
+                                   "actual_end"]] = [ntype, parent, title, st, me, "2026-11-01"]
+            return i
+        my_p4 = mine("project4", p3, "保存_P4", "done")
+        my_tk = mine("task", my_p4, "保存_Task", "done")
+        state.nodes_modified = True
+        state.save()
+        assert state.reopened == [], "他メンバーの子が無いのに戻した"
+        child = state.df_nodes.loc[task_idx].copy()
+        child.name = DB.generate_idx(sender)
+        child[["node_type", "parent_id", "title", "status", "assigned_to"]] = [
+            "ticket", my_tk, "受け取った側", "todo", sender]
+        state.db.upsert_nodes_bulk([child])          # 相手が承諾した（自分のメモリには無い）
+        state.nodes_modified = True
+        state.save()
+        db_nodes = state.db.read_nodes()
+        assert set(state.reopened) == {my_tk, my_p4}, state.reopened
+        for i in (my_tk, my_p4):
+            assert state.df_nodes.loc[i, "status"] == "todo" and db_nodes.loc[i, "status"] == "todo", i
+        ok("他メンバーの未完了の子がある自分の Done の親は、保存時に todo に戻す（祖先も）")
+    except Exception as e:
+        ng("保存時の Done の親", e)
+    finally:
+        asg._own_selected_ids = orig_sel
+        for k, v in patched.items():
+            setattr(QMessageBox, k, v)
+
+
+def test_daily_keep_view(win):
+    """日次: 操作しても表示中の時間帯が変わらない／タブ・メンバー切替で時間帯の選択を外す"""
+    print("\n[日次の表示] 時間帯の保持と選択解除テスト")
+    import ui_main
+    from PySide6.QtWidgets import QApplication
+    state = win.state
+    sp = win.schedule_panel
+    t = sp.schedule_table
+    try:
+        win.resize(1500, 900)
+        win._switch_view(ui_main.IDX_GANTT)
+        QApplication.processEvents()
+        begin_row = state.config.daily_begin_time * 4
+        t.scrollToItem(t.item(begin_row + 20, 0), ui_main.QAbstractItemView.ScrollHint.PositionAtTop)
+        top = t.rowAt(0)
+        assert top != begin_row, "スクロールできていない"
+        sp.refresh()                       # チケットの状態変更などで呼ばれる再描画
+        win.refresh()
+        QApplication.processEvents()
+        assert t.rowAt(0) == top, f"再描画で表示時間帯が変わった {top} → {t.rowAt(0)}"
+        win._switch_view(ui_main.IDX_MAIN)
+        win._switch_view(ui_main.IDX_GANTT)
+        QApplication.processEvents()
+        assert t.rowAt(0) == top, f"タブを戻ると表示時間帯が変わった {top} → {t.rowAt(0)}"
+        ok("再描画・タブ切替でも日次の表示時間帯が変わらない")
+    except Exception as e:
+        ng("日次の表示時間帯", e)
+    try:
+        me = state.user
+        t.selectRow(40)
+        assert t.selectedIndexes(), "選択できていない"
+        win._switch_view(ui_main.IDX_MAIN)
+        assert not t.selectedIndexes(), "タブ切替で時間帯の選択が残った"
+        win._switch_view(ui_main.IDX_GANTT)
+        t.selectRow(40)
+        other = next(m for m in state.members if m != me)
+        win._on_member_changed(other)
+        assert not t.selectedIndexes(), "メンバー切替で時間帯の選択が残った"
+        win._on_member_changed(me)
+        # 選択を外したので、ガントでチケットを確認クリックしても割り当てない
+        before = state.df_daily.copy()
+        own = state.df_nodes[(state.df_nodes["node_type"] == "ticket")
+                             & (state.df_nodes["assigned_to"] == me)
+                             & (state.df_nodes["status"] == "todo")].index[0]
+        sp.assign_ticket(own)
+        assert state.df_daily.equals(before), "選択なしで割り当てられた"
+        ok("タブ・メンバーの切替で日次の時間帯の選択を外す（確認クリックで割り当てない）")
+    except Exception as e:
+        ng("日次の選択解除", e)
+
+
 def test_task_work(win):
     """Task を日次に割り当てる（Task 作業用チケット「-」）。既存の「-」も壊さない"""
     print("\n[作業用] Task 作業用チケットテスト")
@@ -2474,6 +2644,9 @@ def test_ui_state(state, version, win, tmpdir):
         ok("Plan のタイトル列幅が再構築後も保たれる")
         state.nodes_modified = False
         state.schedule_modified = False
+        win.search_view.f_member.setCurrentIndex(win.search_view.f_member.count() - 1)
+        search_member = win.search_view.f_member.currentData()
+        assert search_member, "Search の担当者にメンバーがいない"
         win.save_ui_state()
 
         win2 = MainWindow(state, version)
@@ -2485,6 +2658,8 @@ def test_ui_state(state, version, win, tmpdir):
         assert win2.stack.currentIndex() == IDX_ROADMAP, "前回のタブで開かない"
         assert win2.detail_toggle_btn.isChecked(), "詳細ペインの開閉が戻らない"
         assert win2.gantt_view._get_status_filter() == "all"
+        assert win2.search_view.f_member.currentData() == search_member, \
+            "Search の担当者が次回起動時に戻らない（全員になる）"
         win2.gantt_view._rebuild_table()
         assert win2.gantt_view.table.columnWidth(1) == 257, "ガントの列幅が次回起動時に戻らない"
         win2.road_view._rebuild_table()
@@ -3913,6 +4088,8 @@ def main():
             test_ui_state(state, version, win, tmpdir)
             test_done_ticket(win)
             test_layout_and_inbox_tab(win, task_idx)
+            test_accept_status(win, task_idx)
+            test_daily_keep_view(win)
             test_task_work(win)
             test_ai_context(win, task_idx, ticket2_idx)
             test_theme()

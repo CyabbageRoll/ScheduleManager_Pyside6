@@ -3309,6 +3309,7 @@ class AssignmentView(QWidget):
         today = datetime.date.today().isoformat()
         nodes_to_upsert: list = []
         nodes_to_reassign: list = []
+        to_reopen: list = []   # 受け取ったチケットの done の祖先（todo に戻す）
 
         for asgn_idx in asgn_ids:
             t_idx = self.state.df_assignments.loc[asgn_idx, "ticket_id"]
@@ -3318,14 +3319,17 @@ class AssignmentView(QWidget):
             if node_type == "ticket":
                 # ticket の場合は担当者変更ではなくコピーを作成する
                 # 元チケットは変更せず、自分宛の新規チケットをインメモリに追加
-                new_row = self.state.df_nodes.loc[t_idx].copy()
+                # （依頼元が done でも todo で受け取る）
                 new_idx = DB.generate_idx(self.state.user)
-                new_row.name = new_idx
-                new_row["assigned_to"] = self.state.user
-                new_row["created_at"] = today
-                new_row["updated_at"] = today
+                new_row = LG.make_received_ticket(
+                    self.state.df_nodes.loc[t_idx], new_idx, self.state.user, today)
                 self.state.df_nodes.loc[new_idx] = new_row
                 nodes_to_upsert.append(self.state.df_nodes.loc[new_idx])
+                # done の親の下に未完了は置けないため、親（祖先）を todo に戻す
+                # （兄弟の「完了」チケットは done のまま）
+                for p in LG.done_ancestors(self.state.df_nodes, new_idx):
+                    if p not in to_reopen:
+                        to_reopen.append(p)
             else:
                 # ticket 以外（task / project）は担当者のみ変更する
                 # （手元の古い行で DB を丸ごと上書きしないよう UPDATE で行う）
@@ -3337,10 +3341,15 @@ class AssignmentView(QWidget):
                 self.state.db.upsert_nodes_bulk(nodes_to_upsert)
             if nodes_to_reassign:
                 self.state.db.reassign_nodes_bulk(nodes_to_reassign, self.state.user)
+            # 親は他メンバー担当のこともあり、保存（自分の担当分のみ）では反映されないため DB へ直接書く
+            self.state.db.reopen_nodes_bulk(to_reopen)
             self.state.db.respond_assignments_bulk(asgn_ids, "accepted")
         except Exception as e:
             QMessageBox.critical(self, "承諾エラー", f"DB への書き込みに失敗しました:\n{e}")
             return
+        for p in to_reopen:
+            self.state.df_nodes.loc[p, "status"] = "todo"
+            self.state.df_nodes.loc[p, "actual_end"] = None
         # 移管したノードは DB の最新内容（元担当者の保存済み内容）をメモリへ取り込む
         if nodes_to_reassign:
             fresh = self.state.db.read_nodes()
@@ -3348,7 +3357,8 @@ class AssignmentView(QWidget):
                 if t_idx in fresh.index:
                     self.state.df_nodes.loc[t_idx] = fresh.loc[t_idx]
         if self.state.logger:
-            self.state.logger.info(f"[Request] 承諾 user={self.state.user} 件数={len(asgn_ids)} ids={asgn_ids}")
+            self.state.logger.info(f"[Request] 承諾 user={self.state.user} 件数={len(asgn_ids)} ids={asgn_ids}"
+                                   + (f" 親を todo に戻す={to_reopen}" if to_reopen else ""))
 
         self.state.df_assignments = self.state.db.read_assignments()
         # DB へ直接反映したノード変更は元に戻せないため、ここを Undo の起点にする
@@ -3356,6 +3366,9 @@ class AssignmentView(QWidget):
         self.refresh()
         count = len(asgn_ids)
         msg = "承諾しました" if count == 1 else f"{count}件をまとめて承諾しました"
+        if to_reopen:
+            names = "、".join(str(self.state.df_nodes.loc[p, "title"]) for p in to_reopen)
+            msg += f"\n\nDone だった親を todo に戻しました: {names}"
         QMessageBox.information(self, "完了", msg)
 
     def _on_reject(self) -> None:
