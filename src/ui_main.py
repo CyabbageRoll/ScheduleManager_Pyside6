@@ -4840,8 +4840,12 @@ class InboxView(QWidget):
              "振り分け先 Task（入力で絞り込み）", "メモ", "AI ヒント"]
     C_AGE, C_TITLE, C_EST, C_START, C_DL, C_TASK, C_MEMO, C_HINT = range(8)
     _HELP = ("最下行に入力して Enter で追加（工数 2h ／ 納期 金曜・11/14 ／ 範囲 11/10〜11/14 ／ "
-             "@Task で振り分け先 ／ # 以降はメモ）。セルはダブルクリックか入力で編集。"
+             "@Task で振り分け先 ／ # 以降はメモ）。セルはクリックするとそのまま入力できます。"
              "AI ヒントは AI に振り分けを頼むときの手がかり（例: 顧客A・調査系）")
+
+    _EDIT_TRIGGERS = (QAbstractItemView.EditTrigger.CurrentChanged
+                      | QAbstractItemView.EditTrigger.DoubleClicked
+                      | QAbstractItemView.EditTrigger.EditKeyPressed)
 
     def __init__(self, state, create_func, copy_prompt_func):
         super().__init__()
@@ -4872,9 +4876,11 @@ class InboxView(QWidget):
         self.table = QTableWidget(0, len(self._COLS))
         self.table.setHorizontalHeaderLabels(self._COLS)
         self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
-                                   | QAbstractItemView.EditTrigger.EditKeyPressed
-                                   | QAbstractItemView.EditTrigger.AnyKeyPressed)
+        # セルを選んだ時点で入力欄を開く（AnyKeyPressed は使わない）。
+        # 入力欄が閉じたまま日本語 IME で打ち始めると、Qt は変換中だけ表にフォーカスを残して
+        # 入力欄へ転送する特別な経路を通り、Windows ではこの経路でアプリが落ちることがある
+        # （タイトル欄は入力欄を開いてから打つため落ちず、AI ヒント欄で落ちていた）
+        self.table.setEditTriggers(self._EDIT_TRIGGERS)
         for c, w in enumerate([50, 240, 60, 95, 95, 300, 200]):
             self.table.setColumnWidth(c, w)
         self.table.horizontalHeader().setStretchLastSection(True)
@@ -4961,6 +4967,8 @@ class InboxView(QWidget):
         model = self._task_model()
         today = datetime.date.today()
         self.table.blockSignals(True)
+        # 作り直しの途中で現在セルが動いても入力欄を開かない
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setRowCount(0)
         self.table.setRowCount(len(inbox) + 1)
         for row, (idx, r) in enumerate(inbox.iterrows()):
@@ -4990,6 +4998,7 @@ class InboxView(QWidget):
             item.setBackground(QColor(C.INBOX_BG))
             item.setToolTip("ここに入力して Enter で Inbox に追加")
             self.table.setItem(blank, col, item)
+        self.table.setEditTriggers(self._EDIT_TRIGGERS)
         self.table.blockSignals(False)
         self.move_btn.setEnabled(blank > 0)
         self.del_btn.setEnabled(blank > 0)
@@ -4997,8 +5006,9 @@ class InboxView(QWidget):
     def focus_blank_row(self) -> None:
         """最下行（新規入力）のタイトル欄を編集状態にする"""
         row = self.table.rowCount() - 1
-        self.table.setCurrentCell(row, self.C_TITLE)
-        self.table.editItem(self.table.item(row, self.C_TITLE))
+        self.table.setCurrentCell(row, self.C_TITLE)   # 現在セルが変われば入力欄が開く
+        if self.table.state() != QAbstractItemView.State.EditingState:
+            self.table.editItem(self.table.item(row, self.C_TITLE))
 
     # ── 編集 ──
 
