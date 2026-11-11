@@ -2164,6 +2164,8 @@ def test_layout_and_inbox_tab(win, task_idx):
     """中央の幅・Inbox タブの入力・月次の作業記録"""
     print("\n[1108] 中央の幅 / Inbox タブ / 月次作業記録テスト")
     import pandas as pd
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
     import logic as LG
     import db as DB
     import ui_main
@@ -2230,6 +2232,85 @@ def test_layout_and_inbox_tab(win, task_idx):
         ok(f"Inbox タブに件数を表示: {btn.text()}")
     except Exception as e:
         ng("Inbox タブの入力", e)
+
+    from PySide6.QtCore import qInstallMessageHandler
+    from PySide6.QtGui import QInputMethodEvent
+    from PySide6.QtWidgets import QLineEdit, QAbstractItemView
+    qt_msgs = []
+    old_handler = qInstallMessageHandler(lambda _t, _c, m: qt_msgs.append(m))
+    try:
+        # 実際の入力の流れ: 最下行に日本語で入力 → Enter → 作った行の AI ヒント欄をクリックして日本語入力。
+        # 入力欄が閉じたまま IME で打ち始める経路（Windows で落ちる）を通らないこと
+        win.activateWindow()
+        win._open_inbox_tab()
+        for _ in range(3):
+            QApplication.processEvents()
+        t = view.table
+        ed = win.focusWidget()
+        assert isinstance(ed, QLineEdit), f"最下行の入力欄が開かない {type(ed).__name__}"
+        ev = QInputMethodEvent()
+        ev.setCommitString("IME確認チケット")
+        QApplication.sendEvent(ed, ev)
+        QTest.keyClick(ed, Qt.Key.Key_Return)
+        for _ in range(5):
+            QApplication.processEvents()
+        assert isinstance(win.focusWidget(), QLineEdit), "追加後に次の入力行が開かない"
+        row = next(r for r in range(t.rowCount() - 1)
+                   if t.item(r, view.C_TITLE).text() == "IME確認チケット")
+        QTest.mouseClick(t.viewport(), Qt.MouseButton.LeftButton,
+                         pos=t.visualItemRect(t.item(row, view.C_HINT)).center())
+        QApplication.processEvents()
+        ed = win.focusWidget()
+        assert t.state() == QAbstractItemView.State.EditingState and isinstance(ed, QLineEdit), \
+            f"AI ヒント欄をクリックしても入力欄が開かない（打ち始めで IME の特別経路に入る） {type(ed).__name__}"
+        QApplication.sendEvent(ed, QInputMethodEvent("こきゃく", []))   # 変換中
+        ev = QInputMethodEvent()
+        ev.setCommitString("顧客B")
+        QApplication.sendEvent(ed, ev)
+        QTest.keyClick(ed, Qt.Key.Key_Return)
+        QApplication.processEvents()
+        idx = view._row_idx(row)
+        assert LG.split_ai_hint(state.df_nodes.loc[idx, "memo"])[1] == "顧客B", state.df_nodes.loc[idx, "memo"]
+        # キーボードで戻る場合: Enter → 次の入力行 → ↑ で作った行 → Tab で AI ヒント欄
+        ev = QInputMethodEvent()
+        ev.setCommitString("IME確認チケット2")
+        win._open_inbox_tab()
+        for _ in range(3):
+            QApplication.processEvents()
+        ed = win.focusWidget()
+        QApplication.sendEvent(ed, ev)
+        QTest.keyClick(ed, Qt.Key.Key_Return)
+        for _ in range(5):
+            QApplication.processEvents()
+        QTest.keyClick(win.focusWidget(), Qt.Key.Key_Up)
+        QApplication.processEvents()
+        row2 = t.currentRow()
+        assert t.item(row2, view.C_TITLE).text() == "IME確認チケット2", t.item(row2, view.C_TITLE).text()
+        while t.currentColumn() != view.C_HINT:
+            col = t.currentColumn()
+            QTest.keyClick(win.focusWidget(), Qt.Key.Key_Tab)
+            QApplication.processEvents()
+            assert t.currentColumn() != col, "Tab で次の欄へ進まない"
+        ed = win.focusWidget()
+        assert t.currentRow() == row2 and isinstance(ed, QLineEdit), \
+            f"Tab で AI ヒント欄に移っても入力欄が開かない {type(ed).__name__}"
+        QApplication.sendEvent(ed, QInputMethodEvent("ちょうさ", []))
+        ev = QInputMethodEvent()
+        ev.setCommitString("調査系")
+        QApplication.sendEvent(ed, ev)
+        QTest.keyClick(ed, Qt.Key.Key_Return)
+        QApplication.processEvents()
+        assert LG.split_ai_hint(state.df_nodes.loc[view._row_idx(row2), "memo"])[1] == "調査系"
+        view.refresh()                          # 作り直しの途中で入力欄を開かない
+        assert t.state() != QAbstractItemView.State.EditingState, "作り直しで入力欄が開いた"
+        view.focus_blank_row()
+        assert t.state() == QAbstractItemView.State.EditingState
+        assert not [m for m in qt_msgs if "editing failed" in m], qt_msgs
+        ok("Inbox タブ: セルを選ぶと入力欄が開き、AI ヒントも入力欄の中で日本語入力する")
+    except Exception as e:
+        ng("Inbox タブの日本語入力", e)
+    finally:
+        qInstallMessageHandler(old_handler)
 
     try:
         # 月次の作業記録: 作業内訳・Done・作業ログ・連絡事項
